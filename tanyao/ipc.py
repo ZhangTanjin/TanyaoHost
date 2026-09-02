@@ -127,6 +127,9 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             epsilon=float(p.get("epsilon", 0.0)),
             alignment=int(p["alignment"]) if p.get("alignment") else None,
         ),
+        "scan_cancel": lambda p: facade.scan_cancel(
+            need_pid(p), str(p["job_id"])
+        ),
         "scan_status": lambda p: facade.scan_status(
             need_pid(p), str(p["job_id"]) if p.get("job_id") else None
         ),

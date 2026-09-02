@@ -9,8 +9,10 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .constants import MAP_READ
+from .jobs import ScanCancelled
 
 # value type name -> (struct fmt, size, python kind)
 TYPES: dict[str, tuple[str, int, str]] = {
@@ -103,41 +105,48 @@ class ScanEngine:
 
     MIN_SCAN_CHUNK = 4096
 
-    def _read_region(self, pid: int, lo: int, hi: int, chunk: int, out: list, skipped: list) -> None:
-        """Fault-tolerant chunked read of [lo, hi).
+    def _scan_region(self, pid: int, lo: int, hi: int, chunk: int, on_chunk) -> None:
+        """Fault-tolerant STREAMING read+scan of [lo, hi).
+
+        on_chunk(addr, data) fires as each chunk arrives — reads and scanning
+        are interleaved, so host memory stays constant regardless of range
+        size (a 10GB range does NOT buffer 10GB) and progress flows live
+        (fixes the blocking-job bug: the previous version buffered the whole
+        range before scanning, freezing progress_done at 0 and risking OOM).
 
         On a failed chunk: bisect down to an effective minimum granularity,
-        skipping only unreadable leaves (recorded in `skipped` as (lo, hi)
-        pairs) instead of aborting the scan. Special pages such as [vvar]
-        (VM_PFNMAP) cost ~2 reads per bisection level and are skipped cleanly;
-        completed progress is preserved.
-
-        Field follow-up: large dead zones (hundreds of MB of GUP-unreadable
-        pages) previously cost one failed read per 4KB leaf. Skip granularity
-        escalates geometrically (4KB -> 64MB cap) via the ENGINE-LEVEL
-        `self._dead_gran` counter — it persists across chunk boundaries and
-        recursion levels (a 320MB dead zone costs ~30 reads instead of ~80K),
-        and resets to MIN_SCAN_CHUNK on the next successful read, so isolated
-        holes keep 4KB precision."""
+        skipping only unreadable leaves (appended to
+        self.state.skipped_ranges) instead of aborting. Special pages such as
+        [vvar] (VM_PFNMAP) cost ~2 reads per bisection level and are skipped
+        cleanly; completed progress is preserved. Dead-zone granularity
+        escalates geometrically (4KB -> 64MB cap) via the engine-level
+        `self._dead_gran` counter — persists across chunk boundaries and
+        recursion levels, resets to MIN_SCAN_CHUNK on next successful read
+        (isolated holes keep 4KB precision)."""
         min_take = self._dead_gran
         pos = lo
         while pos < hi:
             take = min(chunk, hi - pos)
             try:
-                out.append((pos, self._read(pid, pos, take)))
-                pos += take
-                self._dead_gran = self.MIN_SCAN_CHUNK  # success resets granularity
+                data = self._read(pid, pos, take)
             except Exception:
                 eff = self._dead_gran
                 if take <= eff:
-                    skipped.append((pos, pos + take))
+                    self.state.skipped_ranges.append((pos, pos + take))
                     pos += take
                     self._dead_gran = min(64 * 1024 * 1024, eff * 2)
                     continue
                 mid = pos + max(eff, (take // 2 // eff) * eff)
-                self._read_region(pid, pos, mid, chunk, out, skipped)
+                self._scan_region(pid, pos, mid, chunk, on_chunk)
                 pos = mid
                 self._dead_gran = min(64 * 1024 * 1024, eff * 2)
+                continue
+            # callback runs OUTSIDE the fault handler: a bug in the scan
+            # callback must propagate loudly, never masquerade as an EFAULT
+            # (this exact masking bug hid scan_hex's NameError for a day)
+            self._dead_gran = self.MIN_SCAN_CHUNK  # successful read resets granularity
+            on_chunk(pos, data)
+            pos += len(data)
 
     # -- first scan ---------------------------------------------------------------
 
@@ -151,6 +160,7 @@ class ScanEngine:
         alignment: int | None = None,
         chunk: int = DEFAULT_CHUNK,
         progress=None,
+        cancel_event=None,
     ) -> int:
         fmt, size, _kind = TYPES[vtype]
         align = alignment or size
@@ -162,35 +172,37 @@ class ScanEngine:
         truncated = False
         total = sum(end - start for start, end in self.state.ranges)
         done = 0
-        chunks: list[tuple[int, bytes]] = []
-        skipped: list[tuple[int, int]] = []
-        for start, end in self.state.ranges:
-            self._read_region(pid, start, end, min(chunk, self._max_transfer), chunks, skipped)
-        self.state.skipped_ranges = self._coalesce(skipped)
-        for pos, data in chunks:
+        unpack = struct.Struct(fmt).unpack_from
+
+        def on_chunk(addr: int, data: bytes) -> None:
+            nonlocal done, truncated
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
             scan_end = len(data) - size
-            # alignment relative to the absolute address (stable across bisection)
-            first = (align - (pos % align)) % align
-            i = first
+            i = (align - (addr % align)) % align  # alignment from absolute address
             while i <= scan_end:
-                found = struct.unpack_from(fmt, data, i)[0]
+                found = unpack(data, i)[0]
                 if _matches(found, want, epsilon):
-                    hits.append(Hit(address=pos + i, value=found))
+                    hits.append(Hit(address=addr + i, value=found))
                     if len(hits) >= MAX_HITS:
                         truncated = True
-                        break
+                        return
                 i += align
-            if truncated:
-                break
             done += len(data)
             if progress:
                 progress(done, total)
+
+        for start, end in self.state.ranges:
+            self._scan_region(pid, start, end, min(chunk, self._max_transfer), on_chunk)
+            if truncated:
+                break
+        self.state.skipped_ranges = self._coalesce(self.state.skipped_ranges)
         self.state.hits = hits
         self.state.truncated = truncated
         self.state.scan_round = 1
         return len(hits)
 
-    def scan_hex(self, pid: int, pattern: bytes, mask: bytes, *, chunk: int = DEFAULT_CHUNK) -> int:
+    def scan_hex(self, pid: int, pattern: bytes, mask: bytes, *, chunk: int = DEFAULT_CHUNK, progress=None, cancel_event=None) -> int:
         """AOB scan. `mask` bytes: 0xFF = must match, 0x00 = wildcard. Same length as pattern."""
         if not pattern or len(pattern) != len(mask):
             raise ValueError("pattern/mask length mismatch")
@@ -200,27 +212,38 @@ class ScanEngine:
             raise ValueError("no scan ranges set")
         hits: list[Hit] = []
         truncated = False
-        chunks: list[tuple[int, bytes]] = []
-        skipped: list[tuple[int, int]] = []
-        for start, end in self.state.ranges:
-            self._read_region(pid, start, end, min(chunk, self._max_transfer), chunks, skipped)
-        self.state.skipped_ranges = self._coalesce(skipped)
-        carry = b""  # tail bytes from previous contiguous chunk (pattern straddling)
-        for pos, data in chunks:
+        carry = b""      # tail of previous contiguous chunk (straddling matches)
+        carry_addr = 0
+        done = 0
+        total = sum(end - start for start, end in self.state.ranges)
+
+        def on_chunk(addr: int, data: bytes) -> None:
+            nonlocal carry, carry_addr, done, truncated
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
             buf = carry + data
-            base = pos - len(carry)
-            start_i = 0
-            while start_i + plen <= len(buf):
-                seg = buf[start_i : start_i + plen]
+            base = addr - len(carry)
+            i = 0
+            while i + plen <= len(buf):
+                seg = buf[i : i + plen]
                 if all((seg[j] & mask[j]) == (pattern[j] & mask[j]) for j in range(plen) if mask[j]):
-                    hits.append(Hit(address=base + start_i, value=int.from_bytes(seg[:8], "little")))
+                    hits.append(Hit(address=base + i, value=int.from_bytes(seg[:8], "little")))
                     if len(hits) >= MAX_HITS:
                         truncated = True
-                        break
-                start_i += 1
+                        return
+                i += 1
+            carry = buf[len(buf) - (plen - 1):] if plen > 1 else b""
+            carry_addr = addr + len(data) - len(carry)
+            done += len(data)
+            if progress:
+                progress(done, total)
+
+        for start, end in self.state.ranges:
+            self._scan_region(pid, start, end, min(chunk, self._max_transfer), on_chunk)
+            carry = b""  # hole skipped: straddling carry is invalid across the gap
             if truncated:
                 break
-            carry = buf[len(buf) - (plen - 1):] if plen > 1 else b""
+        self.state.skipped_ranges = self._coalesce(self.state.skipped_ranges)
         self.state.hits = hits
         self.state.truncated = truncated
         self.state.scan_round = 1

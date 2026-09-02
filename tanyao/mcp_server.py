@@ -153,6 +153,11 @@ TOOLS = [
         ),
     },
     {
+        "name": "scan_cancel",
+        "description": "Request cancellation of a running scan job (the engine stops between chunks; job state becomes cancelled).",
+        "inputSchema": _obj({"pid": {"type": "integer"}, "job_id": {"type": "string"}}, ["pid", "job_id"]),
+    },
+    {
         "name": "scan_status",
         "description": "Poll a background scan job (or list recent jobs): state running/done/error, progress bytes, summary+results when done.",
         "inputSchema": _obj({"pid": {"type": "integer"}, "job_id": {"type": "string"}}, ["pid"]),

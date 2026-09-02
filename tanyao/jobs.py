@@ -15,20 +15,26 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 
+class ScanCancelled(Exception):
+    """Raised inside a scan when a cancellation is requested (job state → cancelled)."""
+
+
 @dataclass
 class ScanJob:
     id: str
     pid: int
     kind: str  # "value" | "hex"
-    state: str = "running"  # running | done | error
+    state: str = "running"  # running | done | error | cancelled
     progress_done: int = 0
     progress_total: int = 0
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     summary: dict | None = None
     error: str | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     def to_dict(self, include_summary: bool = True) -> dict:
+        elapsed = (self.finished_at or time.time()) - self.started_at
         out = {
             "job_id": self.id,
             "pid": self.pid,
@@ -36,8 +42,10 @@ class ScanJob:
             "state": self.state,
             "progress_done": self.progress_done,
             "progress_total": self.progress_total,
-            "elapsed_sec": round((self.finished_at or time.time()) - self.started_at, 3),
+            "elapsed_sec": round(elapsed, 3),
         }
+        if elapsed > 0 and self.progress_done > 0:
+            out["rate_mbps"] = round(self.progress_done / elapsed / 1e6, 2)
         if include_summary and self.summary is not None:
             out["summary"] = self.summary
         if self.error:
@@ -55,8 +63,9 @@ class JobManager:
         self._order: list[str] = []
         self._lock = threading.Lock()
 
-    def start(self, pid: int, kind: str, run_fn: Callable[[Callable[[int, int], None]], dict]) -> str:
-        job = ScanJob(id=uuid.uuid4().hex[:12], pid=pid, kind=kind)
+    def start(self, pid: int, kind: str, run_fn, cancel_event: threading.Event | None = None) -> str:
+        job = ScanJob(id=uuid.uuid4().hex[:12], pid=pid, kind=kind,
+                      cancel_event=cancel_event or threading.Event())
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
@@ -71,6 +80,8 @@ class JobManager:
             try:
                 job.summary = run_fn(progress)
                 job.state = "done"
+            except ScanCancelled:
+                job.state = "cancelled"
             except Exception as exc:  # noqa: BLE001
                 job.state = "error"
                 job.error = f"{type(exc).__name__}: {exc}"
@@ -82,6 +93,15 @@ class JobManager:
 
     def get(self, job_id: str) -> ScanJob | None:
         return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> bool:
+        """Request cancellation; the engine checks the event between chunks.
+        Returns False when the job is unknown or already finished."""
+        job = self._jobs.get(job_id)
+        if job is None or job.state != "running":
+            return False
+        job.cancel_event.set()
+        return True
 
     def list_for(self, pid: int | None = None) -> list[ScanJob]:
         with self._lock:

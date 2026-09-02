@@ -13,6 +13,7 @@ Run: python3 -m unittest tests.test_field -v
 from __future__ import annotations
 
 import json
+import time
 import os
 import struct
 import sys
@@ -146,3 +147,39 @@ class TestFieldRegression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScanCancel(unittest.TestCase):
+    """scan_cancel: running hex job stops between chunks; state becomes cancelled."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN)
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def test_cancel_running_hex_job(self):
+        os.environ["TANYAO_ALLOW_WRITE"] = "1"
+        svc = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        try:
+            facade.scan_set_range(DEMO_PID, HEAP_START, HEAP_START + 0x10000)
+            out = facade.scan_hex(DEMO_PID, "EF BE AD DE", async_run=True)
+            job_id = out["job_id"]
+            self.assertTrue(facade.scan_cancel(DEMO_PID, job_id)["cancel_requested"])
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                st = facade.scan_status(DEMO_PID, job_id)
+                if st["state"] != "running":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(st["state"], "cancelled")
+            # cancel on finished job -> error
+            with self.assertRaises(Exception):
+                facade.scan_cancel(DEMO_PID, job_id)
+        finally:
+            svc.close()

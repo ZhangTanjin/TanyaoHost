@@ -10,6 +10,7 @@ import os
 import shutil
 import struct
 import subprocess
+import threading
 import zipfile
 from typing import Any
 
@@ -18,7 +19,7 @@ from .constants import MAP_EXEC, MAP_READ, MAP_WRITE
 from .dump import dump_module as _dump_module
 from .dump import watch as _watch
 from .elfinfo import ElfParseError, parse_elf64
-from .jobs import JobManager
+from .jobs import JobManager, ScanCancelled
 from .native import ApkParseError, disassemble_a64_ex, extract_strings, parse_apk_manifest
 from .pointer import PointerChainError, resolve_chain
 from .scan import TYPES, ScanEngine
@@ -28,6 +29,26 @@ from .symbols import SymbolError, load_symbols
 
 class WriteDisabled(Exception):
     pass
+
+
+
+
+def _parse_aob(pattern: str) -> tuple[bytes, bytes]:
+    """Parse an AOB pattern ("7F 45 ?? 46") into (bytes, mask). 0x00 mask = wildcard.
+
+    Single source for scan_hex and scan_start hex jobs — the A1 blocker was
+    scan_start passing only the pattern while the job runner expected
+    (pattern, mask) and crashed with IndexError."""
+    pattern_bytes = bytearray()
+    mask_bytes = bytearray()
+    for tok in pattern.split():
+        if tok in ("?", "??"):
+            pattern_bytes.append(0)
+            mask_bytes.append(0)
+        else:
+            pattern_bytes.append(int(tok, 16))
+            mask_bytes.append(0xFF)
+    return bytes(pattern_bytes), bytes(mask_bytes)
 
 
 class AnalysisFacade:
@@ -267,16 +288,7 @@ class AnalysisFacade:
         return engine.summary() | {"found": found, "results": engine.results(limit=32), "async": False}
 
     def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False) -> dict:
-        tokens = pattern.split()
-        pattern_bytes = bytearray()
-        mask_bytes = bytearray()
-        for tok in tokens:
-            if tok in ("?", "??"):
-                pattern_bytes.append(0)
-                mask_bytes.append(0)
-            else:
-                pattern_bytes.append(int(tok, 16))
-                mask_bytes.append(0xFF)
+        pattern_bytes, mask_bytes = _parse_aob(pattern)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
         INLINE_LIMIT = 64 * 1024 * 1024
@@ -297,23 +309,34 @@ class AnalysisFacade:
         if kind == "hex":
             if not pattern:
                 raise AgentError("bad_request", detail="hex scan requires 'pattern'")
-            return self._start_scan_job(pid, "hex", pattern)
+            pattern_bytes, mask_bytes = _parse_aob(pattern)
+            return self._start_scan_job(pid, "hex", pattern_bytes, mask_bytes)
         raise AgentError("bad_request", detail=f"unknown scan kind {kind!r}")
 
     def _start_scan_job(self, pid: int, kind: str, *args, **kwargs) -> dict:
         engine = self._scan_for(pid)
+        cancel_event = threading.Event()
 
         def run(progress) -> dict:
             if kind == "value":
                 engine.scan_value(pid, args[0], args[1], epsilon=kwargs.get("epsilon", 0.0),
-                                  alignment=kwargs.get("alignment"), progress=progress)
+                                  alignment=kwargs.get("alignment"), progress=progress,
+                                  cancel_event=cancel_event)
             else:
-                engine.scan_hex(pid, args[0], args[1])
+                engine.scan_hex(pid, args[0], args[1], progress=progress,
+                                cancel_event=cancel_event)
             return engine.summary() | {"results": engine.results(limit=32)}
 
-        job_id = self._jobs.start(pid, kind, run)
+        job_id = self._jobs.start(pid, kind, run, cancel_event=cancel_event)
         return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
                 "async": True, "poll": "scan_status"}
+
+    def scan_cancel(self, pid: int, job_id: str) -> dict:
+        """Request cancellation of a running scan job. The engine checks the
+        cancel event between chunks and raises ScanCancelled (job → cancelled)."""
+        if self._jobs.cancel(job_id):
+            return {"job_id": job_id, "cancel_requested": True}
+        raise AgentError("not_found", detail=f"job {job_id!r} unknown or already finished")
 
     def scan_status(self, pid: int, job_id: str | None = None) -> dict:
         if job_id:
