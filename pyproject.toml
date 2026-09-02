@@ -1,0 +1,20 @@
+[project]
+name = "tanyao-host"
+version = "0.1.0"
+description = "Tanyao desktop-side core: agent protocol client, analysis engine, HTTP IPC and MCP server"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2.0"]
+elf = ["pyelftools>=0.30"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tanyao*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# test artifacts (dumps, manifests, logs — never commit target material)
+*.dump
+*.dump.manifest.json
+*.so
+*.apk
+*.log
+.pytest_cache/
+.coverage
+
+# local run state
+/tmp/
+*.pid
+
+# NOTE: test tokens ("tanyao-dev-token") are mock-only defaults for the
+# in-repo fake agent; the REAL device token lives on-device at
+# /data/local/tmp/.tanyao-token (0600) and in the operator's env only.
+tests/tanyao_target  (compiled aarch64 binary; build from tanyao_target.c)
