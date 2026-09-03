@@ -1,0 +1,26 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# Tanyao MCP bridge: exposes the tanyao-host desktop core (28 RE tools:
+# process/module enumeration, memory read/write, scan, pointer chains, symbols,
+# dump, Ghidra decompile jobs) to the model as mcp__tanyao__<tool>.
+# Requirements:
+#   1. tanyao.serve must be running (scripts/start-serve.sh in TanyaoHost repo)
+#   2. optional accel: capstone (native disassembly), Ghidra+JDK21 (decompile)
+# If this entry is ever lost (profile reset), re-add the insert block below —
+# the web profile hot-reloads it without restart.
+- insert:
+    - id: mcp-tanyao
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tanyao
+        transport: stdio
+        command: python3
+        args: ['-m', 'tanyao.mcp_server']
+        cwd: /home/tanjin/guihua/tanyao-host
+        env:
+          PYTHONPATH: /home/tanjin/guihua/tanyao-host
+          TANYAO_IPC_URL: 'http://127.0.0.1:28101/'
+        toolCallTimeoutMs: 600000
+        failOnStartupError: false
