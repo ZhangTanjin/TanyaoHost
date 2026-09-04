@@ -263,6 +263,18 @@ host 从 hello 读 `capabilities`；未声明的 cmd 一律得到 `unsupported_c
   `all_readable`
 - 若会话当前 target 与 pid 不同：agent 自动 close 旧 target 再 open
 
+**v1.2.1 附录（2026-09-05，实战缺陷 D1 修复设计，待双端实现后生效）**：
+
+- 请求新增可选 `"ranges":[{"addr":"0x..","size":"0x.."},...]`（≤4096 段；
+  与 `preset` 互斥，present 时忽略 preset）。语义与主机 `scan_set_range`
+  一致：只扫显式段，命中不跨段，dead-zone 二分按段独立。
+- 新增能力位 **bit9 `SCAN_EXPLICIT_RANGES`**：仅声明方支持 `ranges`。
+  host 检测到显式范围而 bit9 未声明时**必须回退主机引擎**，禁止把 ranges
+  发给未声明的 agent（v1.1 agent 会静默忽略并回落 preset——实战缺陷 D1
+  的失败模式）。
+- hello 新增可选字段 `"build":"<git describe>"`：构建标识，供部署卫生诊断
+  （实战缺陷 D2 防复发）；解析方忽略未知字段，向后兼容。
+
 响应：`{"job_id":7,"state":"running","total_bytes":"0x...","ranges":12}`
 （同 pid 已有运行中 job 时先自动 cancel 旧 job，响应加 `"cancelled_old":true`）
 
