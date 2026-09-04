@@ -2,6 +2,8 @@
 
 > 交接时间：2026-09-02 | 链路状态已验证：MCP 回归 32/32，单测 41/41
 > 目标设备：PLC110（3B6F6CE8GCL0BBMH），Android 16，内核 6.6.118-android15-8，tanyaokernel Live
+> 协议与工具口径以 `docs/PROTOCOL.md`、`docs/PROTOCOL_V1.2.md` 为准；本文为
+> v2 时期快照，与现行协议冲突处（工具计数、能力位、回归项数）不回改。
 
 ---
 

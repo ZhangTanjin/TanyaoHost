@@ -6,6 +6,8 @@
 > tanyaokernel v3 Live（.ko `bb9710be…`）
 > 上一轮报告：`TANYAO_FIELD_TEST_REPORT.md`（v2，2026-09-02，8 项 7 PASS
 > + 1 定位根因，P1/P2/P3 已全部修复）——本轮与其同靶对比。
+> 协议与工具口径以 `docs/PROTOCOL.md`、`docs/PROTOCOL_V1.2.md`（含 §7.2
+> v1.2.1 附录）为准；本文所记回归项数/能力位快照如与现行协议冲突，以协议为准。
 
 ---
 

@@ -15,7 +15,10 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
 ```
 
 - 协议唯一真相源：[docs/PROTOCOL.md](docs/PROTOCOL.md)（20B 大端帧头 + JSON
-  payload，单槽位 target 语义，挑战-应答鉴权）
+  payload，单槽位 target 语义，挑战-应答鉴权）；v1.2（计算下沉）定版为
+  [docs/PROTOCOL_V1.2.md](docs/PROTOCOL_V1.2.md)（与正文同效力）；v1.2.1
+  附录（cmd 50 显式 `ranges` + 能力位 bit9 `SCAN_EXPLICIT_RANGES` + hello
+  `build` 构建标识）见 PROTOCOL.md §7.2
 - 设备端 agent：`ZhangTanjin/TanyaoCli` 仓库（`src/agent/`）
 
 ## 能力面（29 个 MCP 工具，v3 按能力位自动分派）
@@ -62,8 +65,9 @@ TANYAO_AGENT=<device-ip:52730> TANYAO_TOKEN=<token> ./scripts/start-serve.sh
 ## 测试
 
 ```bash
-python3 -m unittest discover tests          # 118 用例（mock agent，无需设备）
-python3 tests/mcp_regression.py             # 真机回归 + v1.2 能力条件项（需 serve + 设备）
+python3 -m unittest discover tests          # 单测（mock agent，无需设备）
+python3 tests/mcp_regression.py             # 真机回归，项数随能力位/写门禁条件段浮动
+                                            # （2026-09-05 基准 44 项：agent caps=0x2fb、门禁关闭）
 python3 -m tanyao.interop --host <ip> --port 52730 --token <token> --pid <pid>
                                             # 设备端 agent 验收（按能力位条件化，含 skipped_caps）
 ```
