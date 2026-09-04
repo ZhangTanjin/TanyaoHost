@@ -91,6 +91,7 @@ AGENT_CAP_DISASSEMBLE = 1 << 8
 BASE = 0x7000000000
 HEAP_START = 0x7200000000
 DEMO_PID = 4321
+MORTAL_PID = 5000  # "com.demo.mortal": liveness toggles (D4 regression world)
 MODULE_PATH = "/data/app/libdemo.so"
 
 # Device scan engine constants (PROTOCOL.md §7.4 parity)
@@ -382,6 +383,10 @@ class MockAgent:
         self._scan_job: "MockScanJob | None" = None
         self._scan_seq = 0
         self._scan_lock = threading.Lock()
+        # D4 world: a mortal process; alive_overreport simulates the kernel
+        # kOpIsAlive find_get_pid quirk (pinned dead pid still answers alive)
+        self.mortal_alive = True
+        self.alive_overreport = False
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind((host, port))
@@ -680,9 +685,17 @@ class MockAgent:
                 return {"pid": DEMO_PID}
             raise ProtocolFail("not_found", detail=name)
         if cmd == CMD_PROCESS_LIST:
-            return {"pids": [4321, 1, 5000]}
+            pids = [DEMO_PID, 1]
+            if self.mortal_alive:
+                pids.append(MORTAL_PID)
+            return {"pids": pids}
         if cmd == CMD_PROCESS_ALIVE:
-            return {"alive": payload.get("pid") == DEMO_PID}
+            pid = payload.get("pid")
+            if pid == DEMO_PID:
+                return {"alive": True}
+            if pid == MORTAL_PID:
+                return {"alive": self.mortal_alive or self.alive_overreport}
+            return {"alive": False}
         if cmd == CMD_MODULE_BASE:
             if payload.get("name") == "libdemo.so" and payload.get("pid") == DEMO_PID:
                 return {"base": hx(BASE)}

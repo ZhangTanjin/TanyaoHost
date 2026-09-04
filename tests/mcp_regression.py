@@ -169,6 +169,27 @@ def main() -> int:
         lp = call_tool("list_processes", {})
         check("list_processes: non-empty", lambda: assert_true(len(lp["pids"]) > 5, f"{len(lp['pids'])} pids"))
 
+        # -- D4: process_alive must not report dead pids from cached state -----
+        def d4_process_alive():
+            import urllib.request
+
+            def ipc(method, params):
+                base = env.get("TANYAO_IPC_URL", "http://127.0.0.1:28101/")
+                req = urllib.request.Request(
+                    base, data=json.dumps({"method": method, "params": params}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read())
+
+            live = ipc("process_alive", {"pid": pid})
+            assert live.get("ok") and live["result"]["alive"] is True, f"target pid reported dead: {live}"
+            gone = ipc("process_alive", {"pid": 999999})
+            assert gone.get("ok") and gone["result"]["alive"] is False, f"absent pid reported alive: {gone}"
+            # note: the spawn→kill→false repro runs against the tester's own
+            # sacrificial target (see TANYAO_FIELD_TEST_REPORT_V3 §6 D4)
+            return f"pid={pid} alive, 999999 dead"
+        check("D4: process_alive true for live target, false for absent pid", d4_process_alive)
+
         mods = call_tool("list_modules", {"pid": pid, "filter": "libc.so"})
         libc = next(m for m in mods["modules"] if m["name"] == "libc.so")
         base_hex, base = libc["base"], int(libc["base"], 16)

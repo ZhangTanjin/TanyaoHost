@@ -11,7 +11,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.mock_agent import BASE, DEMO_PID, HEAP_START, MockAgent  # noqa: E402
+from tests.mock_agent import BASE, DEMO_PID, HEAP_START, MORTAL_PID, MockAgent  # noqa: E402
 from tanyao.analysis import AnalysisFacade, WriteDisabled  # noqa: E402
 from tanyao.connection import AgentConnection, AgentError  # noqa: E402
 from tanyao.ipc import IpcServer  # noqa: E402
@@ -246,6 +246,44 @@ class TestE2E(unittest.TestCase):
             self.assertEqual(payload["data_hex"], "7f454c46")
         finally:
             ipc.stop()
+
+
+class TestProcessAliveD4(unittest.TestCase):
+    """Field defect D4: process_alive must report dead targets as false.
+
+    The kernel legacy op (kOpIsAlive → find_get_pid) still answers alive for a
+    pid pinned by our own open target; the host corroborates a TRUE against the
+    session-independent process table (cmd 41). The mock models both sides:
+    `mortal_alive` toggles real liveness, `alive_overreport` makes the legacy
+    op lie like the kernel does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN)
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def test_alive_dead_and_overreported(self):
+        svc = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        svc.connect()
+        try:
+            self.assertTrue(svc.process_alive(DEMO_PID))
+            self.assertTrue(svc.process_alive(MORTAL_PID))
+            self.assertFalse(svc.process_alive(999999))  # never existed
+
+            self.agent.mortal_alive = False  # process got reaped
+            self.assertFalse(svc.process_alive(MORTAL_PID))
+
+            # legacy op over-reports like the kernel quirk; corroboration
+            # against the process table must flip the answer to false
+            self.agent.alive_overreport = True
+            self.assertFalse(svc.process_alive(MORTAL_PID))
+            self.assertTrue(svc.process_alive(DEMO_PID))  # genuinely alive unaffected
+        finally:
+            svc.close()
 
 
 if __name__ == "__main__":

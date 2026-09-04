@@ -333,9 +333,20 @@ class TanyaoService:
             return [int(p) for p in resp.get("pids", [])]
 
     def process_alive(self, pid: int) -> bool:
+        """Process liveness, tolerant of the kernel legacy-op quirk (field
+        defect D4): kOpIsAlive answers from find_get_pid, which still reports
+        pids pinned by our own open target after the process died. The direct
+        cmd 42 stays the primary answer (protocol semantics untouched); a TRUE
+        is corroborated against the session-independent process table (cmd 41)
+        before being reported, with one re-check to absorb fork/listing races."""
         with self._lock:
             resp = self._execute(CMD_PROCESS_ALIVE, {"pid": pid})
-            return bool(resp["alive"])
+            if not bool(resp["alive"]):
+                return False
+            if pid in self.process_list():
+                return True
+            time.sleep(0.05)
+            return pid in self.process_list()
 
     def module_base(self, pid: int, name: str) -> int:
         with self._lock:
