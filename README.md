@@ -18,20 +18,31 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   payload，单槽位 target 语义，挑战-应答鉴权）
 - 设备端 agent：`ZhangTanjin/TanyaoCli` 仓库（`src/agent/`）
 
-## 能力面（29 个 MCP 工具）
+## 能力面（29 个 MCP 工具，v3 按能力位自动分派）
 
-- 侦察：`get_status` `find_process` `list_processes` `list_modules`
+- 侦察：`get_status`（含 `agent_capabilities`/`skipped_caps`）`find_process`
+  `list_processes` `list_modules`
   `resolve_module`（ELF load bias/BSS/mirror）`address_resolve`（RVA）
 - 内存：`read_memory`（原始/typed）`read_batch`（批量）`write_bytes`
-  （双门禁 + expect-old/verify）
+  （双门禁 + expect-old/verify；agent 声明 bit1 时单往返走 cmd 60，门禁仍在 host）
 - 扫描：`scan_set_default_ranges`（preset）`scan_value` `scan_hex`
   `scan_start`/`scan_status`（异步）`scan_next` `scan_results` `scan_cancel`
   `scan_clear`
-  —— 容错分区读，特殊页（PFNMAP）自动跳过，死区粒度几何升级
+  —— agent 声明 bit0 时走设备端扫描引擎（cmd 50–55，只回传命中），
+  否则回退主机引擎（冻结基线）：容错分区读、PFNMAP 自动跳过、死区粒度升级
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
-  （活内存 dynsym）`disassemble`（capstone 主引擎 + 零依赖子集 fallback）
-  `strings` `dump_module`（文件布局重建 + 节表清洗）`pull_apk` `apk_info`
-  `watch` `decompile_start`/`decompile_status`（Ghidra headless 异步）
+  （bit3 → cmd 61 设备端 dynsym 批量，否则活内存解析回退）
+  `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback）
+  `strings`（bit5 → cmd 62 设备端扫描）`dump_module`（bit6 → 设备端落盘 +
+  压缩分块拉取 + sha256 对账 + 显式清理，否则主机分块读重建）
+  `pull_apk`（bit6 时走 dump_pull path 变体）`apk_info`（`pid` 或
+  `apk_path` 二选一：pid 走 cmd 66 零镜像过网）`watch`
+  `decompile_start`/`decompile_status`（Ghidra headless 异步；dump 数据源
+  自动跟随管线）
+
+分派只看 hello `capabilities` 位图，不做版本号判断；所有输出只增字段
+（`engine`、`maps_source`、`skipped_caps`），MCP 工具面（名称/签名/形状）
+向后兼容。协议 v1.2 增量见 [docs/PROTOCOL_V1.2_DRAFT.md](docs/PROTOCOL_V1.2_DRAFT.md)。
 
 ## 快速开始
 
@@ -51,10 +62,10 @@ TANYAO_AGENT=<device-ip:52730> TANYAO_TOKEN=<token> ./scripts/start-serve.sh
 ## 测试
 
 ```bash
-python3 -m unittest discover tests          # 61 用例（mock agent，无需设备）
-python3 tests/mcp_regression.py             # 36 项真机回归（需 serve + 设备）
+python3 -m unittest discover tests          # 118 用例（mock agent，无需设备）
+python3 tests/mcp_regression.py             # 真机回归 + v1.2 能力条件项（需 serve + 设备）
 python3 -m tanyao.interop --host <ip> --port 52730 --token <token> --pid <pid>
-                                            # 设备端 agent 验收（TanyaoCli DoD）
+                                            # 设备端 agent 验收（按能力位条件化，含 skipped_caps）
 ```
 
 ## 仓库结构

@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .analysis import AnalysisFacade
 from .connection import AgentError
+from .constants import undeclared_agent_caps
 from .service import AgentUnavailable
 
 MAX_BODY = 1 << 20
@@ -54,13 +55,19 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             return int(raw, 16)
         raise AgentError("bad_request", detail=f"'{key}' must be 0x hex string or int")
 
-    methods = {
-        "get_status": lambda p: {
+    def get_status(_payload: dict) -> dict:
+        caps = facade.service.agent_capabilities()
+        return {
             "connected": facade.service.is_connected(),
             "generation": facade.service.generation(),
             "backend": _backend_dict(facade.service),
             "write_enabled": facade._write_enabled,
-        },
+            "agent_capabilities": hex(caps),
+            "skipped_caps": undeclared_agent_caps(caps),
+        }
+
+    methods = {
+        "get_status": get_status,
         "ping_agent": lambda p: facade.service.ping(),
         "connect": lambda p: {"backend": facade.service.connect().name},
         "find_process": lambda p: facade.find_process(str(p["name"])),

@@ -133,6 +133,13 @@ def main() -> int:
             st["connected"] and isinstance(st["generation"], int),
             f"backend={st['backend']['name']} caps={st['backend']['capabilities']} gen={st['generation']}"))
 
+        # v1.2 conditional items: engine fields asserted only when the agent
+        # declares the corresponding capability bit (else host fallback runs).
+        caps_mask = int(st.get("agent_capabilities", "0x0"), 16)
+        check("v1.2: get_status exposes agent_capabilities + skipped_caps", lambda: assert_true(
+            isinstance(st.get("agent_capabilities"), str) and isinstance(st.get("skipped_caps"), list),
+            f"caps={st.get('agent_capabilities')} skipped={st.get('skipped_caps')}"))
+
         fr = call_tool("find_process", {"name": "surfaceflinger"})
         pid = args.pid or fr["pid"]
         check("find_process: surfaceflinger", lambda: assert_true(isinstance(pid, int) and pid > 0, f"pid={pid}"))
@@ -228,6 +235,9 @@ def main() -> int:
         check("symbol_list: libc dynsym", lambda: assert_true(
             syms["total"] > 100 and len(syms["symbols"]) == 5,
             f"total={syms['total']}"))
+        if caps_mask & 8:
+            check("v1.2: symbol_list engine=agent-symbols", lambda: assert_true(
+                syms.get("engine") == "agent-symbols", f"engine={syms.get('engine')}"))
 
         sf = call_tool("symbol_find", {"pid": pid, "name": "pthread_create", "module": "libc.so"}, timeout=180)
         pthread_addr = sf["matches"][0]["address"]
@@ -243,12 +253,19 @@ def main() -> int:
         check("disassemble: live a64 window", lambda: assert_true(
             da["count"] == 4 and all(i["text"] for i in da["instructions"]) and
             da["module"] == "libc.so", f"module={da.get('module')} first={da['instructions'][0]['text']}"))
+        if caps_mask & 256:
+            check("v1.2: disassemble engine (agent-capstone or fallback)", lambda: assert_true(
+                da.get("engine") in ("agent-capstone", "capstone", "subset"),
+                f"engine={da.get('engine')}"))
 
         strs = call_tool("strings", {"pid": pid, "module": "libc.so",
                                      "min_length": 10, "limit": 5, "filter": "pthread"}, timeout=180)
         check("strings: libc module scan", lambda: assert_true(
             strs["count"] >= 1 and all("offset" in s for s in strs["strings"]),
             f"{strs['count']} strings, scanned={strs['scanned_bytes']}B"))
+        if caps_mask & 32:
+            check("v1.2: strings engine=agent-strings", lambda: assert_true(
+                strs.get("engine") == "agent-strings", f"engine={strs.get('engine')}"))
 
         try:
             pa = call_tool("pull_apk", {"pid": pid, "out": "/tmp/mcp-regression-pull.apk"}, timeout=180)
@@ -277,6 +294,9 @@ def main() -> int:
 
         sv = call_tool("scan_value", {"pid": pid, "type": "u32", "value": 0x00B70003})
         check("scan_value: e_type+machine u32 found", lambda: assert_true(sv["found"] >= 1, f"{sv['found']} hits"))
+        if caps_mask & 1:
+            check("v1.2: scan_value engine=agent-scan", lambda: assert_true(
+                sv.get("engine") == "agent-scan", f"engine={sv.get('engine')}"))
 
         sh = call_tool("scan_hex", {"pid": pid, "pattern": "03 00 B7 00"})
         check("scan_hex: AOB match (e_type+machine)", lambda: assert_true(sh["found"] >= 1, f"{sh['found']} hits"))
@@ -317,6 +337,9 @@ def main() -> int:
         manifest_ok = os.path.exists(DUMP_PATH + ".manifest.json")
         check("dump_module: ELF file + manifest", lambda: assert_true(
             dm["size"] > 0 and file_ok and manifest_ok, f"{dm['size']}B at {DUMP_PATH}"))
+        if caps_mask & 64:
+            check("v1.2: dump_module engine=agent-dump", lambda: assert_true(
+                dm.get("engine") == "agent-dump", f"engine={dm.get('engine')}"))
 
         w = call_tool("watch", {"pid": pid, "address": base_hex, "size": 8,
                                 "interval_ms": 50, "count": 3})

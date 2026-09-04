@@ -66,6 +66,23 @@ AGENT_CAP_DUMP_PIPELINE = 1 << 6  # cmd 63/64/65/68 dump to disk + chunked pull
 AGENT_CAP_APK_INFO = 1 << 7       # cmd 66 device-side apk metadata (zero-mirror)
 AGENT_CAP_DISASSEMBLE = 1 << 8    # cmd 67 device-side capstone disassembly (optional)
 
+AGENT_CAP_TABLE = (
+    (AGENT_CAP_SCAN, "scan"),
+    (AGENT_CAP_WRITE_TXN, "write_txn"),
+    (AGENT_CAP_SYMBOL_BATCH, "symbol_batch"),
+    (AGENT_CAP_BINARY_FRAMES, "binary_frames"),
+    (AGENT_CAP_STRINGS, "strings"),
+    (AGENT_CAP_DUMP_PIPELINE, "dump_pipeline"),
+    (AGENT_CAP_APK_INFO, "apk_info"),
+    (AGENT_CAP_DISASSEMBLE, "disassemble"),
+)
+
+
+def undeclared_agent_caps(mask: int) -> list[str]:
+    """Names of standard v1.2 capabilities the agent did NOT declare (the
+    skipped_caps diagnostic field: these ops stay on the host fallback)."""
+    return [name for bit, name in AGENT_CAP_TABLE if not mask & bit]
+
 # --- map entry flag bits (PROTOCOL.md section 4.7) -------------------------
 MAP_READ = 1 << 0
 MAP_WRITE = 1 << 1

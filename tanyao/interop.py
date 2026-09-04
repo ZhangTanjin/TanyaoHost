@@ -44,6 +44,7 @@ from .constants import (
     b64_decode,
     parse_u64,
 )
+from .frames import decode_dump_chunk
 from .connection import AgentConnection, AgentError
 
 _RESULTS: list[tuple[bool, str, str]] = []
@@ -311,10 +312,72 @@ def main() -> int:
 
     if not caps & AGENT_CAP_DUMP_PIPELINE:
         skipped_caps.append("dump_pipeline")
+    else:
+        def do_dump_pipeline():
+            import hashlib
+            import zlib
+
+            assert first_rx_map is not None
+            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
+            start = conn.request(63, {"pid": args.pid, "module": module})
+            dump_id, want_sha = start["dump_id"], start["sha256"]
+            hasher = hashlib.sha256()
+            offset = 0
+            while True:
+                frame = conn.request_raw(65, {"dump_id": dump_id,
+                                              "offset": f"0x{offset:x}",
+                                              "chunk": "0x40000", "compress": True})
+                if not isinstance(frame.payload, bytes):
+                    raise AssertionError("dump_pull returned a JSON frame")
+                chunk = decode_dump_chunk(frame.payload)
+                if chunk.offset != offset:
+                    raise AssertionError(f"offset drift: {chunk.offset} != {offset}")
+                data = chunk.data
+                if chunk.is_deflated:
+                    data = zlib.decompress(data)
+                hasher.update(data)
+                offset += len(data)
+                if chunk.is_last:
+                    break
+            assert hasher.hexdigest() == want_sha, "pull sha256 != dump_start sha256"
+            conn.request(68, {"dump_id": dump_id})
+            print(f"     NOTE: pipeline dump {module}: {offset}B, sha256 verified, cleaned up")
+        ok &= check("dump pipeline pull+sha256+cleanup (cmd 63/65/68)", do_dump_pipeline)
+
     if not caps & AGENT_CAP_APK_INFO:
         skipped_caps.append("apk_info")
+    else:
+        def do_apk_info():
+            try:
+                resp = conn.request(66, {"pid": args.pid})
+            except AgentError as exc:
+                # a target without a base.apk mapping is a clean not_found
+                if exc.error == "not_found":
+                    print("     NOTE: apk_info: target has no base.apk mapping (ok)")
+                    return
+                raise
+            assert resp.get("package"), "apk_info missing package"
+        ok &= check("apk_info (cmd 66)", do_apk_info)
+
     if not caps & AGENT_CAP_DISASSEMBLE:
         skipped_caps.append("disassemble")
+    else:
+        def do_disassemble():
+            assert first_rx_map is not None
+            start = parse_u64(first_rx_map["start"], field="start")
+            try:
+                resp = conn.request(67, {"pid": args.pid, "addr": f"0x{start + 0x100:x}",
+                                         "count": 4})
+            except AgentError as exc:
+                # declared but built without capstone: declared-unsupported path
+                if exc.error == "unsupported":
+                    print("     NOTE: disassemble declared but unsupported (no capstone)")
+                    return
+                raise
+            assert int(resp["count"]) == 4 and len(resp["instructions"]) == 4
+            for ins in resp["instructions"]:
+                assert "address" in ins and "bytes_hex" in ins and "mnemonic" in ins
+        ok &= check("disassemble (cmd 67)", do_disassemble)
 
     conn.close()
 

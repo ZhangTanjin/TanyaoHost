@@ -117,6 +117,16 @@ class TestCaps3AgentScan(MatrixBase):
         self.assertEqual(self.service.agent_capabilities(), 0x3)
         self.assertTrue(self.service.has_agent_cap(AGENT_CAP_SCAN))
 
+    def test_get_status_exposes_caps_and_skipped(self):
+        from tanyao.ipc import build_method_table
+
+        st = build_method_table(self.facade)["get_status"]({})
+        self.assertEqual(st["agent_capabilities"], "0x3")
+        skipped = st["skipped_caps"]
+        self.assertNotIn("scan", skipped)
+        self.assertIn("dump_pipeline", skipped)
+        self.assertIn("apk_info", skipped)
+
     def test_scan_value_agent_engine_inline(self):
         self.facade.scan_set_default_ranges(DEMO_PID)
         out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
