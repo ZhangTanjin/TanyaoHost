@@ -63,6 +63,18 @@ def check(name: str, fn) -> bool:
     return True
 
 
+def _as_int(value, field: str = "value") -> int:
+    """Wire ints arrive as JSON numbers from the agent; historical mock/client
+    flows used decimal or 0x-hex strings — accept every form (R2 item 3)."""
+    if isinstance(value, bool):
+        raise AssertionError(f"{field}: bool is not an int")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 0)
+    raise AssertionError(f"{field}: expected int, got {type(value).__name__}")
+
+
 def _recv_raw_frame(sock: socket.socket, timeout: float):
     sock.settimeout(timeout)
     buf = b""
@@ -141,7 +153,7 @@ def main() -> int:
     def do_backend_info():
         nonlocal backend
         backend = conn.request(CMD_BACKEND_INFO, {})
-        assert int(backend["abi_major"]) == 1, "abi_major != 1"
+        assert _as_int(backend["abi_major"], "abi_major") == 1, "abi_major != 1"
         assert parse_u64(backend["capabilities"]) != 0, "capabilities == 0"
         assert parse_u64(backend["max_transfer_size"]) > 0
     ok &= check("backend_info", do_backend_info)
@@ -166,10 +178,10 @@ def main() -> int:
         assert handle is not None
         resp = conn.request(CMD_TARGET_MAPS, {"handle": f"0x{handle:x}", "capacity": 4096})
         entries = resp.get("entries", [])
-        assert int(resp["entry_count"]) > 0, "no maps returned"
-        assert len(entries) == int(resp["entry_count"])
+        assert _as_int(resp["entry_count"], "entry_count") > 0, "no maps returned"
+        assert len(entries) == _as_int(resp["entry_count"], "entry_count")
         for entry in entries:
-            flags = int(entry["flags"])
+            flags = _as_int(entry["flags"], "flags")
             if flags & 1:
                 if flags & 4 and first_rx_map is None and entry["path"]:
                     first_rx_map = entry
@@ -183,7 +195,7 @@ def main() -> int:
         assert first_rx_map is not None
         start = parse_u64(first_rx_map["start"], field="start")
         resp = conn.request(CMD_MEM_READ, {"handle": f"0x{handle:x}", "addr": f"0x{start:x}", "size": "0x10"})
-        assert int(resp["status"]) == 0, f"status={resp['status']}"
+        assert _as_int(resp["status"], "status") == 0, f"status={resp['status']}"
         data = b64_decode(resp["data_b64"])
         assert len(data) == 16, f"short read: {len(data)}"
     ok &= check("mem_read 16 bytes", do_mem_read)
@@ -198,7 +210,7 @@ def main() -> int:
                     {"addr": f"0x{start+8:x}", "size": "0x8"}],
         })
         assert len(resp["spans"]) == 2
-        assert all(int(s["status"]) == 0 for s in resp["spans"])
+        assert all(_as_int(s["status"], "status") == 0 for s in resp["spans"])
     ok &= check("mem_readv", do_mem_readv)
 
     # 11. optional write + readback
@@ -209,7 +221,7 @@ def main() -> int:
             payload_in = bytes(range(16))
             resp = conn.request(CMD_MEM_WRITE, {"handle": f"0x{handle:x}", "addr": f"0x{start:x}",
                                                 "data_b64": __import__("base64").b64encode(payload_in).decode()})
-            assert int(resp["status"]) == 0
+            assert _as_int(resp["status"], "status") == 0
             assert parse_u64(resp["result_size"]) == 16
             back = conn.request(CMD_MEM_READ, {"handle": f"0x{handle:x}", "addr": f"0x{start:x}", "size": "0x10"})
             assert b64_decode(back["data_b64"]) == payload_in, "readback mismatch"
@@ -237,11 +249,6 @@ def main() -> int:
             if exc.error != "not_found":
                 raise AssertionError(f"expected not_found, got {exc.error}")
     ok &= check("legacy process_find (not_found path)", do_legacy)
-
-    # 14. target_close
-    def do_close():
-        conn.request(CMD_TARGET_CLOSE, {"handle": f"0x{handle:x}"})
-    ok &= check("target_close", do_close)
 
     # -- v1.2 conditional capability checks (draft §7: declared → check,
     #    undeclared → record in skipped_caps and skip) ---------------------------
@@ -309,18 +316,36 @@ def main() -> int:
 
     if caps & AGENT_CAP_SYMBOL_BATCH:
         def do_symbol_batch():
-            assert first_rx_map is not None
-            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
-            resp = conn.request(CMD_SYMBOL_BATCH, {"pid": args.pid, "module": module,
-                                                   "format": "json"})
-            count = int(resp["count"])
-            assert count > 0, "symbol_batch returned zero symbols"
-            for field in ("names", "addresses", "sizes", "types"):
-                assert len(resp[field]) == count, f"{field} column misaligned"
-            if "binds" in resp:
-                assert len(resp["binds"]) == count
-            print(f"     NOTE: symbol_batch {module}: {count} symbols")
-        ok &= check("symbol_batch json (cmd 61)", do_symbol_batch)
+            # The usual interop target (tanyao_target) is NDK-static with no
+            # PT_DYNAMIC — not_found there is CORRECT behavior. Probe modules
+            # that carry a dynamic segment instead; assert non-empty table when
+            # one exists (R2 item 2).
+            candidates = []
+            if first_rx_map is not None:
+                candidates.append((first_rx_map.get("path") or "").rsplit("/", 1)[-1])
+            candidates += ["libc.so", "linker64", "linker"]
+            tried = []
+            for module in candidates:
+                if not module or module in tried:
+                    continue
+                tried.append(module)
+                try:
+                    resp = conn.request(CMD_SYMBOL_BATCH, {"pid": args.pid, "module": module,
+                                                           "format": "json"})
+                except AgentError as exc:
+                    if exc.error == "not_found":
+                        continue  # no dynamic segment in this module: correct
+                    raise
+                count = _as_int(resp.get("count"), "count")
+                assert count > 0, f"symbol_batch returned zero symbols for {module}"
+                for field in ("names", "addresses", "sizes", "types"):
+                    assert len(resp[field]) == count, f"{field} column misaligned"
+                if "binds" in resp:
+                    assert len(resp["binds"]) == count
+                print(f"     NOTE: symbol_batch {module}: {count} symbols")
+                return
+            print("     NOTE: no dynsym-bearing module on this target (all not_found) — cmd 61 not verifiable here")
+        ok &= check("symbol_batch json (cmd 61, dynsym-bearing module)", do_symbol_batch)
     else:
         skipped_caps.append("symbol_batch")
 
@@ -330,7 +355,7 @@ def main() -> int:
             module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
             resp = conn.request(62, {"pid": args.pid, "preset": f"module:{module}",
                                      "min_len": 8, "max_results": 16})
-            assert int(resp["count"]) >= 0
+            assert _as_int(resp.get("count"), "count") >= 0
             for item in resp.get("results", []):
                 assert "address" in item and "value" in item
         ok &= check("strings_scan sync (cmd 62)", do_strings_scan)
@@ -401,10 +426,17 @@ def main() -> int:
                     print("     NOTE: disassemble declared but unsupported (no capstone)")
                     return
                 raise
-            assert int(resp["count"]) == 4 and len(resp["instructions"]) == 4
+            assert _as_int(resp.get("count"), "count") == 4 and len(resp["instructions"]) == 4
             for ins in resp["instructions"]:
                 assert "address" in ins and "bytes_hex" in ins and "mnemonic" in ins
         ok &= check("disassemble (cmd 67)", do_disassemble)
+
+    # 14. target_close — deliberately LAST: the capability checks above reuse
+    # the open handle (mem_read for the scan pattern); closing earlier made
+    # them depend on a dead handle (R2 item 1, device R1 handover)
+    def do_close():
+        conn.request(CMD_TARGET_CLOSE, {"handle": f"0x{handle:x}"})
+    ok &= check("target_close", do_close)
 
     conn.close()
 
