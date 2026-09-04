@@ -26,6 +26,7 @@ from .constants import (
     CMD_TARGET_MAPS,
     CMD_TARGET_OPEN,
     DEFAULT_PORT,
+    ProtocolError,
     b64_decode,
     b64_encode,
     hex_u64,
@@ -33,8 +34,9 @@ from .constants import (
 )
 from .connection import AgentConnection, AgentError
 
-# Host-side ceiling on a single mem_read/mem_write chunk, independent of what
-# the backend advertises. Keeps worst-case frame sizes bounded.
+# Protocol v1 returns bytes as base64 inside a 16MiB JSON payload. A 4MiB raw
+# ceiling leaves room for base64 expansion and JSON metadata while keeping
+# single-span read/write requests portable across agent implementations.
 MAX_TRANSFER_FALLBACK = 4 * 1024 * 1024
 
 
@@ -182,6 +184,12 @@ class TanyaoService:
             if exc.error == "auth_failed":
                 self._drop_connection()
             raise
+        except ProtocolError as exc:
+            # A framing/handshake violation leaves the stream untrustworthy:
+            # drop the socket so the next call reconnects cleanly instead of
+            # parsing garbage from a desynced buffer.
+            self._drop_connection()
+            raise AgentError("protocol_error", detail=str(exc)) from exc
 
     def _require_handle(self, pid: int) -> TargetSession:
         """Get or reopen the target session for pid.

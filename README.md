@@ -18,14 +18,15 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   payload，单槽位 target 语义，挑战-应答鉴权）
 - 设备端 agent：`ZhangTanjin/TanyaoCli` 仓库（`src/agent/`）
 
-## 能力面（28 个 MCP 工具）
+## 能力面（29 个 MCP 工具）
 
 - 侦察：`get_status` `find_process` `list_processes` `list_modules`
   `resolve_module`（ELF load bias/BSS/mirror）`address_resolve`（RVA）
 - 内存：`read_memory`（原始/typed）`read_batch`（批量）`write_bytes`
   （双门禁 + expect-old/verify）
 - 扫描：`scan_set_default_ranges`（preset）`scan_value` `scan_hex`
-  `scan_start`/`scan_status`（异步）`scan_next` `scan_results` `scan_clear`
+  `scan_start`/`scan_status`（异步）`scan_next` `scan_results` `scan_cancel`
+  `scan_clear`
   —— 容错分区读，特殊页（PFNMAP）自动跳过，死区粒度几何升级
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
   （活内存 dynsym）`disassemble`（capstone 主引擎 + 零依赖子集 fallback）

@@ -145,6 +145,65 @@ class TestFieldRegression(unittest.TestCase):
         self.assertEqual(out["found"], 1)
 
 
+class TestAobStraddle(unittest.TestCase):
+    """scan_hex carry semantics: straddling matches found exactly once.
+
+    Regression: a working-tree variant scanned each chunk starting AFTER the
+    carry prefix (i = len(carry)), which silently dropped every AOB match
+    crossing a chunk boundary. Correct behavior: scan from the carry start and
+    skip only matches that END within already-scanned bytes."""
+
+    @staticmethod
+    def _engine(data: bytes, base: int) -> "ScanEngine":
+        from tanyao.scan import ScanEngine
+
+        buf = bytearray(data)
+
+        def read(pid, addr, size):
+            off = addr - base
+            if off < 0 or off + size > len(buf):
+                raise MemoryError("out of range")
+            return bytes(buf[off : off + size])
+
+        eng = ScanEngine(read)  # no readv: deterministic chunking path
+        eng.set_ranges(1, [(base, base + len(buf))])
+        return eng
+
+    def test_straddling_match_found_across_chunk_boundary(self):
+        base = 0x100000
+        data = bytearray(b"\xcc" * 0x100)
+        marker = bytes.fromhex("EFBEADDE")
+        data[0x1E:0x22] = marker  # straddles a 0x20-byte boundary
+        eng = self._engine(bytes(data), base)
+        for chunk in (0x10, 0x20, 0x21, 0x40):
+            eng.scan_hex(1, marker, b"\xff" * 4, chunk=chunk)
+            self.assertEqual(
+                eng.state.hits[0].address,
+                base + 0x1E,
+                f"straddle missed with chunk=0x{chunk:x}",
+            )
+            self.assertEqual(len(eng.state.hits), 1)
+
+    def test_no_duplicates_across_many_chunks(self):
+        base = 0x200000
+        data = bytearray(b"\x00" * 0x200)
+        marker = bytes.fromhex("CAFEF00D")
+        data[0x40:0x44] = marker
+        data[0x140:0x144] = marker
+        eng = self._engine(bytes(data), base)
+        found = eng.scan_hex(1, marker, b"\xff" * 4, chunk=0x18)
+        self.assertEqual(found, 2)
+        self.assertEqual({h.address for h in eng.state.hits}, {base + 0x40, base + 0x140})
+
+    def test_wildcard_straddle(self):
+        base = 0x300000
+        data = bytearray(b"\x11" * 0x80)
+        data[0x3F:0x43] = bytes.fromhex("7F450000")  # ?? ?? wildcard tail crosses 0x40
+        eng = self._engine(bytes(data), base)
+        eng.scan_hex(1, bytes.fromhex("7F450000"), bytes.fromhex("FFFF0000"), chunk=0x20)
+        self.assertEqual([h.address for h in eng.state.hits], [base + 0x3F])
+
+
 if __name__ == "__main__":
     unittest.main()
 

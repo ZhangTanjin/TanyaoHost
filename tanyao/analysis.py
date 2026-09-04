@@ -70,7 +70,12 @@ class AnalysisFacade:
         engine = self._scans.get(pid)
         if engine is None:
             backend = self.service.backend_info()
-            engine = ScanEngine(self.service.mem_read, max_transfer=backend.max_transfer_size)
+            engine = ScanEngine(
+                self.service.mem_read,
+                max_transfer=backend.max_transfer_size,
+                readv_fn=self.service.mem_readv,
+                max_iov=backend.max_iov,
+            )
             self._scans[pid] = engine
         return engine
 

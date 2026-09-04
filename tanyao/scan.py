@@ -29,7 +29,13 @@ TYPES: dict[str, tuple[str, int, str]] = {
 }
 
 MAX_HITS = 200_000
-DEFAULT_CHUNK = 1 << 20
+# Protocol v1 carries binary data as base64 inside a 16MiB JSON frame. Keep a
+# single raw transfer well below that ceiling, then batch disjoint spans to
+# amortize TCP/JSON round trips across fragmented VMAs.
+MAX_SAFE_TRANSFER = 4 * 1024 * 1024
+DEFAULT_CHUNK = MAX_SAFE_TRANSFER
+READV_BATCH_BYTES = 8 * 1024 * 1024
+READV_BATCH_IOV = 64
 
 PAC_MASK_DEFAULT = 0x0000FFFFFFFFFFFF
 
@@ -70,10 +76,14 @@ def _matches(found: int | float, want: int | float, epsilon: float) -> bool:
 class ScanEngine:
     """One scan state per target process; the service owns lifecycle."""
 
-    def __init__(self, read_fn, max_transfer: int = DEFAULT_CHUNK) -> None:
+    def __init__(self, read_fn, max_transfer: int = DEFAULT_CHUNK, readv_fn=None, max_iov: int = READV_BATCH_IOV) -> None:
         # read_fn(pid, address, size) -> bytes ; raises AgentError on failure
+        # readv_fn(pid, [(address, size), ...]) -> [bytes|None] is optional;
+        # when present, disjoint chunks are batched to amortize round trips.
         self._read = read_fn
-        self._max_transfer = max_transfer
+        self._readv = readv_fn
+        self._max_iov = max(1, min(max_iov, READV_BATCH_IOV))
+        self._max_transfer = min(max_transfer, MAX_SAFE_TRANSFER)
         self._dead_gran = self.MIN_SCAN_CHUNK  # engine-level dead-zone skip granularity
         self.state = ScanState()
 
@@ -105,7 +115,7 @@ class ScanEngine:
 
     MIN_SCAN_CHUNK = 4096
 
-    def _scan_region(self, pid: int, lo: int, hi: int, chunk: int, on_chunk) -> None:
+    def _scan_region(self, pid: int, lo: int, hi: int, chunk: int, on_chunk, on_skip=None) -> None:
         """Fault-tolerant STREAMING read+scan of [lo, hi).
 
         on_chunk(addr, data) fires as each chunk arrives — reads and scanning
@@ -133,11 +143,13 @@ class ScanEngine:
                 eff = self._dead_gran
                 if take <= eff:
                     self.state.skipped_ranges.append((pos, pos + take))
+                    if on_skip is not None:
+                        on_skip(pos, pos + take)
                     pos += take
                     self._dead_gran = min(64 * 1024 * 1024, eff * 2)
                     continue
                 mid = pos + max(eff, (take // 2 // eff) * eff)
-                self._scan_region(pid, pos, mid, chunk, on_chunk)
+                self._scan_region(pid, pos, mid, chunk, on_chunk, on_skip)
                 pos = mid
                 self._dead_gran = min(64 * 1024 * 1024, eff * 2)
                 continue
@@ -147,6 +159,64 @@ class ScanEngine:
             self._dead_gran = self.MIN_SCAN_CHUNK  # successful read resets granularity
             on_chunk(pos, data)
             pos += len(data)
+
+    def _scan_ranges(self, pid: int, on_chunk, on_gap=None, on_skip=None, chunk: int | None = None) -> None:
+        """Scan configured ranges, batching ordinary chunks through MEM_READV.
+
+        The v1 envelope carries binary bytes as base64 inside a 16MiB JSON
+        payload. Keep each readv batch <=8MiB raw and <=64 spans; this
+        amortizes request/response latency across fragmented VMAs without
+        exceeding the frame budget. A failed span falls back to _scan_region
+        for bisection and precise skipped accounting.
+        """
+        ranges = list(self.state.ranges)
+        cap = self._max_transfer if chunk and chunk > 0 else DEFAULT_CHUNK
+        chunk = min(cap, self._max_transfer)
+        if self._readv is None:
+            for index, (lo, hi) in enumerate(ranges):
+                if index and on_gap is not None:
+                    on_gap()
+                self._scan_region(pid, lo, hi, chunk, on_chunk, on_skip)
+            return
+
+        pending: list[tuple[int, int, int]] = []
+        pending_bytes = 0
+
+        def flush() -> None:
+            nonlocal pending, pending_bytes
+            if not pending:
+                return
+            spans = [(addr, size) for addr, size, _range_id in pending]
+            try:
+                results = list(self._readv(pid, spans))
+            except Exception:
+                results = [None] * len(spans)
+            if len(results) < len(pending):
+                results.extend([None] * (len(pending) - len(results)))
+            previous_range = None
+            for (addr, size, range_id), data in zip(pending, results):
+                if previous_range is not None and range_id != previous_range and on_gap is not None:
+                    on_gap()
+                if data is None or len(data) != size:
+                    if on_gap is not None:
+                        on_gap()
+                    self._scan_region(pid, addr, addr + size, chunk, on_chunk, on_skip)
+                else:
+                    on_chunk(addr, data)
+                previous_range = range_id
+            pending = []
+            pending_bytes = 0
+
+        for range_id, (lo, hi) in enumerate(ranges):
+            pos = lo
+            while pos < hi:
+                take = min(chunk, hi - pos)
+                if pending and (len(pending) >= self._max_iov or pending_bytes + take > READV_BATCH_BYTES):
+                    flush()
+                pending.append((pos, take, range_id))
+                pending_bytes += take
+                pos += take
+        flush()
 
     # -- first scan ---------------------------------------------------------------
 
@@ -165,6 +235,7 @@ class ScanEngine:
         fmt, size, _kind = TYPES[vtype]
         align = alignment or size
         want = float(value) if isinstance(value, float) else int(value)
+        self._dead_gran = self.MIN_SCAN_CHUNK  # each scan starts with fine fault isolation
         self.state = ScanState(pid=pid, vtype=vtype, ranges=self.state.ranges if self.state.pid == pid else [])
         if not self.state.ranges:
             raise ValueError("no scan ranges set; call set_ranges/set_default_ranges first")
@@ -192,10 +263,16 @@ class ScanEngine:
             if progress:
                 progress(done, total)
 
-        for start, end in self.state.ranges:
-            self._scan_region(pid, start, end, min(chunk, self._max_transfer), on_chunk)
-            if truncated:
-                break
+        def on_skip(lo: int, hi: int) -> None:
+            nonlocal done
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
+            done += hi - lo
+            if progress:
+                progress(done, total)
+
+        self.state.skipped_ranges = []
+        self._scan_ranges(pid, on_chunk, on_skip=on_skip, chunk=chunk)
         self.state.skipped_ranges = self._coalesce(self.state.skipped_ranges)
         self.state.hits = hits
         self.state.truncated = truncated
@@ -207,24 +284,31 @@ class ScanEngine:
         if not pattern or len(pattern) != len(mask):
             raise ValueError("pattern/mask length mismatch")
         plen = len(pattern)
+        self._dead_gran = self.MIN_SCAN_CHUNK  # each scan starts with fine fault isolation
         self.state = ScanState(pid=pid, vtype="bytes", ranges=self.state.ranges if self.state.pid == pid else [])
         if not self.state.ranges:
             raise ValueError("no scan ranges set")
         hits: list[Hit] = []
         truncated = False
         carry = b""      # tail of previous contiguous chunk (straddling matches)
-        carry_addr = 0
         done = 0
         total = sum(end - start for start, end in self.state.ranges)
 
         def on_chunk(addr: int, data: bytes) -> None:
-            nonlocal carry, carry_addr, done, truncated
+            nonlocal carry, done, truncated
             if cancel_event is not None and cancel_event.is_set():
                 raise ScanCancelled()
             buf = carry + data
             base = addr - len(carry)
+            # Scan from the carry prefix: a match starting in the previous
+            # chunk's tail may straddle into this chunk. Matches that END
+            # within already-scanned bytes were reported there, so skip only
+            # those (base+i+plen <= addr); straddling ones must be caught now.
             i = 0
             while i + plen <= len(buf):
+                if base + i + plen <= addr:
+                    i += 1
+                    continue
                 seg = buf[i : i + plen]
                 if all((seg[j] & mask[j]) == (pattern[j] & mask[j]) for j in range(plen) if mask[j]):
                     hits.append(Hit(address=base + i, value=int.from_bytes(seg[:8], "little")))
@@ -233,16 +317,25 @@ class ScanEngine:
                         return
                 i += 1
             carry = buf[len(buf) - (plen - 1):] if plen > 1 else b""
-            carry_addr = addr + len(data) - len(carry)
             done += len(data)
             if progress:
                 progress(done, total)
 
-        for start, end in self.state.ranges:
-            self._scan_region(pid, start, end, min(chunk, self._max_transfer), on_chunk)
-            carry = b""  # hole skipped: straddling carry is invalid across the gap
-            if truncated:
-                break
+        def on_gap() -> None:
+            nonlocal carry
+            carry = b""  # matches must never cross a VMA or skipped hole
+
+        def on_skip(lo: int, hi: int) -> None:
+            nonlocal done
+            on_gap()
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
+            done += hi - lo
+            if progress:
+                progress(done, total)
+
+        self.state.skipped_ranges = []
+        self._scan_ranges(pid, on_chunk, on_gap=on_gap, on_skip=on_skip, chunk=chunk)
         self.state.skipped_ranges = self._coalesce(self.state.skipped_ranges)
         self.state.hits = hits
         self.state.truncated = truncated

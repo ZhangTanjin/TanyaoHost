@@ -117,12 +117,13 @@ def main() -> int:
             "get_status", "find_process", "list_processes", "list_modules",
             "resolve_module", "address_resolve", "read_memory", "write_bytes",
             "resolve_offset_chain", "read_batch", "scan_start", "scan_status",
-            "symbol_list", "symbol_find", "scan_set_default_ranges", "scan_value",
+            "scan_cancel", "symbol_list", "symbol_find",
+            "scan_set_default_ranges", "scan_value",
             "scan_hex", "scan_next", "scan_results", "scan_clear", "dump_module", "watch",
             "disassemble", "strings", "pull_apk", "apk_info",
             "decompile_start", "decompile_status",
         ])
-        check("mcp: tools/list == 28 expected", lambda: assert_true(
+        check("mcp: tools/list == 29 expected", lambda: assert_true(
             tool_names == expected, f"got {len(tool_names)}: missing="
             f"{set(expected) - set(tool_names)}, extra={set(tool_names) - set(expected)}"))
 

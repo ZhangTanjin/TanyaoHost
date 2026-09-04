@@ -1,7 +1,13 @@
-# Tanyao Agent 线协议 v1（唯一真相源）
+# Tanyao Agent 线协议 v1.1（唯一真相源）
 
 双端（主机 `tanyao-host` / 设备 `tanyao-agent`）以本文为唯一协议依据。
 任何修改必须先改本文并同步双方 + 互通测试。
+
+> **版本说明（2026-09-04）**：v1.1 扩展（能力协商 + cmd 50–55 设备端扫描 +
+> cmd 60 写入事务，原 `TanyaoCli/docs/AGENT_PROTOCOL_EXTENSIONS.md` 草案）
+> 已定版并入本文（§3 表、§4.0、§5 表、§7），该草案文档转为存档。
+> 下一增量 **v1.2（计算下沉）**正在 `docs/PROTOCOL_V1.2_DRAFT.md` 评审
+> （符号批量/strings/dump 管线/apk 元信息/二进制帧），定版后才并入本文。
 
 设计原则：agent 只做"帧 ↔ ioctl"翻译，不含任何业务逻辑；
 所有 u64 值走 JSON 十六进制字符串，避免 JS/Python 浮点精度丢失；
@@ -54,8 +60,16 @@
 | 41 | process_list | host→agent | legacy `OP_LIST_PROC` |
 | 42 | process_alive | host→agent | legacy `OP_ALIVE` |
 | 43 | module_base | host→agent | legacy `OP_MODULE_BASE` |
+| 50 | scan_start | host→agent | 设备端本地扫描（§7.3，能力位 bit0） |
+| 51 | scan_status | host→agent | 扫描 job 状态/进度 |
+| 52 | scan_refine | host→agent | 扫描命中精筛 |
+| 53 | scan_results | host→agent | 扫描结果分页 |
+| 54 | scan_cancel | host→agent | 取消扫描 job |
+| 55 | scan_clear | host→agent | 清空扫描结果（保留范围配置） |
+| 60 | write_txn | host→agent | 单地址写入事务（§7.6，能力位 bit1） |
 
 未识别的 cmd：回 `ERROR` 帧（error=`unsupported_cmd`），**不断开**。
+能力位未声明的 cmd 同样回 `unsupported_cmd`（§7.1）。
 
 ## 4. JSON 约定
 
@@ -69,9 +83,13 @@
 ### 4.0 hello（agent 主动推送，seq=0）
 
 ```json
-{"agent":"tanyao-agent","version":"1.0.0","generation":7,
- "challenge":"<64个小写hex，随机每次连接>"}
+{"agent":"tanyao-agent","version":"1.1.0","generation":7,
+ "challenge":"<64个小写hex，随机每次连接>","capabilities":"0x3"}
 ```
+
+`capabilities` 为 agent 层能力位图（§7.1），v1.0 解析方忽略该未知字段，
+向后兼容。agent 实际发送的 `version` 自 v1.1 定版起为 `"1.1.0"`
+（历史实现曾发 `"1.0.0"`，修正项登记于 TanyaoCli `PROMPT_V3_AGENT.md` M0）。
 
 ### 4.1 auth
 
@@ -182,6 +200,8 @@ ERROR 帧 payload：
 | `unsupported_cmd` | 未知 cmd | 0 |
 | `backend_error` | ioctl 失败 | 内核 errno（负数原样带出） |
 | `not_found` | 进程/模块无匹配 | 0 |
+| `expect_old_mismatch` | write_txn：expect_old 比较失败（响应含 `old_b64`） | 0 |
+| `verify_failed` | write_txn：写后校验失败（已回滚） | 0 |
 | `internal` | agent 内部错误 | 0 |
 
 规则：内核 ioctl 返回 -1/负 status 时用 `backend_error` + `errno`；
@@ -199,3 +219,86 @@ ERROR 帧 payload：
    （per-connection target 列表，见 §4.5 单槽位语义）；host 同时丢弃 handle 缓存。
 6. SIGTERM/SIGINT：agent 尽量回 shutdown 响应后干净退出；退出前 close 全部
    target（内核侧也会随 fd 自动清理，这是兜底）。
+
+## 7. v1.1 扩展：设备端扫描引擎与写入事务（已定版，2026-09-04 合并）
+
+本章内容由 `TanyaoCli/docs/AGENT_PROTOCOL_EXTENSIONS.md` 草案定版合并而来；
+该草案转为存档，不再维护。原则不变：不破坏 v1——全部为新增 cmd + 能力位
+协商，旧 host/旧 agent 组合行为不变。
+
+### 7.1 能力位（hello.capabilities）
+
+agent 层能力位与内核 `backend_info.capabilities` 分开命名空间，从 bit0 起：
+
+| bit | 名称 | 含义 |
+| --- | --- | --- |
+| 0 | AGENT_SCAN | cmd 50–55（agent 本地扫描引擎） |
+| 1 | WRITE_TXN | cmd 60（写入事务） |
+
+host 从 hello 读 `capabilities`；未声明的 cmd 一律得到 `unsupported_cmd`
+（不断开）。v1.2 增量位（bit2 起）见 `docs/PROTOCOL_V1.2_DRAFT.md`。
+
+### 7.2 cmd 50 scan_start（异步，agent 后台线程执行）
+
+请求：
+
+```json
+{"pid":1234,"kind":"value","type":"u32","value":1337,
+ "epsilon":0.0,"alignment":0,"preset":"anon","module":""}
+```
+
+- `kind`：`value` | `hex`；hex 时用 `pattern`（`7F 45 ?? 46`，`?`/`??` 通配）
+- `type`：u8..u64 / i8..i64 / f32 / f64（小端）
+- `alignment`：0 = 元素大小；对齐按**绝对地址**计算
+- `preset`：`anon`（可读匿名 + 可写无路径）/ `stack` / `module:<basename>` /
+  `all_readable`
+- 若会话当前 target 与 pid 不同：agent 自动 close 旧 target 再 open
+
+响应：`{"job_id":7,"state":"running","total_bytes":"0x...","ranges":12}`
+（同 pid 已有运行中 job 时先自动 cancel 旧 job，响应加 `"cancelled_old":true`）
+
+### 7.3 cmd 51–55
+
+- `scan_status {"job_id":7}`（可省略 = 当前 job）→
+  `{"job_id":7,"state":"running|done|error|cancelled","pid":1234,"type":"u32",
+  "round":1,"scanned_bytes":"0x...","total_bytes":"0x...","skipped_bytes":"0x...",
+  "matches":42,"truncated":false,"rate_mbps":820.5,"elapsed_sec":3.2,"error":""}`
+- `scan_refine {"mode":"eq|neq|changed|unchanged|increased|decreased",
+  "value":1337,"epsilon":0.0}`（hex job 仅 changed/unchanged）→
+  `{"job_id":7,"matches":17,"round":2}`；未读到的命中直接丢弃，round +1
+- `scan_results {"offset":0,"limit":256}` →
+  `{"count":42,"truncated":false,"hits":[{"address":"0x...","value":1337,
+  "value_hex":"0x..."}]}`（value_hex 为原始 8 字节小端，供 u64 精度兜底）
+- `scan_cancel {}` → `{"ok":true,"state":"cancelled"}`
+- `scan_clear {}` → `{"ok":true}`（清结果，保留范围配置，round=0）
+
+### 7.4 扫描语义（与 host scan.py 对齐，真相源为本章 + 设备端实现）
+
+- 类型表小端，`alignment or size`，按绝对地址对齐
+- 浮点：epsilon>0 用 `|a-b|<=eps`，否则 `isclose(rel_tol=1e-6)`；整数精确相等
+- `MAX_HITS=200000`，超出置 `truncated` 并停止追加
+- 故障二分：失败 chunk 按 dead-granularity（4KB 起 ×2 至 64MB 封顶，成功
+  复位）下分，只跳过不可读叶；skipped 计入进度并合并区间
+- AOB：区域间 carry 清零（命中不跨 VMA/跳过区），区域内保留 `plen-1` 尾字节
+- 生命周期：单客户端，扫描 job 属于连接，断连自动 cancel（target 由 §6.5
+  的 per-connection 机制回收）
+
+### 7.5 cmd 60 write_txn（单地址写入事务）
+
+请求：`{"handle":"0x..","addr":"0x..","data_b64":"..",
+"expect_old_b64":"..","verify":true}`
+
+agent 本地顺序执行：read old → expect_old 比较 → write → verify 回读 →
+失败回滚。响应：`{"ok":true,"old_b64":"..","result_size":"0x..",
+"verified":true,"rolled_back":false}`
+
+失败：`expect_old` 不匹配 → ERROR `expect_old_mismatch`（含 `old_b64`）；
+verify 失败 → ERROR `verify_failed`（已回滚）；写入失败 → ERROR
+`backend_error` + errno（已尽力回滚）。**明确非原子**：read→write 窗口为
+agent 本地微秒级，不构成跨地址或内核级原子事务，host 不得据此假设并发安全。
+
+### 7.6 v1.1 定版勘误记录
+
+- 草案 §1 曾写 "cmd 50–56"：笔误，实现与清单均为 50–55。
+- 草案 hello 示例 `"version":"1.1.0"` 与 agent 实发 `"1.0.0"` 不一致：
+  定版后 agent 统一发 `"1.1.0"`（修正项在 TanyaoCli 仓库 M0）。

@@ -9,11 +9,12 @@ Run:  python3 -m tanyao.mcp_server          (requires `serve` to be running)
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-IPC_URL = "http://127.0.0.1:28101/"
+IPC_URL = os.environ.get("TANYAO_IPC_URL", "http://127.0.0.1:28101/")
 SERVER_NAME = "tanyao-host"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_VERSION = "2024-11-05"
