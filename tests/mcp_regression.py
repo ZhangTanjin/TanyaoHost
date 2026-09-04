@@ -245,6 +245,62 @@ def main() -> int:
                 raise AssertionError("write to unmapped pid succeeded with gate closed")
             check("write_bytes: gate state honored, no live-target mutation", write_gate)
 
+        # -- D2 coverage: write-success path (CONDITIONAL, own target ONLY) -----
+        # Gate off (default): record the skip, never write. Gate on (operator
+        # explicitly started serve with TANYAO_ALLOW_WRITE=1): exercise the
+        # success chain against the tester's OWN sacrificial target — a live
+        # target is never substituted (discipline: find_process miss → skip).
+        if not st.get("write_enabled"):
+            check("D2 write-success: skipped (gate off)", lambda: "skipped: gate off")
+        elif args.skip_write:
+            check("D2 write-success: skipped (--skip-write)", lambda: "skipped: --skip-write")
+        else:
+            tgt_pid = call_tool("find_process", {"name": "tanyao_target"}).get("pid")
+            if not tgt_pid:
+                check("D2 write-success: skipped (own target tanyao_target not found)",
+                      lambda: "skipped: no own target, live fallback forbidden")
+            else:
+                d2_state = {"races": 0}
+
+                def d2_write_success():
+                    mods = call_tool("list_modules", {"pid": tgt_pid})
+                    first = sorted(mods["modules"], key=lambda m: int(m["base"], 16))[0]
+                    addr = hex(int(first["base"], 16) + 0x1000)
+                    data = None
+                    for attempt in range(3):
+                        fresh = call_tool("read_memory", {"pid": tgt_pid, "address": addr, "size": 16})
+                        data = fresh["data_hex"]
+                        try:
+                            # content-preserving write: same bytes back, gated by expect_old
+                            w = call_tool("write_bytes", {"pid": tgt_pid, "address": addr,
+                                                          "data_hex": data,
+                                                          "expect_old_hex": data})
+                        except AssertionError as exc:
+                            if "expect_old_mismatch" in str(exc) and attempt < 2:
+                                d2_state["races"] += 1  # target tick raced read→write: retry, not a failure
+                                continue
+                            raise
+                        assert_true(w.get("verified") is True, f"verified={w.get('verified')}")
+                        assert_true(w.get("rolled_back") is False,
+                                    f"D2 regression: rolled_back={w.get('rolled_back')} on success path")
+                        back = call_tool("read_memory", {"pid": tgt_pid, "address": addr, "size": 16})
+                        assert_true(back["data_hex"] == data, "readback mismatch after success write")
+                        # D5 pairing: mismatch negative must surface the old bytes
+                        try:
+                            call_tool("write_bytes", {"pid": tgt_pid, "address": addr,
+                                                      "data_hex": "00" * 16,
+                                                      "expect_old_hex": "ff" * 16})
+                        except AssertionError as exc:
+                            text = str(exc)
+                            assert_true("expect_old_mismatch" in text, text[:160])
+                            assert_true("old_b64" in text,
+                                        f"old_b64 missing from error payload: {text[:240]}")
+                            return f"ok (expect_old races={d2_state['races']})"
+                        raise AssertionError("write with wrong expect_old unexpectedly succeeded")
+                    raise AssertionError("write-success attempts exhausted by target races")
+                check("D2 write-success: verified + rolled_back=false + old_b64 negative (own target)",
+                      d2_write_success)
+
         rb = call_tool("read_batch", {"pid": pid, "spans": [
             {"address": base_hex, "size": 8}, {"address": hex(base + 8), "size": 8}]})
         check("read_batch: 2 spans", lambda: assert_true(
