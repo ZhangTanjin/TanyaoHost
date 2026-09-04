@@ -13,6 +13,9 @@ MAX_PAYLOAD = 16 * 1024 * 1024
 
 FLAG_RESPONSE = 0x01
 FLAG_ERROR = 0x02
+# v1.2 draft §2: PAYLOAD_BINARY — agent→host responses only; a host request
+# carrying this bit is a protocol violation (agent must disconnect).
+FLAG_PAYLOAD_BINARY = 0x04
 
 # --- opcodes (PROTOCOL.md section 3) ---------------------------------------
 CMD_HELLO = 0
@@ -31,8 +34,37 @@ CMD_PROCESS_FIND = 40
 CMD_PROCESS_LIST = 41
 CMD_PROCESS_ALIVE = 42
 CMD_MODULE_BASE = 43
+# --- v1.1 device-local scan engine + write transaction (PROTOCOL.md §7) ----
+CMD_SCAN_START = 50
+CMD_SCAN_STATUS = 51
+CMD_SCAN_REFINE = 52
+CMD_SCAN_RESULTS = 53
+CMD_SCAN_CANCEL = 54
+CMD_SCAN_CLEAR = 55
+CMD_WRITE_TXN = 60
+# --- v1.2 draft §3: compute-down ops ---------------------------------------
+CMD_SYMBOL_BATCH = 61
+CMD_STRINGS_SCAN = 62
+CMD_DUMP_START = 63
+CMD_DUMP_STATUS = 64
+CMD_DUMP_PULL = 65
+CMD_APK_INFO = 66
+CMD_DISASSEMBLE = 67
+CMD_DUMP_CLEANUP = 68
 
 DEFAULT_PORT = 52730
+
+# --- agent-layer capability bits (hello.capabilities; SEPARATE namespace ---
+# --- from kernel backend_info.capabilities; PROTOCOL.md §7.1 + v1.2 §1) ----
+AGENT_CAP_SCAN = 1 << 0           # cmd 50-55 device-local scan engine
+AGENT_CAP_WRITE_TXN = 1 << 1      # cmd 60 single-address write transaction
+# bit 2: MODULE_STREAM — REVOKED, permanently reserved, must never be used.
+AGENT_CAP_SYMBOL_BATCH = 1 << 3   # cmd 61 device-side dynsym batch parse
+AGENT_CAP_BINARY_FRAMES = 1 << 4  # frame flags bit2 PAYLOAD_BINARY
+AGENT_CAP_STRINGS = 1 << 5        # cmd 62 device-side strings scan
+AGENT_CAP_DUMP_PIPELINE = 1 << 6  # cmd 63/64/65/68 dump to disk + chunked pull
+AGENT_CAP_APK_INFO = 1 << 7       # cmd 66 device-side apk metadata (zero-mirror)
+AGENT_CAP_DISASSEMBLE = 1 << 8    # cmd 67 device-side capstone disassembly (optional)
 
 # --- map entry flag bits (PROTOCOL.md section 4.7) -------------------------
 MAP_READ = 1 << 0

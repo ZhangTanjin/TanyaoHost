@@ -359,6 +359,24 @@ class ScanEngine:
         """
         if self.state.scan_round == 0:
             raise ValueError("no first scan yet")
+        if self.state.vtype == "bytes":
+            # hex scan (AOB): only changed/unchanged are defined (PROTOCOL.md
+            # §7.3 parity). Hits stored the first 8 pattern bytes little-endian.
+            if mode not in ("changed", "unchanged"):
+                raise ValueError("hex scan refine supports changed/unchanged only")
+            kept: list[Hit] = []
+            for hit in self.state.hits:
+                try:
+                    data = self._read(pid, hit.address, 8)
+                except Exception:
+                    continue  # unreadable now -> drop
+                new = int.from_bytes(data[:8], "little")
+                ok = (new == hit.value) if mode == "unchanged" else (new != hit.value)
+                if ok:
+                    kept.append(Hit(address=hit.address, value=new))
+            self.state.hits = kept
+            self.state.scan_round += 1
+            return len(kept)
         _fmt, size, _kind = TYPES[self.state.vtype]
 
         def read_values(addrs: list[int]) -> list[int | float | None]:

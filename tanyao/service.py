@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .constants import (
+    AGENT_CAP_SCAN,
     CMD_BACKEND_INFO,
     CMD_MEM_READ,
     CMD_MEM_READV,
@@ -21,6 +22,12 @@ from .constants import (
     CMD_PROCESS_ALIVE,
     CMD_PROCESS_FIND,
     CMD_PROCESS_LIST,
+    CMD_SCAN_CANCEL,
+    CMD_SCAN_CLEAR,
+    CMD_SCAN_RESULTS,
+    CMD_SCAN_REFINE,
+    CMD_SCAN_START,
+    CMD_SCAN_STATUS,
     CMD_SESSION_INFO,
     CMD_TARGET_CLOSE,
     CMD_TARGET_MAPS,
@@ -240,6 +247,23 @@ class TanyaoService:
         with self._lock:
             return self._backend or self.connect()
 
+    # -- agent capability dispatch (v1.1 §7.1 / v1.2 draft §1) -------------------
+
+    def agent_capabilities(self) -> int:
+        """Agent-layer capability bitmap from hello. Selection rule (v1.2 §6):
+        dispatch reads ONLY this bitmap, never the hello version string."""
+        with self._lock:
+            if self._conn is None:
+                if not self._auto_reconnect:
+                    raise AgentUnavailable("not connected")
+                self.connect()
+            assert self._conn is not None
+            return self._conn.agent_capabilities
+
+    def has_agent_cap(self, bit: int) -> bool:
+        with self._lock:
+            return bool(self.agent_capabilities() & (1 << bit))
+
     def ping(self) -> dict:
         with self._lock:
             return self._execute(CMD_PING, {})
@@ -350,6 +374,69 @@ class TanyaoService:
             # PROTOCOL.md §4.7: "target_maps" (kernel snapshot) or "proc_maps" (agent fallback)
             self._last_maps_source = str(resp.get("maps_source", "target_maps"))
             return entries
+
+    # -- device-local scan engine (PROTOCOL.md §7, requires AGENT_CAP_SCAN) ------
+
+    def agent_scan_start(
+        self,
+        pid: int,
+        *,
+        kind: str,
+        type: str | None = None,
+        value=None,
+        pattern: str | None = None,
+        epsilon: float = 0.0,
+        alignment: int = 0,
+        preset: str = "anon",
+        module: str = "",
+    ) -> dict:
+        """cmd 50: start a device-local scan job (returns immediately)."""
+        with self._lock:
+            payload: dict = {
+                "pid": pid,
+                "kind": kind,
+                "epsilon": epsilon,
+                "alignment": alignment or 0,
+                "preset": preset,
+                "module": module or "",
+            }
+            if type:
+                payload["type"] = type
+            if value is not None:
+                payload["value"] = value
+            if pattern:
+                payload["pattern"] = pattern
+            return self._execute(CMD_SCAN_START, payload)
+
+    def agent_scan_status(self, job_id: int | None = None) -> dict:
+        """cmd 51: job status; job_id omitted = current job."""
+        with self._lock:
+            payload = {"job_id": int(job_id)} if job_id is not None else {}
+            return self._execute(CMD_SCAN_STATUS, payload)
+
+    def agent_scan_refine(self, mode: str, value=None, *, epsilon: float = 0.0) -> dict:
+        """cmd 52: refine current job hits (synchronous)."""
+        with self._lock:
+            payload: dict = {"mode": mode, "epsilon": epsilon}
+            if value is not None:
+                payload["value"] = value
+            return self._execute(CMD_SCAN_REFINE, payload)
+
+    def agent_scan_results(self, offset: int = 0, limit: int = 256) -> dict:
+        """cmd 53: paged hits of the current job."""
+        with self._lock:
+            return self._execute(CMD_SCAN_RESULTS, {"offset": int(offset), "limit": int(limit)})
+
+    def agent_scan_cancel(self, job_id: int | None = None) -> dict:
+        """cmd 54: cancel the running job."""
+        with self._lock:
+            payload = {"job_id": int(job_id)} if job_id is not None else {}
+            return self._execute(CMD_SCAN_CANCEL, payload)
+
+    def agent_scan_clear(self) -> dict:
+        """cmd 55: clear results, keep range configuration."""
+        with self._lock:
+            return self._execute(CMD_SCAN_CLEAR, {})
 
     # -- memory -------------------------------------------------------------------
 

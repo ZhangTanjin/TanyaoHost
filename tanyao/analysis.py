@@ -11,11 +11,12 @@ import shutil
 import struct
 import subprocess
 import threading
+import time
 import zipfile
 from typing import Any
 
 from .connection import AgentError
-from .constants import MAP_EXEC, MAP_READ, MAP_WRITE
+from .constants import AGENT_CAP_SCAN, MAP_EXEC, MAP_READ, MAP_WRITE, parse_u64
 from .dump import dump_module as _dump_module
 from .dump import watch as _watch
 from .elfinfo import ElfParseError, parse_elf64
@@ -57,6 +58,12 @@ class AnalysisFacade:
         self._scans: dict[int, ScanEngine] = {}
         self._jobs = JobManager()
         self._write_enabled = os.environ.get("TANYAO_ALLOW_WRITE") == "1"
+        # v3 engine dispatch state (agent-scan path): last preset per pid for
+        # cmd 50 passthrough, per-pid device-job metadata, and a map of host
+        # job ids to device job ids so scan_cancel reaches the agent.
+        self._scan_presets: dict[int, str] = {}
+        self._agent_scan_meta: dict[int, dict] = {}
+        self._agent_job_map: dict[str, int] = {}
 
     # -- helpers ----------------------------------------------------------------
 
@@ -242,9 +249,103 @@ class AnalysisFacade:
 
     # -- scan ----------------------------------------------------------------------------
 
+    def _agent_scan_enabled(self, pid: int) -> bool:
+        """Engine dispatch (DESIGN_V3_HOST §3.1): bit0 in hello.capabilities →
+        scan_* goes to the device (cmd 50-55); otherwise the frozen host engine."""
+        return self.service.has_agent_cap(AGENT_CAP_SCAN)
+
+    def _agent_summary(self, pid: int, st: dict, meta: dict) -> dict:
+        """Map device scan_status fields onto the host ScanEngine.summary() shape.
+
+        Note: the v1.1 wire carries skipped_bytes but no skipped-range count, so
+        skipped_ranges is 0 unless the agent sends the additive field."""
+        return {
+            "pid": pid,
+            "type": meta.get("type_label") or str(st.get("type") or "u32"),
+            "round": int(st.get("round", 1)),
+            "count": int(st.get("matches", 0)),
+            "ranges": int(meta.get("ranges", 0)),
+            "truncated": bool(st.get("truncated", False)),
+            "skipped_ranges": int(st.get("skipped_ranges", 0)),
+            "skipped_bytes": parse_u64(st.get("skipped_bytes", "0x0"), field="skipped_bytes"),
+            "engine": "agent-scan",
+        }
+
+    def _agent_scan_start(self, pid: int, *, kind: str, vtype: str | None = None,
+                          value=None, pattern: str | None = None,
+                          epsilon: float = 0.0, alignment: int = 0) -> tuple[int, dict]:
+        preset = self._scan_presets.get(pid, "anon")
+        resp = self.service.agent_scan_start(
+            pid, kind=kind, type=vtype, value=value, pattern=pattern,
+            epsilon=epsilon, alignment=alignment, preset=preset,
+        )
+        dev_job = int(resp["job_id"])
+        meta = {
+            "type_label": vtype if kind == "value" else "bytes",
+            "ranges": int(resp.get("ranges", 0)),
+            "dev_job": dev_job,
+        }
+        self._agent_scan_meta[pid] = meta
+        return dev_job, meta
+
+    def _agent_wait(self, dev_job: int, progress=None, cancel_event=None,
+                    timeout: float = 600.0) -> dict:
+        """Poll device job status until done. Maps cancel/error to host semantics."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    self.service.agent_scan_cancel(dev_job)
+                except AgentError:
+                    pass
+                raise ScanCancelled()
+            st = self.service.agent_scan_status(dev_job)
+            if progress is not None:
+                progress(
+                    parse_u64(st.get("scanned_bytes", "0x0"), field="scanned_bytes"),
+                    parse_u64(st.get("total_bytes", "0x0"), field="total_bytes"),
+                )
+            state = st.get("state")
+            if state == "done":
+                return st
+            if state == "cancelled":
+                raise ScanCancelled()
+            if state == "error":
+                raise AgentError("backend_error", detail=str(st.get("error") or "agent scan failed"))
+            if time.monotonic() > deadline:
+                raise AgentError("backend_error", detail=f"agent scan job {dev_job} timed out")
+            time.sleep(0.05)
+
+    def _agent_results_page(self, dev_job: int, offset: int, limit: int) -> list[dict]:
+        resp = self.service.agent_scan_results(offset, limit)
+        out: list[dict] = []
+        for h in resp.get("hits", []):
+            item: dict = {"address": str(h["address"])}
+            for key in ("value", "value_hex", "length"):
+                if key in h:
+                    item[key] = h[key]
+            out.append(item)
+        return out
+
+    def _start_agent_scan_job(self, pid: int, kind: str, dev_job: int, meta: dict) -> dict:
+        """Wrap a device job in a host JobManager job (progress passthrough)."""
+        cancel_event = threading.Event()
+
+        def run(progress) -> dict:
+            st = self._agent_wait(dev_job, progress=progress, cancel_event=cancel_event)
+            summary = self._agent_summary(pid, st, meta)
+            return summary | {"results": self._agent_results_page(dev_job, 0, 32)}
+
+        job_id = self._jobs.start(pid, kind, run, cancel_event=cancel_event)
+        self._agent_job_map[job_id] = dev_job
+        return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
+                "async": True, "poll": "scan_status"}
+
     def scan_set_default_ranges(self, pid: int, *, preset: str = "anon") -> dict:
         """preset: anon (default, readable anonymous/heap), stack, module:<name>,
-        all_readable."""
+        all_readable. Host-side accounting only: the device engine derives its
+        own ranges from the same preset at scan_start time; we keep a host
+        snapshot for the est-based inline/async decision and error parity."""
         maps = self.service.target_maps(pid)
         engine = self._scan_for(pid)
         if preset == "anon":
@@ -264,6 +365,7 @@ class AnalysisFacade:
             engine.set_ranges(pid, [(m.start, m.end) for m in matches])
         else:
             raise AgentError("bad_request", detail=f"unknown preset {preset!r}")
+        self._scan_presets[pid] = preset
         total = sum(e - s for s, e in engine.state.ranges)
         return {"pid": pid, "preset": preset, "ranges": len(engine.state.ranges), "total_bytes": total}
 
@@ -284,15 +386,43 @@ class AnalysisFacade:
     ) -> dict:
         """First scan. With async_run=True (or estimated bytes > threshold) this runs
         as a background job: returns {'job_id','state':'running'} — poll scan_status."""
+        if self._agent_scan_enabled(pid):
+            dev_job, meta = self._agent_scan_start(
+                pid, kind="value", vtype=vtype, value=value,
+                epsilon=epsilon, alignment=alignment or 0,
+            )
+            engine = self._scans.get(pid)
+            est = sum(e - s for s, e in engine.state.ranges) if engine else 0
+            INLINE_LIMIT = 64 * 1024 * 1024
+            if async_run or est > INLINE_LIMIT:
+                return self._start_agent_scan_job(pid, "value", dev_job, meta)
+            st = self._agent_wait(dev_job)
+            summary = self._agent_summary(pid, st, meta)
+            return summary | {"found": summary["count"],
+                              "results": self._agent_results_page(dev_job, 0, 32),
+                              "async": False}
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
         INLINE_LIMIT = 64 * 1024 * 1024  # >64MB: force async
         if async_run or est > INLINE_LIMIT:
             return self._start_scan_job(pid, "value", vtype, value, epsilon=epsilon, alignment=alignment)
         found = engine.scan_value(pid, vtype, value, epsilon=epsilon, alignment=alignment)
-        return engine.summary() | {"found": found, "results": engine.results(limit=32), "async": False}
+        return engine.summary() | {"found": found, "results": engine.results(limit=32), "async": False,
+                                   "engine": "host-scan"}
 
     def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False) -> dict:
+        if self._agent_scan_enabled(pid):
+            dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern)
+            engine = self._scans.get(pid)
+            est = sum(e - s for s, e in engine.state.ranges) if engine else 0
+            INLINE_LIMIT = 64 * 1024 * 1024
+            if async_run or est > INLINE_LIMIT:
+                return self._start_agent_scan_job(pid, "hex", dev_job, meta)
+            st = self._agent_wait(dev_job)
+            summary = self._agent_summary(pid, st, meta)
+            return summary | {"found": summary["count"],
+                              "results": self._agent_results_page(dev_job, 0, 256),
+                              "async": False}
         pattern_bytes, mask_bytes = _parse_aob(pattern)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
@@ -300,7 +430,8 @@ class AnalysisFacade:
         if async_run or est > INLINE_LIMIT:
             return self._start_scan_job(pid, "hex", bytes(pattern_bytes), bytes(mask_bytes))
         found = engine.scan_hex(pid, bytes(pattern_bytes), bytes(mask_bytes))
-        return engine.summary() | {"found": found, "results": engine.results(), "async": False}
+        return engine.summary() | {"found": found, "results": engine.results(), "async": False,
+                                   "engine": "host-scan"}
 
     def scan_start(self, pid: int, kind: str, *, type: str | None = None, value=None,
                    pattern: str | None = None, epsilon: float = 0.0,
@@ -310,10 +441,19 @@ class AnalysisFacade:
         if kind == "value":
             if type is None or value is None:
                 raise AgentError("bad_request", detail="value scan requires 'type' and 'value'")
+            if self._agent_scan_enabled(pid):
+                dev_job, meta = self._agent_scan_start(
+                    pid, kind="value", vtype=type, value=value,
+                    epsilon=epsilon, alignment=alignment or 0,
+                )
+                return self._start_agent_scan_job(pid, "value", dev_job, meta)
             return self._start_scan_job(pid, "value", type, value, epsilon=epsilon, alignment=alignment)
         if kind == "hex":
             if not pattern:
                 raise AgentError("bad_request", detail="hex scan requires 'pattern'")
+            if self._agent_scan_enabled(pid):
+                dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern)
+                return self._start_agent_scan_job(pid, "hex", dev_job, meta)
             pattern_bytes, mask_bytes = _parse_aob(pattern)
             return self._start_scan_job(pid, "hex", pattern_bytes, mask_bytes)
         raise AgentError("bad_request", detail=f"unknown scan kind {kind!r}")
@@ -330,7 +470,7 @@ class AnalysisFacade:
             else:
                 engine.scan_hex(pid, args[0], args[1], progress=progress,
                                 cancel_event=cancel_event)
-            return engine.summary() | {"results": engine.results(limit=32)}
+            return engine.summary() | {"results": engine.results(limit=32), "engine": "host-scan"}
 
         job_id = self._jobs.start(pid, kind, run, cancel_event=cancel_event)
         return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
@@ -340,6 +480,12 @@ class AnalysisFacade:
         """Request cancellation of a running scan job. The engine checks the
         cancel event between chunks and raises ScanCancelled (job → cancelled)."""
         if self._jobs.cancel(job_id):
+            dev_job = self._agent_job_map.get(job_id)
+            if dev_job is not None:
+                try:
+                    self.service.agent_scan_cancel(dev_job)
+                except AgentError:
+                    pass  # device job may have finished between poll cycles
             return {"job_id": job_id, "cancel_requested": True}
         raise AgentError("not_found", detail=f"job {job_id!r} unknown or already finished")
 
@@ -355,25 +501,45 @@ class AnalysisFacade:
         return {"pid": pid, "jobs": [j.to_dict(include_summary=(j.state == "done")) for j in jobs[-8:]]}
 
     def scan_next(self, pid: int, mode: str, value: float | None = None, *, epsilon: float = 0.0) -> dict:
+        if self._agent_scan_enabled(pid):
+            meta = self._agent_scan_meta.get(pid)
+            if meta is None:
+                raise AgentError("bad_request", detail="no scan in progress for this pid")
+            if any(j.state == "running" for j in self._jobs.list_for(pid)):
+                raise AgentError("bad_request", detail="a scan job is still running; poll scan_status first")
+            resp = self.service.agent_scan_refine(mode, value, epsilon=epsilon)
+            st = self.service.agent_scan_status(meta["dev_job"])
+            summary = self._agent_summary(pid, st, meta)
+            return summary | {"found": int(resp.get("matches", 0))}
         engine = self._scans.get(pid)
         if engine is None or engine.state.scan_round == 0:
             raise AgentError("bad_request", detail="no scan in progress for this pid")
         if any(j.state == "running" for j in self._jobs.list_for(pid)):
             raise AgentError("bad_request", detail="a scan job is still running; poll scan_status first")
         found = engine.refine(pid, mode, value, epsilon=epsilon)
-        return engine.summary() | {"found": found}
+        return engine.summary() | {"found": found, "engine": "host-scan"}
 
     def scan_results(self, pid: int, *, offset: int = 0, limit: int = 256) -> dict:
+        if self._agent_scan_enabled(pid):
+            meta = self._agent_scan_meta.get(pid)
+            if meta is None:
+                raise AgentError("bad_request", detail="no scan for this pid")
+            st = self.service.agent_scan_status(meta["dev_job"])
+            summary = self._agent_summary(pid, st, meta)
+            return summary | {"results": self._agent_results_page(meta["dev_job"], offset, limit)}
         engine = self._scans.get(pid)
         if engine is None:
             raise AgentError("bad_request", detail="no scan for this pid")
-        return engine.summary() | {"results": engine.results(offset, limit)}
+        return engine.summary() | {"results": engine.results(offset, limit), "engine": "host-scan"}
 
     def scan_clear(self, pid: int) -> dict:
+        if self._agent_scan_enabled(pid):
+            self.service.agent_scan_clear()
+            return {"cleared": True, "engine": "agent-scan"}
         engine = self._scans.get(pid)
         if engine:
             engine.clear()
-        return {"cleared": True}
+        return {"cleared": True, "engine": "host-scan"}
 
     # -- batch read ------------------------------------------------------------------------
 

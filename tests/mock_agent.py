@@ -17,6 +17,7 @@ Fake world:
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import socket
 import struct
@@ -47,6 +48,23 @@ CMD_PROCESS_FIND = 40
 CMD_PROCESS_LIST = 41
 CMD_PROCESS_ALIVE = 42
 CMD_MODULE_BASE = 43
+# v1.1 device-local scan engine (PROTOCOL.md §7)
+CMD_SCAN_START = 50
+CMD_SCAN_STATUS = 51
+CMD_SCAN_REFINE = 52
+CMD_SCAN_RESULTS = 53
+CMD_SCAN_CANCEL = 54
+CMD_SCAN_CLEAR = 55
+CMD_WRITE_TXN = 60
+# v1.2 compute-down ops (PROTOCOL_V1.2_DRAFT.md §3)
+CMD_SYMBOL_BATCH = 61
+CMD_STRINGS_SCAN = 62
+CMD_DUMP_START = 63
+CMD_DUMP_STATUS = 64
+CMD_DUMP_PULL = 65
+CMD_APK_INFO = 66
+CMD_DISASSEMBLE = 67
+CMD_DUMP_CLEANUP = 68
 
 CAP_SESSION = 1 << 0
 CAP_TARGET_HANDLE = 1 << 1
@@ -55,10 +73,35 @@ CAP_MEM_READV = 1 << 3
 CAP_MEM_WRITE = 1 << 4
 CAP_MAPS = 1 << 5
 
+# Agent-layer capability bits (hello.capabilities namespace) — mirrors
+# tanyao.constants; scan ops are gated on AGENT_CAP_SCAN.
+AGENT_CAP_SCAN = 1 << 0
+AGENT_CAP_WRITE_TXN = 1 << 1
+AGENT_CAP_SYMBOL_BATCH = 1 << 3
+AGENT_CAP_BINARY_FRAMES = 1 << 4
+AGENT_CAP_STRINGS = 1 << 5
+AGENT_CAP_DUMP_PIPELINE = 1 << 6
+AGENT_CAP_APK_INFO = 1 << 7
+AGENT_CAP_DISASSEMBLE = 1 << 8
+
 BASE = 0x7000000000
 HEAP_START = 0x7200000000
 DEMO_PID = 4321
 MODULE_PATH = "/data/app/libdemo.so"
+
+# Device scan engine constants (PROTOCOL.md §7.4 parity)
+SCAN_MAX_HITS = 200_000
+SCAN_CHUNK = 2 * 1024 * 1024
+SCAN_MIN_GRAN = 4096
+SCAN_MAX_GRAN = 64 * 1024 * 1024
+
+# name -> (little-endian struct fmt, size, is_float); mirrors host scan.TYPES
+SCAN_TYPES: dict[str, tuple[str, int, bool]] = {
+    "u8": ("<B", 1, False), "u16": ("<H", 2, False), "u32": ("<I", 4, False),
+    "u64": ("<Q", 8, False), "i8": ("<b", 1, False), "i16": ("<h", 2, False),
+    "i32": ("<i", 4, False), "i64": ("<q", 8, False),
+    "f32": ("<f", 4, True), "f64": ("<d", 8, True),
+}
 
 
 def build_elf64() -> bytes:
@@ -165,13 +208,87 @@ class MemoryFault(Exception):
     pass
 
 
+class MockScanJob:
+    """One device-local scan job (single job slot, v1.1 semantics)."""
+
+    __slots__ = ("id", "spec", "ranges", "state", "round", "scanned", "total",
+                 "skipped", "hits", "truncated", "error", "started", "finished",
+                 "cancel", "dead_gran", "hex_carry")
+
+    def __init__(self, job_id: int, spec: dict, ranges: list[tuple[int, int]]) -> None:
+        self.id = job_id
+        self.spec = spec
+        self.ranges = ranges
+        self.state = "running"  # running | done | error | cancelled
+        self.round = 1  # first scan counts as round 1 (PROTOCOL.md §7.3)
+        self.scanned = 0
+        self.total = sum(hi - lo for lo, hi in ranges)
+        self.skipped: list[tuple[int, int]] = []
+        self.hits: list[dict] = []
+        self.truncated = False
+        self.error = ""
+        self.started = time.monotonic()
+        self.finished: float | None = None
+        self.cancel = threading.Event()
+        self.dead_gran = SCAN_MIN_GRAN
+        self.hex_carry = b""
+
+
+def _parse_aob(pattern: str) -> tuple[bytes, bytes]:
+    """Parse "7F 45 ?? 46" into (pattern, mask); 0x00 mask = wildcard."""
+    pb = bytearray()
+    mb = bytearray()
+    for tok in pattern.split():
+        if tok in ("?", "??"):
+            pb.append(0)
+            mb.append(0)
+        else:
+            pb.append(int(tok, 16))
+            mb.append(0xFF)
+    return bytes(pb), bytes(mb)
+
+
+def _mock_match(found, want, eps: float) -> bool:
+    """Float: eps>0 window else isclose(rel_tol=1e-6); ints exact (§7.4)."""
+    if isinstance(found, float) or isinstance(want, float):
+        if eps > 0:
+            return abs(found - want) <= eps
+        return math.isclose(found, want, rel_tol=1e-6)
+    return found == want
+
+
+def _raw8(value, fmt: str, size: int) -> bytes:
+    """Raw 8-byte little-endian form of a hit value (value_hex backing)."""
+    if isinstance(value, float):
+        return struct.pack(fmt, value) + b"\x00" * (8 - size)
+    return (value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+
+
+def _u64(value, field: str = "value") -> int:
+    if isinstance(value, str) and value.lower().startswith("0x"):
+        return int(value, 16)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ProtocolFail("bad_request", detail=f"bad u64 field {field}")
+
+
+def hx(v: int) -> str:
+    """u64 → lowercase 0x hex string (module-level for op helpers)."""
+    return f"0x{v:x}"
+
+
 class MockAgent:
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None,
+                 agent_caps: int = 0) -> None:
         self.token = token if token is not None else os.environ.get("TANYAO_MOCK_TOKEN", "tanyao-dev-token")
+        self.agent_caps = agent_caps
         self.generation = 1
         self.start_time = time.monotonic()
         self.memory = FakeMemory()
         self._build_world()
+        self._scan_job: "MockScanJob | None" = None
+        self._scan_seq = 0
+        self._scan_lock = threading.Lock()
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind((host, port))
@@ -231,6 +348,19 @@ class MockAgent:
         # strings marker in the heap (outside module) for window-mode tests
         hmarker = b"TANYAO_STRINGS_WINDOW_MARKER\x00"
         heap[0xB000:0xB000 + len(hmarker)] = hmarker
+
+        # Canonical target_maps snapshot shared by cmd 22 and the device scan
+        # engine presets (same table a real agent gets from the kernel).
+        self.target_maps = [
+            {"start": BASE, "end": BASE + 0x2000, "file_offset": 0,
+             "flags": 1 | 4 | 8, "path": MODULE_PATH},
+            {"start": BASE + 0x2000, "end": BASE + 0x3000, "file_offset": 0x2000,
+             "flags": 1 | 2 | 8, "path": MODULE_PATH},
+            {"start": BASE + 0x3000, "end": BASE + 0x4000, "file_offset": 0x2000,
+             "flags": 2 | 8, "path": MODULE_PATH},
+            {"start": HEAP_START, "end": HEAP_START + 0x10000, "file_offset": 0,
+             "flags": 1 | 2 | 8 | 32, "path": ""},
+        ]
 
     # -- networking ----------------------------------------------------------------
 
@@ -292,12 +422,16 @@ class MockAgent:
         try:
             conn.settimeout(60)
             challenge = os.urandom(32).hex()
-            self._send(conn, 0, CMD_HELLO, {
+            hello = {
                 "agent": "tanyao-agent",
                 "version": "0.1.0-mock",
                 "generation": self.generation,
                 "challenge": challenge,
-            }, 0)
+            }
+            if self.agent_caps:
+                # v1.0 agents omit the field entirely; host treats absent as 0.
+                hello["capabilities"] = hex(self.agent_caps)
+            self._send(conn, 0, CMD_HELLO, hello, 0)
             decoder_buffer = bytearray()
             authed = False
             expected_seq = 0
@@ -381,21 +515,17 @@ class MockAgent:
             handle = u64(payload.get("handle"), "handle")
             if handle != DEMO_PID << 8:
                 raise ProtocolFail("bad_request", detail="unknown handle")
+            entries = [
+                {"start": hx(m["start"]), "end": hx(m["end"]),
+                 "file_offset": hx(m["file_offset"]), "flags": m["flags"],
+                 "path": m["path"]}
+                for m in self.target_maps
+            ]
             return {
-                "status": 0, "entry_count": 4, "total_count": 4,
+                "status": 0, "entry_count": len(entries), "total_count": len(entries),
                 "target_cookie": hx(0x1234ABCD),
                 "maps_source": "target_maps",
-                "entries": [
-                    {"start": hx(BASE), "end": hx(BASE + 0x2000), "file_offset": hx(0),
-                     "flags": 1 | 4 | 8, "path": MODULE_PATH},
-                    {"start": hx(BASE + 0x2000), "end": hx(BASE + 0x3000), "file_offset": hx(0x2000),
-                     "flags": 1 | 2 | 8, "path": MODULE_PATH},
-                    # P2-2 world: -w-p tail mapping with file-offset drift
-                    {"start": hx(BASE + 0x3000), "end": hx(BASE + 0x4000), "file_offset": hx(0x2000),
-                     "flags": 2 | 8, "path": MODULE_PATH},
-                    {"start": hx(HEAP_START), "end": hx(HEAP_START + 0x10000), "file_offset": hx(0),
-                     "flags": 1 | 2 | 8 | 32, "path": ""},
-                ],
+                "entries": entries,
             }
         if cmd == CMD_MEM_READ:
             handle = u64(payload.get("handle"), "handle")
@@ -453,7 +583,327 @@ class MockAgent:
             if payload.get("name") == "libdemo.so" and payload.get("pid") == DEMO_PID:
                 return {"base": hx(BASE)}
             raise ProtocolFail("not_found")
+        if cmd in (CMD_SCAN_START, CMD_SCAN_STATUS, CMD_SCAN_REFINE,
+                   CMD_SCAN_RESULTS, CMD_SCAN_CANCEL, CMD_SCAN_CLEAR):
+            if not self.agent_caps & AGENT_CAP_SCAN:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            if cmd == CMD_SCAN_START:
+                return self._scan_start(payload)
+            if cmd == CMD_SCAN_STATUS:
+                return self._scan_status(payload)
+            if cmd == CMD_SCAN_REFINE:
+                return self._scan_refine(payload)
+            if cmd == CMD_SCAN_RESULTS:
+                return self._scan_results(payload)
+            if cmd == CMD_SCAN_CANCEL:
+                return self._scan_cancel(payload)
+            return self._scan_clear(payload)
+        if cmd in (CMD_WRITE_TXN, CMD_SYMBOL_BATCH, CMD_STRINGS_SCAN,
+                   CMD_DUMP_START, CMD_DUMP_STATUS, CMD_DUMP_PULL,
+                   CMD_APK_INFO, CMD_DISASSEMBLE, CMD_DUMP_CLEANUP):
+            # implemented in later milestones; undeclared-or-unimplemented ops
+            # behave exactly like unknown cmds (unsupported_cmd, no disconnect)
+            raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
         raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+
+    # -- device-local scan engine (PROTOCOL.md §7 reference implementation) ------
+
+    def _preset_ranges(self, preset: str, module: str) -> list[tuple[int, int]]:
+        """Range selection per scan_engine.cpp prepare_ranges (device parity)."""
+        out: list[tuple[int, int]] = []
+        for m in self.target_maps:
+            path = m["path"]
+            anonymous = (not path) or path.startswith("[")
+            if preset == "anon":
+                include = anonymous or ((m["flags"] & 2) and not path)
+            elif preset == "stack":
+                # kernel labels [stack] anonymous; match by address shape
+                include = anonymous and (m["flags"] & 2) and m["start"] >= 0x7F0000000000
+            elif preset == "all_readable":
+                include = True
+            elif preset.startswith("module:") or module:
+                base = path.rsplit("/", 1)[-1] if path else ""
+                base = base.split(" (deleted)")[0]
+                include = base == (module or preset[7:])
+            else:
+                include = True  # unknown preset: all readable (device parity)
+            if include:
+                out.append((m["start"], m["end"]))
+        return out
+
+    def _scan_start(self, payload: dict) -> dict:
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            # agent auto-opens the target; unknown pid fails like target_open
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        kind = payload.get("kind")
+        spec: dict = {"pid": pid, "kind": kind, "preset": str(payload.get("preset", "anon")),
+                      "module": str(payload.get("module", "")), "epsilon": 0.0, "alignment": 0}
+        if kind == "value":
+            vtype = payload.get("type")
+            if vtype not in SCAN_TYPES:
+                raise ProtocolFail("bad_request", detail=f"unknown scan type {vtype!r}")
+            value = payload.get("value")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ProtocolFail("bad_request", detail="value must be a number")
+            spec["type"] = vtype
+            spec["value"] = float(value) if isinstance(value, float) else int(value)
+        elif kind == "hex":
+            pattern = payload.get("pattern")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ProtocolFail("bad_request", detail="hex scan requires 'pattern'")
+            pbytes, mask = _parse_aob(pattern)
+            spec["pattern"], spec["mask"] = pbytes, mask
+        else:
+            raise ProtocolFail("bad_request", detail=f"unknown scan kind {kind!r}")
+        eps = payload.get("epsilon", 0.0)
+        if isinstance(eps, (int, float)) and not isinstance(eps, bool):
+            spec["epsilon"] = float(eps)
+        align = payload.get("alignment", 0)
+        if isinstance(align, int) and not isinstance(align, bool) and align > 0:
+            spec["alignment"] = align
+        ranges = self._preset_ranges(spec["preset"], spec["module"])
+        if not ranges:
+            raise ProtocolFail("backend_error", 0, "preset matched no readable ranges")
+
+        with self._scan_lock:
+            cancelled_old = False
+            old = self._scan_job
+            if old is not None and old.state == "running":
+                old.cancel.set()
+                old.state = "cancelled"
+                cancelled_old = True
+            self._scan_seq += 1
+            job = MockScanJob(self._scan_seq, spec, ranges)
+            self._scan_job = job
+        threading.Thread(target=self._run_scan, args=(job,), daemon=True,
+                         name=f"mock-scan-{job.id}").start()
+        resp = {"job_id": job.id, "state": "running",
+                "total_bytes": hx(job.total), "ranges": len(job.ranges)}
+        if cancelled_old:
+            resp["cancelled_old"] = True
+        return resp
+
+    def _current_job(self, payload: dict) -> "MockScanJob | None":
+        with self._scan_lock:
+            job = self._scan_job
+        if job is None:
+            raise ProtocolFail("not_found", detail="no scan job")
+        if "job_id" in payload and payload["job_id"] is not None:
+            want = _u64(payload["job_id"], "job_id")
+            if want != job.id:
+                raise ProtocolFail("not_found", detail=f"no scan job {want}")
+        return job
+
+    def _scan_status(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        elapsed = time.monotonic() - job.started
+        out = {
+            "job_id": job.id, "state": job.state, "pid": job.spec["pid"],
+            "type": job.spec.get("type", ""), "round": job.round,
+            "scanned_bytes": hx(job.scanned), "total_bytes": hx(job.total),
+            "skipped_bytes": hx(sum(hi - lo for lo, hi in self._merged_skipped(job))),
+            "matches": len(job.hits), "truncated": job.truncated,
+            "elapsed_sec": round(elapsed, 3), "error": job.error,
+        }
+        if job.state == "running" and elapsed > 0.2 and job.scanned > 0:
+            out["rate_mbps"] = round(job.scanned / elapsed / 1e6, 2)
+        if job.spec["kind"] == "strings":
+            out["kind"] = "strings"
+        return out
+
+    def _scan_refine(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        if job.state == "running":
+            raise ProtocolFail("bad_request", detail="scan job still running")
+        mode = payload.get("mode")
+        modes = ("eq", "neq", "changed", "unchanged", "increased", "decreased")
+        if mode not in modes:
+            raise ProtocolFail("bad_request", detail=f"unknown refine mode {mode!r}")
+        if job.spec["kind"] == "hex" and mode not in ("changed", "unchanged"):
+            raise ProtocolFail("bad_request", detail="hex job supports changed/unchanged only")
+        eps = payload.get("epsilon", 0.0)
+        eps = float(eps) if isinstance(eps, (int, float)) and not isinstance(eps, bool) else 0.0
+        value = payload.get("value")
+        kept: list[dict] = []
+        if job.spec["kind"] == "value":
+            fmt, size, is_float = SCAN_TYPES[job.spec["type"]]
+            unpack = struct.Struct(fmt).unpack_from
+            for hit in job.hits:
+                try:
+                    data = self.memory.read(hit["address"], size)
+                except MemoryFault:
+                    continue  # unreadable now -> drop (host parity)
+                new = unpack(data)[0]
+                old = hit["value"]
+                if mode == "eq":
+                    ok = value is not None and _mock_match(new, value, eps)
+                elif mode == "neq":
+                    ok = value is not None and not _mock_match(new, value, eps)
+                elif mode == "changed":
+                    ok = new != old
+                elif mode == "unchanged":
+                    ok = new == old
+                elif mode == "increased":
+                    ok = new > old
+                else:
+                    ok = new < old
+                if ok:
+                    kept.append({"address": hit["address"], "value": new,
+                                 "raw": _raw8(new, fmt, size)})
+        else:
+            plen = len(job.spec["pattern"])
+            for hit in job.hits:
+                try:
+                    data = self.memory.read(hit["address"], plen)
+                except MemoryFault:
+                    continue
+                same = data == hit["seg"]
+                if (mode == "unchanged" and same) or (mode == "changed" and not same):
+                    # kept hits carry the re-read bytes (host refine parity)
+                    kept.append({"address": hit["address"],
+                                 "value": int.from_bytes(data[:8], "little"),
+                                 "raw": data[:8].ljust(8, b"\0"), "seg": bytes(data)})
+        job.hits = kept
+        job.round += 1
+        return {"job_id": job.id, "matches": len(kept), "round": job.round}
+
+    def _scan_results(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        offset = int(payload.get("offset", 0))
+        limit = int(payload.get("limit", 256))
+        begin = min(max(0, offset), len(job.hits))
+        end = min(begin + max(0, limit), len(job.hits))
+        if job.spec["kind"] == "strings":
+            hits = [{"address": hx(h["address"]), "length": h["length"],
+                     "value": h["value"]} for h in job.hits[begin:end]]
+        else:
+            hits = [{"address": hx(h["address"]), "value": h["value"],
+                     "value_hex": "0x" + h["raw"].hex()} for h in job.hits[begin:end]]
+        return {"job_id": job.id, "count": end - begin, "total": len(job.hits),
+                "truncated": job.truncated, "hits": hits}
+
+    def _scan_cancel(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        if job.state == "running":
+            job.cancel.set()
+            job.state = "cancelled"
+        return {"ok": True, "state": job.state}
+
+    def _scan_clear(self, payload: dict) -> dict:
+        with self._scan_lock:
+            job = self._scan_job
+        if job is not None:
+            if job.state == "running":
+                job.cancel.set()
+                job.state = "cancelled"
+            job.hits = []
+            job.skipped = []
+            job.round = 0
+            job.scanned = 0
+            job.truncated = False
+        return {"ok": True}
+
+    def _run_scan(self, job: "MockScanJob") -> None:
+        try:
+            for lo, hi in job.ranges:
+                if job.cancel.is_set():
+                    break
+                job.hex_carry = b""  # matches never cross VMAs
+                self._scan_region(job, lo, hi, SCAN_CHUNK)
+                if job.truncated:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            job.state = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if job.state == "running":
+                job.state = "done"
+        job.finished = time.monotonic()
+
+    def _scan_region(self, job: "MockScanJob", lo: int, hi: int, chunk: int) -> None:
+        """Fault-tolerant streaming read+scan (host scan.py _scan_region parity)."""
+        pos = lo
+        while pos < hi:
+            if job.cancel.is_set():
+                job.state = "cancelled"
+                return
+            take = min(chunk, hi - pos)
+            try:
+                data = self.memory.read(pos, take)
+            except MemoryFault:
+                eff = job.dead_gran
+                if take <= eff:
+                    job.skipped.append((pos, pos + take))
+                    pos += take
+                    job.dead_gran = min(SCAN_MAX_GRAN, eff * 2)
+                    continue
+                mid = pos + max(eff, (take // 2 // eff) * eff)
+                self._scan_region(job, pos, mid, chunk)
+                pos = mid
+                job.dead_gran = min(SCAN_MAX_GRAN, eff * 2)
+                continue
+            job.dead_gran = SCAN_MIN_GRAN
+            self._on_chunk(job, pos, data)
+            if job.truncated:
+                return
+            pos += len(data)
+
+    def _on_chunk(self, job: "MockScanJob", pos: int, data: bytes) -> None:
+        job.scanned += len(data)
+        if job.spec["kind"] == "value":
+            fmt, size, _is_float = SCAN_TYPES[job.spec["type"]]
+            align = job.spec["alignment"] or size
+            unpack = struct.Struct(fmt).unpack_from
+            want = job.spec["value"]
+            eps = job.spec["epsilon"]
+            i = (align - (pos % align)) % align
+            while i + size <= len(data):
+                found = unpack(data, i)[0]
+                if _mock_match(found, want, eps):
+                    if len(job.hits) < SCAN_MAX_HITS:
+                        job.hits.append({"address": pos + i, "value": found,
+                                         "raw": _raw8(found, fmt, size)})
+                    else:
+                        job.truncated = True
+                i += align
+            return
+        # hex AOB with carry; straddling matches must be caught (scan from the
+        # carry prefix, skip only matches ending within already-scanned bytes)
+        pattern, mask = job.spec["pattern"], job.spec["mask"]
+        plen = len(pattern)
+        buf = job.hex_carry + data
+        base = pos - len(job.hex_carry)
+        i = 0
+        while i + plen <= len(buf):
+            if base + i + plen <= pos:
+                i += 1
+                continue
+            seg = buf[i : i + plen]
+            if all((seg[j] & mask[j]) == (pattern[j] & mask[j]) for j in range(plen) if mask[j]):
+                if len(job.hits) < SCAN_MAX_HITS:
+                    job.hits.append({"address": base + i,
+                                     "value": int.from_bytes(seg[:8], "little"),
+                                     "raw": seg[:8].ljust(8, b"\0"), "seg": bytes(seg)})
+                else:
+                    job.truncated = True
+            i += 1
+        job.hex_carry = buf[len(buf) - (plen - 1):] if plen > 1 else b""
+
+    @staticmethod
+    def _merged_skipped(job: "MockScanJob") -> list[tuple[int, int]]:
+        if not job.skipped:
+            return []
+        merged = [job.skipped[0]]
+        for lo, hi in sorted(job.skipped)[1:]:
+            plo, phi = merged[-1]
+            if lo <= phi:
+                merged[-1] = (plo, max(phi, hi))
+            else:
+                merged.append((lo, hi))
+        return merged
 
     # -- framing ------------------------------------------------------------------
 

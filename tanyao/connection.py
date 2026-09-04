@@ -28,6 +28,27 @@ class AgentError(Exception):
         self.detail = detail
 
 
+def _parse_caps(value) -> int:
+    """hello.capabilities → int bitmap. Absent (v1.0 agent) means 0."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ProtocolError("hello capabilities must be an int/hex bitmap")
+    if isinstance(value, int):
+        if value < 0 or value > 0xFFFFFFFFFFFFFFFF:
+            raise ProtocolError(f"hello capabilities out of u64 range: {value}")
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text.startswith("0x"):
+            raise ProtocolError(f"hello capabilities must be 0x hex, got {value!r}")
+        try:
+            return int(text, 16)
+        except ValueError as exc:
+            raise ProtocolError(f"bad hello capabilities {value!r}") from exc
+    raise ProtocolError(f"bad hello capabilities type {type(value).__name__}")
+
+
 class AgentConnection:
     """One TCP connection to tanyao-agent. Not thread-safe; guard with a lock if shared."""
 
@@ -50,6 +71,10 @@ class AgentConnection:
         self._seq = 0
         self.generation: int | None = None
         self.agent_version: str | None = None
+        # Agent-layer capability bitmap (hello.capabilities, PROTOCOL.md §7.1).
+        # 0 for v1.0 agents that do not send the field. Engine dispatch reads
+        # ONLY this bitmap — never the hello version string.
+        self.agent_capabilities: int = 0
         self.authenticated = False
         self.connected_at: float | None = None
 
@@ -76,6 +101,7 @@ class AgentConnection:
             raise ProtocolError("hello payload missing 64-hex challenge")
         self.generation = int(hello.payload.get("generation", 0))
         self.agent_version = hello.payload.get("version")
+        self.agent_capabilities = _parse_caps(hello.payload.get("capabilities"))
 
         proof = hashlib.sha256((self._token + challenge).encode("utf-8")).hexdigest()
         resp = self.request(1, {"proof": proof}, authenticate=False)
@@ -131,6 +157,10 @@ class AgentConnection:
 
     def ping(self) -> dict:
         return self.request(2, {})
+
+    def has_cap(self, bit: int) -> bool:
+        """True when the agent declared the given agent-layer capability bit."""
+        return bool(self.agent_capabilities & (1 << bit))
 
     # -- internal -------------------------------------------------------------
 
