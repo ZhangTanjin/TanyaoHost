@@ -1,17 +1,26 @@
-# Tanyao Agent 线协议 v1.1（唯一真相源）
+# Tanyao Agent 线协议 v1.2（唯一真相源）
 
-双端（主机 `tanyao-host` / 设备 `tanyao-agent`）以本文为唯一协议依据。
-任何修改必须先改本文并同步双方 + 互通测试。
+双端（主机 `tanyao-host` / 设备 `tanyao-agent`）以本文 + `docs/PROTOCOL_V1.2.md`
+为唯一协议依据。任何修改必须先改协议文本并同步双方 + 互通测试。
 
-> **版本说明（2026-09-04）**：v1.1 扩展（能力协商 + cmd 50–55 设备端扫描 +
-> cmd 60 写入事务，原 `TanyaoCli/docs/AGENT_PROTOCOL_EXTENSIONS.md` 草案）
-> 已定版并入本文（§3 表、§4.0、§5 表、§7），该草案文档转为存档。
-> 下一增量 **v1.2（计算下沉）**正在 `docs/PROTOCOL_V1.2_DRAFT.md` 评审
-> （符号批量/strings/dump 管线/apk 元信息/二进制帧），定版后才并入本文。
+> **版本说明（2026-09-05）**：
+> - **v1.1**（2026-09-04 定版并入本文）：能力协商 + cmd 50–55 设备端扫描 +
+>   cmd 60 写入事务（§3 表、§4.0、§5 表、§7）。
+> - **v1.2**（2026-09-05 定版，计算下沉）：能力位 bit3–bit8、帧 flags bit2
+>   PAYLOAD_BINARY、cmd 61–68（符号批量/strings/dump 管线/apk 元信息/反汇编）、
+>   命中集与镜像不再过网。规范正文见 **`docs/PROTOCOL_V1.2.md`**（§8 为索引），
+>   与本文同效力。
+> - 历史草案存档：v1.1 → `TanyaoCli/docs/AGENT_PROTOCOL_EXTENSIONS.md`；
+>   v1.2 的勘误（module_off 措辞）已并入正文。
+> - 后续增量一律走 `PROTOCOL_V1.3_DRAFT.md` 流程：草案 → 双端实现 → 真机
+>   联合回归 → 定版。
 
-设计原则：agent 只做"帧 ↔ ioctl"翻译，不含任何业务逻辑；
-所有 u64 值走 JSON 十六进制字符串，避免 JS/Python 浮点精度丢失；
-二进制数据走 base64；帧头定长二进制负责分帧与版本协商。
+设计原则：agent 自 v1.2 起为**设备端分析引擎**——数据密集操作（扫描/符号/
+strings/dump 落盘/apk 元信息/反汇编）在设备本地计算，网络只传提炼结果，
+Ghidra 反编译是唯一显式批量例外；v1 时代"纯转发器"边界的沿革见
+`PROTOCOL_V1.2.md`。所有 u64 值走 JSON 十六进制字符串，避免 JS/Python 浮点
+精度丢失；二进制数据 v1.2 起走 PAYLOAD_BINARY 帧（JSON 帧内仍用 base64）；
+帧头定长二进制负责分帧与版本协商。
 
 ## 1. 传输
 
@@ -302,3 +311,30 @@ agent 本地微秒级，不构成跨地址或内核级原子事务，host 不得
 - 草案 §1 曾写 "cmd 50–56"：笔误，实现与清单均为 50–55。
 - 草案 hello 示例 `"version":"1.1.0"` 与 agent 实发 `"1.0.0"` 不一致：
   定版后 agent 统一发 `"1.1.0"`（修正项在 TanyaoCli 仓库 M0）。
+
+## 8. v1.2 定版索引与验收记录（2026-09-05）
+
+规范正文：**`docs/PROTOCOL_V1.2.md`**（与本文同效力）。条目索引：
+
+| 项 | 正文位置（PROTOCOL_V1.2.md） |
+| --- | --- |
+| 能力位 bit3–bit8；bit2 MODULE_STREAM 撤销、永久不用 | §1 |
+| 帧 flags bit2 PAYLOAD_BINARY（仅响应方向；请求携带即协议错误断开） | §2 |
+| cmd 61 symbol_batch（module 范围 + modules/module_indexes 归属；packed 20B entry + module_off） | §3.1 |
+| cmd 62 strings_scan（同步/async job 双模式；256MiB 同步上限） | §3.2 |
+| cmd 63/64/65/68 dump 管线（24B 大端子头 offset/data_len/raw_len/flags/crc32；幂等 EOF；disk_budget） | §3.3–§3.5 |
+| cmd 66 apk_info（目标进程语义，零镜像；MCP 层 pid/apk_path 互斥路由，见 DESIGN_V3_HOST §3.4） | §3.6 |
+| cmd 67 disassemble（可选，bit8；未 vendor capstone 回 unsupported） | §3.7 |
+| 错误 slug 增补：`disk_budget`、`unsupported` | §5 |
+| 资源约束：单 job、SCHED_IDLE/nice、pacing、落盘预算、全 op 鉴权 | §4 |
+
+**定版验收（真机，2026-09-05）**：`tests/mcp_regression.py` **41/41 PASS**
+（含 v1.2 条件项：`engine=agent-symbols` / `agent-strings` / `agent-scan` /
+`agent-dump` 四条下沉路径全部经 IPC→agent→内核→目标进程真实链路；写门禁
+保持关闭且无活体目标改动）。验收中发现并修复 agent 侧 `scan_start`
+拒绝 `alignment=0` 的实现偏差（§7.2 原文"0 = 元素大小"即为权威语义，
+TanyaoCli `9ab9c7d` 修复后复跑全绿）。
+
+**遗留跟进**：agent hello `version` 升 `"1.2.0"` 并打 tag `agent-v1.2.0`
+（TanyaoCli，随下次发版）；cmd 67 capstone vendor 为可选增强（bit8 当前未
+声明，host 走 native.py 回退，行为符合规范）。

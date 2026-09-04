@@ -1,7 +1,9 @@
-# Tanyao Agent 线协议 v1.2 草案（计算下沉）
+# Tanyao Agent 线协议 v1.2（计算下沉，定版）
 
-> 状态：**草案**——设备端（TanyaoCli）与主机端（tanyao-host）评审通过、双端实现
-> 并互通后，正式并入 `PROTOCOL.md` 取代本文。
+> 状态：**已定版（2026-09-05）**——双端实现完成，真机联合回归 41/41
+> （`engine=agent-symbols/agent-strings/agent-scan/agent-dump` 四条下沉路径
+> 全部经真实链路验证；写门禁无活体目标改动）。本文与 `PROTOCOL.md`（v1/v1.1）
+> 共同构成现行规范；`PROTOCOL.md` §版本说明 与 §8 为本版的索引与勘误记录。
 > 上游依据：`tanyao-host/tanyao-ai-re-architecture.md` §11（v3 架构，2026-09-04 定稿）。
 > 本文在 v1（`PROTOCOL.md`）+ v1.1（`TanyaoCli/docs/AGENT_PROTOCOL_EXTENSIONS.md`）
 > 之上做**纯增量**：新增能力位、新增 cmd、帧 flags 新增一位；v1/v1.1 全部语义不变。
@@ -101,10 +103,15 @@ DT_HASH/GNU_HASH`（兼容 bionic 的 raw/absolute 两种地址形态，与 host
 4   4   module_count     u32
 8   4   name_blob_size   u32
 12  4   module_blob_size u32
-16  20×count  entry：addr u64 | size u32 | name_off u32 | module_idx u32
+16  20×count  entry：addr u64 | size u32 | name_off u32 | module_off u32
 ...     name_blob：'\0' 结尾字符串连续拼接（name_off 相对起点）
-...     module_blob：'\0' 结尾字符串连续拼接（module_idx 相对起点）
+...     module_blob：'\0' 结尾字符串连续拼接（module_off 相对起点）
 ```
+
+> 措辞勘误（2026-09-04 审查）：entry 第 4 字段定名 `module_off`——语义是
+> **相对 module_blob 起点的字节偏移**（与 name_off 同规则），不是模块表
+> 下标。双端实现（agent `symbol_packed` / host `frames.py` 解码器）均按
+> 此语义，本条仅修正文档表述，wire 不变。
 
 错误：`not_found`（模块未命中/无动态段/无可执行映射）、`backend_error`
 （内存读失败，带 errno）、`bad_request`。

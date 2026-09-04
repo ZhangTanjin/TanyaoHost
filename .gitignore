@@ -24,3 +24,6 @@ venv/
 # in-repo fake agent; the REAL device token lives on-device at
 # /data/local/tmp/.tanyao-token (0600) and in the operator's env only.
 tests/tanyao_target  (compiled aarch64 binary; build from tanyao_target.c)
+
+# editor agent state
+.zcode/
