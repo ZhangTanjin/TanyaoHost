@@ -244,7 +244,11 @@ class IpcRequestHandler(BaseHTTPRequestHandler):
                 result = handler(params)
                 self._reply(200, {"ok": True, "result": result})
             except AgentError as exc:
-                self._reply(200, {"ok": False, "error": exc.error, "errno": exc.errno, "detail": exc.detail})
+                body = {"ok": False, "error": exc.error, "errno": exc.errno, "detail": exc.detail}
+                if exc.payload.get("old_b64"):
+                    # D5: keep the device-attached old bytes so callers can diff
+                    body["old_b64"] = exc.payload["old_b64"]
+                self._reply(200, body)
             except (KeyError, ValueError) as exc:
                 self._reply(200, {"ok": False, "error": "bad_request", "detail": str(exc)})
             except AgentUnavailable as exc:

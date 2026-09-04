@@ -19,6 +19,7 @@ from typing import Any
 from .connection import AgentError
 from .constants import (
     AGENT_CAP_APK_INFO,
+    b64_decode,
     AGENT_CAP_DISASSEMBLE,
     AGENT_CAP_DUMP_PIPELINE,
     AGENT_CAP_SCAN,
@@ -229,7 +230,14 @@ class AnalysisFacade:
         if self.service.has_agent_cap(AGENT_CAP_WRITE_TXN):
             # bit1: the gate stays here, the expect→write→verify round trip
             # collapses into cmd 60 (PROTOCOL.md §7.5, DESIGN_V3_HOST §3.5)
-            resp = self.service.write_txn(pid, address, data, expect_old=expect_old, verify=True)
+            try:
+                resp = self.service.write_txn(pid, address, data, expect_old=expect_old, verify=True)
+            except AgentError as exc:
+                if exc.error == "expect_old_mismatch" and exc.payload.get("old_b64"):
+                    # D5: decode the device-attached old bytes into the detail
+                    old_hex = b64_decode(exc.payload["old_b64"]).hex()
+                    exc.detail = f"expect_old mismatch: device has {old_hex} (old_b64 preserved)"
+                raise
             return {
                 "pid": pid,
                 "address": f"0x{address:x}",

@@ -19,13 +19,23 @@ from .frames import Frame, FrameDecoder, encode_frame
 
 
 class AgentError(Exception):
-    """Application-level error reported by the agent (ERROR frame) or transport."""
+    """Application-level error reported by the agent (ERROR frame) or transport.
 
-    def __init__(self, error: str, errno: int | None = None, detail: str = "") -> None:
+    `payload` keeps the raw ERROR-frame fields the agent attached beyond the
+    standard error/errno/detail triple — e.g. write_txn's old_b64 (PROTOCOL.md
+    §7.5, field defect D5) — so transport-agnostic layers can surface them."""
+
+    def __init__(self, error: str, errno: int | None = None, detail: str = "",
+                 payload: dict | None = None) -> None:
         super().__init__(f"{error}" + (f" (errno={errno})" if errno is not None else "") + (f": {detail}" if detail else ""))
         self.error = error
         self.errno = errno
         self.detail = detail
+        self.payload: dict = payload or {}
+
+    @property
+    def old_b64(self) -> str | None:
+        return self.payload.get("old_b64")
 
 
 def _parse_caps(value) -> int:
@@ -156,7 +166,8 @@ class AgentConnection:
                 err = resp.payload.get("error", "unknown")
                 errno = resp.payload.get("errno")
                 detail = resp.payload.get("detail", "")
-                raise AgentError(str(err), errno=int(errno) if isinstance(errno, int) else None, detail=str(detail))
+                raise AgentError(str(err), errno=int(errno) if isinstance(errno, int) else None,
+                                 detail=str(detail), payload=resp.payload)
             return resp
 
     def request(self, cmd: int, payload: dict, *, authenticate: bool = True) -> dict:

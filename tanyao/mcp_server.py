@@ -378,10 +378,10 @@ def handle_request(message: dict) -> dict | None:
                 "id": msg_id,
                 "result": {"content": [{"type": "text", "text": text}], "isError": False},
             }
-        text = json.dumps(
-            {"error": ipc.get("error"), "errno": ipc.get("errno"), "detail": ipc.get("detail")},
-            ensure_ascii=False,
-        )
+        err_body = {"error": ipc.get("error"), "errno": ipc.get("errno"), "detail": ipc.get("detail")}
+        if ipc.get("old_b64"):
+            err_body["old_b64"] = ipc.get("old_b64")  # D5: device old bytes for diffing
+        text = json.dumps(err_body, ensure_ascii=False)
         return {
             "jsonrpc": "2.0",
             "id": msg_id,

@@ -433,6 +433,48 @@ class TestCaps1FFFullPipeline(MatrixBase):
         self.assertEqual(ctx.exception.error, "expect_old_mismatch")
         self.service.mem_write(DEMO_PID, addr, b"\x00" * 4)
 
+    def test_expect_old_mismatch_surfaces_old_bytes_d5(self):
+        """D5: the device-attached old_b64 must survive to the MCP error text
+        with the correct value, and the detail carries the decoded hex."""
+        import base64 as b64mod
+        import urllib.request
+
+        from tanyao import mcp_server
+        from tanyao.ipc import IpcServer
+
+        addr = HEAP_START + 0x6100
+        self.service.mem_write(DEMO_PID, addr, b"\xaa" * 4)
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                self.facade.write_bytes(DEMO_PID, addr, b"\xbb" * 4,
+                                        expect_old=b"\x11" * 4)
+            self.assertEqual(ctx.exception.error, "expect_old_mismatch")
+            self.assertEqual(ctx.exception.payload.get("old_b64"),
+                             b64mod.b64encode(b"\xaa" * 4).decode())
+            self.assertIn("aaaaaaaa", ctx.exception.detail)
+
+            # full chain: MCP stdio -> IPC -> facade -> agent error frame
+            ipc = IpcServer(self.facade, port=0)
+            port = ipc._httpd.server_address[1]
+            ipc.start()
+            try:
+                mcp_server.IPC_URL = f"http://127.0.0.1:{port}/"
+                resp = mcp_server.handle_request({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "write_bytes", "arguments": {
+                        "pid": DEMO_PID, "address": hex(addr),
+                        "data_hex": "bbbbbbbb", "expect_old_hex": "11111111"}},
+                })
+                self.assertTrue(resp["result"]["isError"])
+                payload = json.loads(resp["result"]["content"][0]["text"])
+                self.assertEqual(payload["error"], "expect_old_mismatch")
+                self.assertEqual(payload["old_b64"],
+                                 b64mod.b64encode(b"\xaa" * 4).decode())
+            finally:
+                ipc.stop()
+        finally:
+            self.service.mem_write(DEMO_PID, addr, b"\x00" * 4)
+
     def test_decompile_data_source_via_pipeline(self):
         """decompile_start only swaps the dump source (Ghidra absent here, so we
         assert the pipeline dump materialized synchronously before job start)."""
