@@ -22,6 +22,7 @@ from .constants import (
     AGENT_CAP_DISASSEMBLE,
     AGENT_CAP_DUMP_PIPELINE,
     AGENT_CAP_SCAN,
+    AGENT_CAP_SCAN_EXPLICIT_RANGES,
     AGENT_CAP_STRINGS,
     AGENT_CAP_SYMBOL_BATCH,
     AGENT_CAP_WRITE_TXN,
@@ -78,6 +79,10 @@ class AnalysisFacade:
         self._scan_presets: dict[int, str] = {}
         self._agent_scan_meta: dict[int, dict] = {}
         self._agent_job_map: dict[str, int] = {}
+        # user-set explicit ranges (scan_set_range); carried onto cmd 50
+        # `ranges` when the agent declares bit9, else forces the host engine
+        # (D1: a v1.1 agent would silently ignore ranges and fall back to preset)
+        self._explicit_ranges: dict[int, list[tuple[int, int]]] = {}
         # dump pipeline resume checkpoints (pull_dump_with_resume store)
         self._pull_states: dict[str, dict] = {}
 
@@ -283,6 +288,27 @@ class AnalysisFacade:
         scan_* goes to the device (cmd 50-55); otherwise the frozen host engine."""
         return self.service.has_agent_cap(AGENT_CAP_SCAN)
 
+    def _scan_route(self, pid: int) -> str:
+        """Engine choice for the next scan on pid: 'agent' or 'host'.
+
+        D1 rule (PROTOCOL.md §7.2 v1.2.1 附录): with user-set explicit ranges
+        the device engine only qualifies when the agent declared bit9
+        SCAN_EXPLICIT_RANGES — an agent without bit9 would silently ignore
+        `ranges` and fall back to the preset, scanning the WRONG ranges.
+        Fallback must never surface as an error to the user."""
+        if not self.service.has_agent_cap(AGENT_CAP_SCAN):
+            return "host"
+        explicit = self._explicit_ranges.get(pid)
+        if explicit and not self.service.has_agent_cap(AGENT_CAP_SCAN_EXPLICIT_RANGES):
+            return "host"
+        return "agent"
+
+    def _explicit_ranges_payload(self, pid: int) -> list[dict] | None:
+        ranges = self._explicit_ranges.get(pid)
+        if not ranges or len(ranges) > 4096:
+            return None
+        return [{"addr": f"0x{start:x}", "size": f"0x{end - start:x}"} for start, end in ranges]
+
     def _agent_summary(self, pid: int, st: dict, meta: dict) -> dict:
         """Map device scan_status fields onto the host ScanEngine.summary() shape.
 
@@ -302,11 +328,13 @@ class AnalysisFacade:
 
     def _agent_scan_start(self, pid: int, *, kind: str, vtype: str | None = None,
                           value=None, pattern: str | None = None,
-                          epsilon: float = 0.0, alignment: int = 0) -> tuple[int, dict]:
-        preset = self._scan_presets.get(pid, "anon")
+                          epsilon: float = 0.0, alignment: int = 0,
+                          ranges: list[dict] | None = None) -> tuple[int, dict]:
         resp = self.service.agent_scan_start(
             pid, kind=kind, type=vtype, value=value, pattern=pattern,
-            epsilon=epsilon, alignment=alignment, preset=preset,
+            epsilon=epsilon, alignment=alignment,
+            preset=None if ranges else self._scan_presets.get(pid, "anon"),
+            ranges=ranges,
         )
         dev_job = int(resp["job_id"])
         meta = {
@@ -395,12 +423,16 @@ class AnalysisFacade:
         else:
             raise AgentError("bad_request", detail=f"unknown preset {preset!r}")
         self._scan_presets[pid] = preset
+        self._explicit_ranges.pop(pid, None)  # preset supersedes explicit ranges
         total = sum(e - s for s, e in engine.state.ranges)
         return {"pid": pid, "preset": preset, "ranges": len(engine.state.ranges), "total_bytes": total}
 
     def scan_set_range(self, pid: int, start: int, end: int) -> dict:
         engine = self._scan_for(pid)
         engine.set_ranges(pid, [(start, end)])
+        # D1: explicit ranges must survive the engine dispatch — carried onto
+        # cmd 50 `ranges` under bit9, host engine otherwise
+        self._explicit_ranges[pid] = [(start, end)]
         return {"pid": pid, "ranges": 1, "span": end - start}
 
     def scan_value(
@@ -415,10 +447,11 @@ class AnalysisFacade:
     ) -> dict:
         """First scan. With async_run=True (or estimated bytes > threshold) this runs
         as a background job: returns {'job_id','state':'running'} — poll scan_status."""
-        if self._agent_scan_enabled(pid):
+        if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(
                 pid, kind="value", vtype=vtype, value=value,
                 epsilon=epsilon, alignment=alignment or 0,
+                ranges=self._explicit_ranges_payload(pid),
             )
             engine = self._scans.get(pid)
             est = sum(e - s for s, e in engine.state.ranges) if engine else 0
@@ -440,8 +473,9 @@ class AnalysisFacade:
                                    "engine": "host-scan"}
 
     def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False) -> dict:
-        if self._agent_scan_enabled(pid):
-            dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern)
+        if self._scan_route(pid) == "agent":
+            dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern,
+                                                   ranges=self._explicit_ranges_payload(pid))
             engine = self._scans.get(pid)
             est = sum(e - s for s, e in engine.state.ranges) if engine else 0
             INLINE_LIMIT = 64 * 1024 * 1024
@@ -470,18 +504,20 @@ class AnalysisFacade:
         if kind == "value":
             if type is None or value is None:
                 raise AgentError("bad_request", detail="value scan requires 'type' and 'value'")
-            if self._agent_scan_enabled(pid):
+            if self._scan_route(pid) == "agent":
                 dev_job, meta = self._agent_scan_start(
                     pid, kind="value", vtype=type, value=value,
                     epsilon=epsilon, alignment=alignment or 0,
+                    ranges=self._explicit_ranges_payload(pid),
                 )
                 return self._start_agent_scan_job(pid, "value", dev_job, meta)
             return self._start_scan_job(pid, "value", type, value, epsilon=epsilon, alignment=alignment)
         if kind == "hex":
             if not pattern:
                 raise AgentError("bad_request", detail="hex scan requires 'pattern'")
-            if self._agent_scan_enabled(pid):
-                dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern)
+            if self._scan_route(pid) == "agent":
+                dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern,
+                                                       ranges=self._explicit_ranges_payload(pid))
                 return self._start_agent_scan_job(pid, "hex", dev_job, meta)
             pattern_bytes, mask_bytes = _parse_aob(pattern)
             return self._start_scan_job(pid, "hex", pattern_bytes, mask_bytes)

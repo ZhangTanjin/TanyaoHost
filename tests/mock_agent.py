@@ -80,6 +80,7 @@ CAP_MAPS = 1 << 5
 # tanyao.constants; scan ops are gated on AGENT_CAP_SCAN.
 AGENT_CAP_SCAN = 1 << 0
 AGENT_CAP_WRITE_TXN = 1 << 1
+AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # v1.2.1: cmd 50 `ranges` support
 AGENT_CAP_SYMBOL_BATCH = 1 << 3
 AGENT_CAP_BINARY_FRAMES = 1 << 4
 AGENT_CAP_STRINGS = 1 << 5
@@ -1203,7 +1204,27 @@ class MockAgent:
         align = payload.get("alignment", 0)
         if isinstance(align, int) and not isinstance(align, bool) and align > 0:
             spec["alignment"] = align
-        ranges = self._preset_ranges(spec["preset"], spec["module"])
+        # v1.2.1 附录: explicit `ranges` (bit9) replaces the preset entirely;
+        # an agent WITHOUT bit9 ignores the unknown field (the D1 failure mode)
+        ranges = None
+        ranges_raw = payload.get("ranges")
+        if ranges_raw is not None:
+            if not self.agent_caps & AGENT_CAP_SCAN_EXPLICIT_RANGES:
+                ranges_raw = None  # undeclared → pretend the field does not exist
+        if ranges_raw is not None:
+            if not isinstance(ranges_raw, list) or not ranges_raw:
+                raise ProtocolFail("bad_request", detail="ranges must be a non-empty array")
+            if len(ranges_raw) > 4096:
+                raise ProtocolFail("bad_request", detail="ranges exceeds 4096 segments")
+            ranges = []
+            for seg in ranges_raw:
+                addr = _u64(seg.get("addr"), "addr")
+                size = _u64(seg.get("size"), "size")
+                if size <= 0:
+                    raise ProtocolFail("bad_request", detail="ranges segment size must be > 0")
+                ranges.append((addr, addr + size))
+        else:
+            ranges = self._preset_ranges(spec["preset"], spec["module"])
         if not ranges:
             raise ProtocolFail("backend_error", 0, "preset matched no readable ranges")
 

@@ -406,19 +406,27 @@ class TanyaoService:
         pattern: str | None = None,
         epsilon: float = 0.0,
         alignment: int = 0,
-        preset: str = "anon",
+        preset: str | None = "anon",
         module: str = "",
+        ranges: list[dict] | None = None,
     ) -> dict:
-        """cmd 50: start a device-local scan job (returns immediately)."""
+        """cmd 50: start a device-local scan job (returns immediately).
+
+        ranges (v1.2.1 附录): explicit segments [{"addr","size"}...]; the agent
+        must have declared bit9 — the facade routes those scans to the host
+        engine otherwise, so this method never sends ranges blindly."""
         with self._lock:
             payload: dict = {
                 "pid": pid,
                 "kind": kind,
                 "epsilon": epsilon,
                 "alignment": alignment or 0,
-                "preset": preset,
                 "module": module or "",
             }
+            if ranges:
+                payload["ranges"] = ranges  # present → agent ignores preset
+            else:
+                payload["preset"] = preset or "anon"
             if type:
                 payload["type"] = type
             if value is not None:

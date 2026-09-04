@@ -328,6 +328,27 @@ def main() -> int:
         check("scan_results after clear: empty ok", lambda: assert_true(
             sr["ok"] if isinstance(sr, dict) and "ok" in sr else sr["count"] == 0, str(sr)[:100]))
 
+        # -- v1.2.1 D1: explicit ranges survive the engine dispatch ------------
+        if caps_mask & 1:
+            def d1_explicit_ranges():
+                call_tool("scan_set_range", {"pid": pid, "start": base_hex,
+                                             "end": hex(base + 0x2000)})
+                out = call_tool("scan_hex", {"pid": pid, "pattern": "7F 45 4C 46"})
+                assert_true(out.get("ranges") == 1, f"ranges={out.get('ranges')}")
+                for hit in out.get("results", []):
+                    assert_true(base <= int(hit["address"], 16) < base + 0x2000,
+                                f"hit outside explicit range: {hit}")
+                if caps_mask & 512:  # bit9 SCAN_EXPLICIT_RANGES
+                    assert_true(out.get("engine") == "agent-scan",
+                                f"engine={out.get('engine')}")
+                else:
+                    # D1 contract: never send ranges to an agent without bit9
+                    assert_true(out.get("engine") == "host-scan",
+                                f"engine={out.get('engine')}")
+                return f"engine={out.get('engine')}"
+            check("v1.2.1 D1: scan_set_range honored (device or forced fallback)", d1_explicit_ranges)
+            call_tool("scan_set_default_ranges", {"pid": pid, "preset": "anon"})  # restore
+
         # -- dump / watch ------------------------------------------------------------
         dm = call_tool("dump_module", {"pid": pid, "module": "libc.so", "out": DUMP_PATH}, timeout=300)
         dump_head = open(DUMP_PATH, "rb").read(8) if os.path.exists(DUMP_PATH) else b""

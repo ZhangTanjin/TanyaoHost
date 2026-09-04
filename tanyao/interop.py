@@ -280,6 +280,32 @@ def main() -> int:
     else:
         skipped_caps.append("scan")
 
+    if caps & AGENT_CAP_SCAN and not caps & AGENT_CAP_SCAN_EXPLICIT_RANGES:
+        skipped_caps.append("scan_explicit_ranges")
+    if caps & AGENT_CAP_SCAN_EXPLICIT_RANGES:
+        def do_agent_scan_ranges():
+            assert first_rx_map is not None
+            base = parse_u64(first_rx_map["start"], field="start")
+            span = 0x1000
+            # preset must be ignored when ranges are present (v1.2.1 附录)
+            job = conn.request(50, {"pid": args.pid, "kind": "hex",
+                                    "pattern": "00 00 00 00",
+                                    "preset": "all_readable",
+                                    "ranges": [{"addr": f"0x{base:x}",
+                                                "size": f"0x{span:x}"}]})
+            deadline = time.time() + 60
+            status = {"state": "running"}
+            while time.time() < deadline:
+                status = conn.request(51, {"job_id": job["job_id"]})
+                if status.get("state") != "running":
+                    break
+                time.sleep(0.2)
+            assert status.get("state") == "done", f"ranges scan state={status.get('state')}"
+            assert parse_u64(status.get("total_bytes", "0x0"), field="total_bytes") == span, \
+                f"ranges ignored: total_bytes={status.get('total_bytes')}"
+            conn.request(55, {})
+        ok &= check("agent scan explicit ranges (cmd 50 ranges, bit9)", do_agent_scan_ranges)
+
     if caps & AGENT_CAP_SYMBOL_BATCH:
         def do_symbol_batch():
             assert first_rx_map is not None

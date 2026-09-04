@@ -65,6 +65,7 @@ AGENT_CAP_STRINGS = 1 << 5        # cmd 62 device-side strings scan
 AGENT_CAP_DUMP_PIPELINE = 1 << 6  # cmd 63/64/65/68 dump to disk + chunked pull
 AGENT_CAP_APK_INFO = 1 << 7       # cmd 66 device-side apk metadata (zero-mirror)
 AGENT_CAP_DISASSEMBLE = 1 << 8    # cmd 67 device-side capstone disassembly (optional)
+AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # cmd 50 accepts explicit `ranges` (v1.2.1)
 
 AGENT_CAP_TABLE = (
     (AGENT_CAP_SCAN, "scan"),
@@ -75,6 +76,7 @@ AGENT_CAP_TABLE = (
     (AGENT_CAP_DUMP_PIPELINE, "dump_pipeline"),
     (AGENT_CAP_APK_INFO, "apk_info"),
     (AGENT_CAP_DISASSEMBLE, "disassemble"),
+    (AGENT_CAP_SCAN_EXPLICIT_RANGES, "scan_explicit_ranges"),
 )
 
 

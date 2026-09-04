@@ -27,7 +27,7 @@ from tests.mock_agent import (  # noqa: E402
 )
 from tanyao.connection import AgentConnection, AgentError  # noqa: E402
 from tanyao.analysis import AnalysisFacade  # noqa: E402
-from tanyao.constants import CMD_SCAN_START  # noqa: E402
+from tanyao.constants import CMD_SCAN_START, CMD_SCAN_STATUS  # noqa: E402
 from tanyao.service import TanyaoService  # noqa: E402
 
 TOKEN = "tanyao-dev-token"
@@ -445,6 +445,91 @@ class TestCaps1FFFullPipeline(MatrixBase):
             self.assertIn(str(exc.error), ("unavailable",))
             return
         self.assertIn("job_id", out)
+
+
+class TestD1ExplicitRanges(unittest.TestCase):
+    """v1.2.1 D1: scan_set_range must survive the agent-scan dispatch.
+
+    - bit9 declared → cmd 50 carries `ranges`, device scans exactly those
+      segments (preset ignored).
+    - bit9 absent + explicit ranges → HOST engine (never send ranges to an
+      agent that would silently fall back to preset — the D1 failure mode).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent_bit9 = MockAgent(port=0, token=TOKEN, agent_caps=0x3FF)
+        cls.agent_bit9.start()
+        cls.agent_legacy = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        cls.agent_legacy.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent_bit9.stop()
+        cls.agent_legacy.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_bit9_declared_ranges_carried_to_device(self):
+        facade = self._facade(self.agent_bit9)
+        # 32-byte window around exactly one known hit (heap+0x1000 = 1337)
+        window_lo, window_hi = HEAP_START + 0x0FF0, HEAP_START + 0x1010
+        facade.scan_set_range(DEMO_PID, window_lo, window_hi)
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["ranges"], 1)
+        # preset would have found 4 hits across the whole heap — ranges found
+        # exactly the one inside the explicit window
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["results"][0]["address"], hx(HEAP_START + 0x1000))
+
+    def test_bit9_absent_falls_back_to_host_engine(self):
+        facade = self._facade(self.agent_legacy)
+        window_lo, window_hi = HEAP_START + 0x0FF0, HEAP_START + 0x1010
+        facade.scan_set_range(DEMO_PID, window_lo, window_hi)
+        out = facade.scan_hex(DEMO_PID, "EF BE AD DE")
+        self.assertEqual(out["engine"], "host-scan")  # forced fallback, no error
+        self.assertEqual(out["count"], 0)  # window excludes the 0x488 hit
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "host-scan")
+        self.assertEqual(out["count"], 1)  # exactly the in-window hit
+
+    def test_ranges_override_preset_on_wire(self):
+        """Protocol mutex: ranges present → the agent must ignore preset
+        (mock reference semantics, raw request carries both)."""
+        conn = AgentConnection("127.0.0.1", self.agent_bit9.port, TOKEN)
+        conn.connect()
+        try:
+            window_lo = HEAP_START + 0x0FF0
+            job = conn.request(CMD_SCAN_START, {
+                "pid": DEMO_PID, "kind": "hex", "pattern": "00 00 00 00",
+                "preset": "all_readable",  # would be ~84KB+; must be ignored
+                "ranges": [{"addr": hex(window_lo), "size": "0x20"}],
+            })
+            deadline = time.time() + 10
+            st = {"state": "running"}
+            while time.time() < deadline:
+                st = conn.request(CMD_SCAN_STATUS, {"job_id": job["job_id"]})
+                if st.get("state") != "running":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(st["state"], "done", st.get("error"))
+            self.assertEqual(int(st["total_bytes"], 16), 0x20)  # preset NOT used
+        finally:
+            conn.close()
+
+    def test_preset_reset_clears_explicit_ranges(self):
+        facade = self._facade(self.agent_bit9)
+        facade.scan_set_range(DEMO_PID, HEAP_START + 0x0FF0, HEAP_START + 0x1010)
+        facade.scan_set_default_ranges(DEMO_PID, preset="anon")
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["count"], 4)  # back to the whole anon preset
 
 
 if __name__ == "__main__":
