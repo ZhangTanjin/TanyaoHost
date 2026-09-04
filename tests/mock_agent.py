@@ -372,8 +372,10 @@ def hx(v: int) -> str:
 
 class MockAgent:
     def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None,
-                 agent_caps: int = 0, disasm_available: bool = True) -> None:
+                 agent_caps: int = 0, disasm_available: bool = True,
+                 build: str | None = None) -> None:
         self.disasm_available = disasm_available
+        self.build = build
         self.token = token if token is not None else os.environ.get("TANYAO_MOCK_TOKEN", "tanyao-dev-token")
         self.agent_caps = agent_caps
         self.generation = 1
@@ -538,6 +540,8 @@ class MockAgent:
             if self.agent_caps:
                 # v1.0 agents omit the field entirely; host treats absent as 0.
                 hello["capabilities"] = hex(self.agent_caps)
+            if self.build:
+                hello["build"] = self.build  # v1.2.1 附录 (D2 prevention)
             self._send(conn, 0, CMD_HELLO, hello, 0)
             decoder_buffer = bytearray()
             authed = False

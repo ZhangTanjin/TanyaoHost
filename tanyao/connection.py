@@ -112,6 +112,10 @@ class AgentConnection:
         self.generation = int(hello.payload.get("generation", 0))
         self.agent_version = hello.payload.get("version")
         self.agent_capabilities = _parse_caps(hello.payload.get("capabilities"))
+        # v1.2.1 附录: optional build identifier (git describe) for deployment
+        # hygiene diagnostics (field defect D2 prevention); absent on old agents
+        build = hello.payload.get("build")
+        self.agent_build: str | None = str(build) if isinstance(build, str) and build else None
 
         proof = hashlib.sha256((self._token + challenge).encode("utf-8")).hexdigest()
         resp = self.request(1, {"proof": proof}, authenticate=False)

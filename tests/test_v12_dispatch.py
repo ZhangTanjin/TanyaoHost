@@ -117,6 +117,26 @@ class TestCaps3AgentScan(MatrixBase):
         self.assertEqual(self.service.agent_capabilities(), 0x3)
         self.assertTrue(self.service.has_agent_cap(AGENT_CAP_SCAN))
 
+    def test_get_status_passes_hello_build_through(self):
+        """v1.2.1 (D2 prevention): hello build surfaces in get_status when the
+        agent sends it, and the key is omitted when it does not."""
+        from tanyao.ipc import build_method_table
+
+        st = build_method_table(self.facade)["get_status"]({})
+        self.assertNotIn("agent_build", st)  # this class's mock sends no build
+
+        built = MockAgent(port=0, token=TOKEN, agent_caps=0x3,
+                          build="agent-v1.2.1-4-gdeadbee")
+        built.start()
+        try:
+            svc = TanyaoService("127.0.0.1", built.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            st = build_method_table(facade)["get_status"]({})
+            self.assertEqual(st["agent_build"], "agent-v1.2.1-4-gdeadbee")
+        finally:
+            built.stop()
+
     def test_get_status_exposes_caps_and_skipped(self):
         from tanyao.ipc import build_method_table
 

@@ -57,7 +57,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
 
     def get_status(_payload: dict) -> dict:
         caps = facade.service.agent_capabilities()
-        return {
+        out = {
             "connected": facade.service.is_connected(),
             "generation": facade.service.generation(),
             "backend": _backend_dict(facade.service),
@@ -65,6 +65,10 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             "agent_capabilities": hex(caps),
             "skipped_caps": undeclared_agent_caps(caps),
         }
+        build = facade.service.agent_build()
+        if build:
+            out["agent_build"] = build  # omitted entirely when the agent has no build field
+        return out
 
     methods = {
         "get_status": get_status,

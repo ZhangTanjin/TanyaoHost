@@ -283,6 +283,17 @@ class TanyaoService:
         with self._lock:
             return bool(self.agent_capabilities() & bit)
 
+    def agent_build(self) -> str | None:
+        """hello `build` (v1.2.1 附录, D2 prevention); None when the agent
+        predates the field."""
+        with self._lock:
+            if self._conn is None:
+                if not self._auto_reconnect:
+                    raise AgentUnavailable("not connected")
+                self.connect()
+            assert self._conn is not None
+            return self._conn.agent_build
+
     def ping(self) -> dict:
         with self._lock:
             return self._execute(CMD_PING, {})
