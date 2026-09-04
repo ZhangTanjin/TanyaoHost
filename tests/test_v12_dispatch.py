@@ -203,5 +203,90 @@ class TestCaps3AgentScan(MatrixBase):
                                           preset="anon")
 
 
+class TestCaps3BSymbolsStrings(MatrixBase):
+    """caps=0x3b (bits 0,1,3,4,5): symbols/strings on the device incl. binary
+    frames end-to-end (packed symbol_batch goes over a real socket)."""
+
+    AGENT_CAPS = 0x3B
+
+    def test_symbol_list_agent_engine(self):
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so")
+        self.assertEqual(out["engine"], "agent-symbols")
+        self.assertEqual(out["module"], "libdemo.so")
+        names = {s["name"]: s for s in out["symbols"]}
+        self.assertIn("demo_start", names)
+        self.assertIn("demo_data", names)
+        self.assertEqual(names["demo_start"]["address"], hx(BASE + 0x1B40))
+        self.assertEqual(names["demo_start"]["type"], "FUNC")
+        self.assertIn("bind", names["demo_start"])  # shape key preserved
+
+    def test_symbol_list_filter(self):
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so", filter="^demo_data$")
+        self.assertEqual([s["name"] for s in out["symbols"]], ["demo_data"])
+
+    def test_symbol_find_agent_engine(self):
+        out = self.facade.symbol_find(DEMO_PID, "demo_start", module="libdemo.so")
+        self.assertEqual(out["engine"], "agent-symbols")
+        self.assertEqual(out["module"], "libdemo.so")
+        self.assertEqual(out["matches"][0]["address"], hx(BASE + 0x1B40))
+        with self.assertRaises(AgentError) as ctx:
+            self.facade.symbol_find(DEMO_PID, "no_such_symbol_xyz")
+        self.assertEqual(ctx.exception.error, "not_found")
+
+    def test_packed_matches_json(self):
+        j = self.service.symbol_batch(DEMO_PID, module="libdemo.so")
+        p = self.service.symbol_batch(DEMO_PID, module="libdemo.so", format="packed")
+        self.assertEqual(p["names"], j["names"])
+        self.assertEqual(p["addresses"], j["addresses"])
+        self.assertEqual(p["sizes"], j["sizes"])
+        self.assertEqual(p["modules"], j["modules"])
+        self.assertGreater(len(p["names"]), 0)
+
+    def test_strings_module_mode_agent(self):
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6)
+        self.assertEqual(out["engine"], "agent-strings")
+        vals = [s["value"] for s in out["strings"]]
+        self.assertIn("tanyao_mock_engine", vals)
+        self.assertIn("Java_icu_nullptr_test", vals)
+        by_val = {s["value"]: s for s in out["strings"]}
+        self.assertEqual(by_val["tanyao_mock_engine"]["offset"], BASE + 0x900)
+        self.assertEqual(by_val["tanyao_mock_engine"]["length"], 18)
+        self.assertGreater(out["scanned_bytes"], 0)
+
+    def test_strings_window_mode_agent(self):
+        out = self.facade.strings(DEMO_PID, address=HEAP_START + 0xAFF0, size=0x40,
+                                  min_length=8)
+        self.assertEqual(out["engine"], "agent-strings")
+        vals = [s["value"] for s in out["strings"]]
+        self.assertIn("TANYAO_STRINGS_WINDOW_MARKER", vals)
+
+    def test_strings_regex_and_bad_regex(self):
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6,
+                                  filter="^tanyao")
+        self.assertEqual([s["value"] for s in out["strings"]], ["tanyao_mock_engine"])
+        with self.assertRaises(AgentError) as ctx:
+            self.service.strings_scan(DEMO_PID, preset="module:libdemo.so", regex="([bad")
+        self.assertEqual(ctx.exception.error, "bad_request")
+
+    def test_strings_async_job_roundtrip(self):
+        out = self.service.strings_scan(DEMO_PID, preset="module:libdemo.so",
+                                        min_len=6, async_run=True)
+        dev_job = int(out["job_id"])
+        st = {}
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            st = self.service.agent_scan_status(dev_job)
+            if st.get("state") != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(st["state"], "done", st.get("error"))
+        self.assertEqual(st.get("kind"), "strings")
+        page = self.service.agent_scan_results(0, 32)
+        hits = page["hits"]
+        self.assertTrue(any(h["value"] == "tanyao_mock_engine" for h in hits))
+        self.assertNotIn("value_hex", hits[0])  # strings hits carry length, not value_hex
+        self.assertIn("length", hits[0])
+
+
 if __name__ == "__main__":
     unittest.main()

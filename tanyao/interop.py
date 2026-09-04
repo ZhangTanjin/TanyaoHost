@@ -19,6 +19,12 @@ import sys
 import time
 
 from .constants import (
+    AGENT_CAP_APK_INFO,
+    AGENT_CAP_DISASSEMBLE,
+    AGENT_CAP_DUMP_PIPELINE,
+    AGENT_CAP_SCAN,
+    AGENT_CAP_STRINGS,
+    AGENT_CAP_SYMBOL_BATCH,
     CMD_BACKEND_INFO,
     CMD_MEM_READ,
     CMD_MEM_READV,
@@ -27,6 +33,7 @@ from .constants import (
     CMD_PING,
     CMD_PROCESS_FIND,
     CMD_SESSION_INFO,
+    CMD_SYMBOL_BATCH,
     CMD_TARGET_CLOSE,
     CMD_TARGET_MAPS,
     CMD_TARGET_OPEN,
@@ -234,7 +241,85 @@ def main() -> int:
         conn.request(CMD_TARGET_CLOSE, {"handle": f"0x{handle:x}"})
     ok &= check("target_close", do_close)
 
+    # -- v1.2 conditional capability checks (draft §7: declared → check,
+    #    undeclared → record in skipped_caps and skip) ---------------------------
+    skipped_caps: list[str] = []
+    caps = conn.agent_capabilities
+
+    if caps & AGENT_CAP_SCAN:
+        def do_agent_scan():
+            assert first_rx_map is not None
+            base = parse_u64(first_rx_map["start"], field="start")
+            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
+            resp = conn.request(CMD_MEM_READ, {"handle": f"0x{handle:x}",
+                                               "addr": f"0x{base + 0x100:x}", "size": "0x4"})
+            data = b64_decode(resp["data_b64"])
+            pattern = " ".join(f"{b:02X}" for b in data)
+            job = conn.request(50, {"pid": args.pid, "kind": "hex", "pattern": pattern,
+                                    "preset": f"module:{module}"})
+            deadline = time.time() + 60
+            status = {"state": "running"}
+            while time.time() < deadline:
+                status = conn.request(51, {"job_id": job["job_id"]})
+                if status.get("state") != "running":
+                    break
+                time.sleep(0.2)
+            assert status.get("state") == "done", f"scan job state={status.get('state')} err={status.get('error')}"
+            assert parse_u64(status.get("total_bytes", "0x0"), field="total_bytes") > 0
+            results = conn.request(53, {"offset": 0, "limit": 16})
+            assert isinstance(results.get("hits"), list), "scan_results missing hits"
+            print(f"     NOTE: agent scan '{pattern}' in {module}: "
+                  f"{results.get('total', results.get('count'))} hits")
+        ok &= check("agent scan (cmd 50/51/53)", do_agent_scan)
+
+        def do_agent_scan_clear():
+            resp = conn.request(55, {})
+            assert resp.get("ok") is True
+        ok &= check("agent scan_clear (cmd 55)", do_agent_scan_clear)
+    else:
+        skipped_caps.append("scan")
+
+    if caps & AGENT_CAP_SYMBOL_BATCH:
+        def do_symbol_batch():
+            assert first_rx_map is not None
+            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
+            resp = conn.request(CMD_SYMBOL_BATCH, {"pid": args.pid, "module": module,
+                                                   "format": "json"})
+            count = int(resp["count"])
+            assert count > 0, "symbol_batch returned zero symbols"
+            for field in ("names", "addresses", "sizes", "types"):
+                assert len(resp[field]) == count, f"{field} column misaligned"
+            if "binds" in resp:
+                assert len(resp["binds"]) == count
+            print(f"     NOTE: symbol_batch {module}: {count} symbols")
+        ok &= check("symbol_batch json (cmd 61)", do_symbol_batch)
+    else:
+        skipped_caps.append("symbol_batch")
+
+    if caps & AGENT_CAP_STRINGS:
+        def do_strings_scan():
+            assert first_rx_map is not None
+            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
+            resp = conn.request(62, {"pid": args.pid, "preset": f"module:{module}",
+                                     "min_len": 8, "max_results": 16})
+            assert int(resp["count"]) >= 0
+            for item in resp.get("results", []):
+                assert "address" in item and "value" in item
+        ok &= check("strings_scan sync (cmd 62)", do_strings_scan)
+    else:
+        skipped_caps.append("strings")
+
+    if not caps & AGENT_CAP_DUMP_PIPELINE:
+        skipped_caps.append("dump_pipeline")
+    if not caps & AGENT_CAP_APK_INFO:
+        skipped_caps.append("apk_info")
+    if not caps & AGENT_CAP_DISASSEMBLE:
+        skipped_caps.append("disassemble")
+
     conn.close()
+
+    if skipped_caps:
+        print(f"skipped_caps: [{', '.join(skipped_caps)}] (capability not declared)")
 
     passed = sum(1 for good, _, _ in _RESULTS if good)
     failed = len(_RESULTS) - passed

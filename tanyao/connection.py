@@ -128,8 +128,10 @@ class AgentConnection:
 
     # -- request/response ----------------------------------------------------
 
-    def request(self, cmd: int, payload: dict, *, authenticate: bool = True) -> dict:
-        """Send one request and wait for the matching response. Raises AgentError on ERROR frames."""
+    def request_raw(self, cmd: int, payload: dict, *, authenticate: bool = True) -> Frame:
+        """Like request(), but returns the raw response Frame — used by ops
+        whose success response is a PAYLOAD_BINARY frame (draft §2: dump_pull,
+        symbol_batch packed). ERROR frames are still raised as AgentError."""
         if self._sock is None:
             raise AgentError("not_connected", detail="call connect() first")
         if authenticate and not self.authenticated:
@@ -149,18 +151,29 @@ class AgentConnection:
                 # Per spec, agent never pushes frames other than hello. Treat as fatal.
                 raise ProtocolError(f"unexpected non-response frame cmd={resp.cmd}")
             if resp.flags & FLAG_ERROR:
+                if not isinstance(resp.payload, dict):
+                    raise ProtocolError("ERROR frame with binary payload")
                 err = resp.payload.get("error", "unknown")
                 errno = resp.payload.get("errno")
                 detail = resp.payload.get("detail", "")
                 raise AgentError(str(err), errno=int(errno) if isinstance(errno, int) else None, detail=str(detail))
-            return resp.payload
+            return resp
+
+    def request(self, cmd: int, payload: dict, *, authenticate: bool = True) -> dict:
+        """Send one request and wait for the matching JSON response. Raises
+        AgentError on ERROR frames, ProtocolError on framing violations."""
+        resp = self.request_raw(cmd, payload, authenticate=authenticate)
+        if isinstance(resp.payload, bytes):
+            raise ProtocolError(f"cmd {cmd}: unexpected binary payload for JSON op")
+        return resp.payload
 
     def ping(self) -> dict:
         return self.request(2, {})
 
     def has_cap(self, bit: int) -> bool:
-        """True when the agent declared the given agent-layer capability bit."""
-        return bool(self.agent_capabilities & (1 << bit))
+        """True when the agent declared the given capability. `bit` is a mask
+        (AGENT_CAP_* constants), not a bit index."""
+        return bool(self.agent_capabilities & bit)
 
     # -- internal -------------------------------------------------------------
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import shutil
 import struct
 import subprocess
@@ -16,7 +17,15 @@ import zipfile
 from typing import Any
 
 from .connection import AgentError
-from .constants import AGENT_CAP_SCAN, MAP_EXEC, MAP_READ, MAP_WRITE, parse_u64
+from .constants import (
+    AGENT_CAP_SCAN,
+    AGENT_CAP_STRINGS,
+    AGENT_CAP_SYMBOL_BATCH,
+    MAP_EXEC,
+    MAP_READ,
+    MAP_WRITE,
+    parse_u64,
+)
 from .dump import dump_module as _dump_module
 from .dump import watch as _watch
 from .elfinfo import ElfParseError, parse_elf64
@@ -566,7 +575,37 @@ class AnalysisFacade:
 
     # -- symbols ---------------------------------------------------------------------------
 
+    @staticmethod
+    def _symbol_row(resp: dict, i: int, default_module: str | None) -> dict:
+        """One cmd 61 column-row → host symbol dict. `bind` is not carried on
+        the cmd 61 wire (draft §3.1); module attribution comes from
+        modules/module_indexes when the agent provides them."""
+        modules = resp.get("modules") or []
+        idx = resp.get("module_indexes") or []
+        module: str | None = default_module
+        if i < len(idx) and isinstance(idx[i], int) and 0 <= idx[i] < len(modules):
+            module = modules[idx[i]]
+        return {
+            "name": resp["names"][i],
+            "address": resp["addresses"][i],
+            "size": resp["sizes"][i],
+            "type": resp["types"][i] or "NOTYPE",
+            "bind": "",
+            "module": module,
+        }
+
     def symbol_list(self, pid: int, name: str, *, limit: int = 512, filter: str | None = None) -> dict:
+        if self.service.has_agent_cap(AGENT_CAP_SYMBOL_BATCH):
+            resp = self.service.symbol_batch(pid, module=name, filter=filter)
+            symbols = [self._symbol_row(resp, i, name) for i in range(resp["count"])]
+            return {
+                "pid": pid,
+                "module": name,
+                "total": int(resp["count"]),
+                "shown": min(int(resp["count"]), limit),
+                "symbols": symbols[:limit],
+                "engine": "agent-symbols",
+            }
         read_fn = self._read_for(pid)
         maps = self.service.target_maps(pid)
         module_maps = [m for m in maps if m.path.rstrip("/").split("/")[-1] == name]
@@ -588,11 +627,23 @@ class AnalysisFacade:
             "total": len(syms),
             "shown": min(len(syms), limit),
             "symbols": [s.to_dict() for s in syms[:limit]],
+            "engine": "host-symbols",
         }
 
     def symbol_find(self, pid: int, name: str, module: str | None = None) -> dict:
         """Exact symbol name lookup. Tries one module (or all executable file-backed
         modules until found) and returns matches with absolute addresses."""
+        if self.service.has_agent_cap(AGENT_CAP_SYMBOL_BATCH):
+            # DESIGN_V3_HOST §3.1: single full-module request + anchored filter
+            # (server-side filtering runs before max_symbols counting).
+            resp = self.service.symbol_batch(pid, module=module, filter=f"^({_re.escape(name)})$")
+            if not resp["count"]:
+                detail = f"symbol {name!r} not found" + (f" in {module!r}" if module else "")
+                raise AgentError("not_found", detail=detail)
+            matches = [self._symbol_row(resp, i, module) for i in range(resp["count"])]
+            first_module = next((m["module"] for m in matches if m.get("module")), module)
+            return {"pid": pid, "module": first_module, "matches": matches,
+                    "engine": "agent-symbols"}
         read_fn = self._read_for(pid)
         maps = self.service.target_maps(pid)
         if module:
@@ -609,7 +660,8 @@ class AnalysisFacade:
             tried.append(mod_name)
             hits = [s for s in listed["symbols"] if s["name"] == name]
             if hits:
-                return {"pid": pid, "module": mod_name, "matches": hits}
+                return {"pid": pid, "module": mod_name, "matches": hits,
+                        "engine": "host-symbols"}
         raise AgentError("not_found", detail=f"symbol {name!r} not found (tried: {tried[:8]})")
 
     # -- native binary analysis -----------------------------------------------------
@@ -665,6 +717,9 @@ class AnalysisFacade:
                 filter: str | None = None) -> dict:
         """Extract printable-ASCII strings from a module's readable segments
         (module mode, chunked with per-chunk fault skip) or an explicit window."""
+        if self.service.has_agent_cap(AGENT_CAP_STRINGS):
+            return self._agent_strings(pid, module=module, address=address, size=size,
+                                       min_length=min_length, limit=limit, filter=filter)
         read_fn = self._read_for(pid)
         if module is not None:
             maps = self.service.target_maps(pid)
@@ -698,6 +753,7 @@ class AnalysisFacade:
             return {
                 "pid": pid, "module": name, "count": len(results), "strings": results,
                 "scanned_bytes": scanned, "skipped_bytes": skipped, "truncated": truncated,
+                "engine": "host-strings",
             }
         if address is None:
             raise AgentError("bad_request", detail="strings: provide module= or address=")
@@ -708,7 +764,50 @@ class AnalysisFacade:
         items = extract_strings(data, offset=address, min_length=min_length,
                                 limit=limit, filter=filter)
         return {"pid": pid, "address": f"0x{address:x}", "size": size,
-                "count": len(items), "strings": items, "truncated": len(items) >= limit}
+                "count": len(items), "strings": items, "truncated": len(items) >= limit,
+                "engine": "host-strings"}
+
+    def _agent_strings(self, pid: int, *, module: str | None, address: int | None,
+                       size: int | None, min_length: int, limit: int,
+                       filter: str | None) -> dict:
+        """cmd 62 path: device extracts strings, host maps back to the
+        {offset,length,value} shape (offset = absolute address)."""
+        def _rows(resp: dict) -> list[dict]:
+            out = []
+            for r in resp.get("results", []):
+                out.append({
+                    "offset": int(str(r["address"]), 16),
+                    "length": int(r.get("length", len(str(r["value"])))),
+                    "value": r["value"],
+                })
+            return out
+
+        if module is not None:
+            resp = self.service.strings_scan(pid, preset=f"module:{module}",
+                                             min_len=min_length, max_results=limit,
+                                             regex=filter)
+            return {
+                "pid": pid, "module": module, "count": int(resp["count"]),
+                "strings": _rows(resp),
+                "scanned_bytes": parse_u64(resp.get("scanned_bytes", "0x0"), field="scanned_bytes"),
+                "skipped_bytes": parse_u64(resp.get("skipped_bytes", "0x0"), field="skipped_bytes"),
+                "truncated": bool(resp.get("truncated", False)),
+                "engine": "agent-strings",
+            }
+        if address is None:
+            raise AgentError("bad_request", detail="strings: provide module= or address=")
+        if not size or size <= 0:
+            raise AgentError("bad_request", detail="strings: address mode requires size")
+        size = min(int(size), 0x1000000)
+        resp = self.service.strings_scan(pid, addr=address, size=size,
+                                         min_len=min_length, max_results=limit,
+                                         regex=filter)
+        return {
+            "pid": pid, "address": f"0x{address:x}", "size": size,
+            "count": int(resp["count"]), "strings": _rows(resp),
+            "truncated": bool(resp.get("truncated", False)),
+            "engine": "agent-strings",
+        }
 
     def pull_apk(self, pid: int, out_path: str) -> dict:
         """Pull the APK backing this pid to the host (host adb; no agent command)."""

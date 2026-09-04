@@ -19,16 +19,19 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import socket
 import struct
 import threading
 import time
+import zlib
 
 # --- protocol constants (mirrors PROTOCOL.md; host code is the canonical copy) ---
 FRAME_MAGIC = 0x54594F31
 PROTOCOL_VERSION = 1
 FLAG_RESPONSE = 0x01
 FLAG_ERROR = 0x02
+FLAG_PAYLOAD_BINARY = 0x04
 HEADER = struct.Struct(">IBBHIII")  # magic, version, flags, reserved, seq, cmd, length = 20 bytes
 MAX_PAYLOAD = 16 * 1024 * 1024
 
@@ -94,6 +97,10 @@ SCAN_MAX_HITS = 200_000
 SCAN_CHUNK = 2 * 1024 * 1024
 SCAN_MIN_GRAN = 4096
 SCAN_MAX_GRAN = 64 * 1024 * 1024
+
+# packed symbol table (v1.2 draft §3.1), mirrors tanyao.frames
+PACKED_SYMBOL_HEADER = struct.Struct(">IIII")
+PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
 
 # name -> (little-endian struct fmt, size, is_float); mirrors host scan.TYPES
 SCAN_TYPES: dict[str, tuple[str, int, bool]] = {
@@ -213,7 +220,8 @@ class MockScanJob:
 
     __slots__ = ("id", "spec", "ranges", "state", "round", "scanned", "total",
                  "skipped", "hits", "truncated", "error", "started", "finished",
-                 "cancel", "dead_gran", "hex_carry")
+                 "cancel", "dead_gran", "hex_carry",
+                 "str_start", "str_buf", "str_total")
 
     def __init__(self, job_id: int, spec: dict, ranges: list[tuple[int, int]]) -> None:
         self.id = job_id
@@ -232,6 +240,10 @@ class MockScanJob:
         self.cancel = threading.Event()
         self.dead_gran = SCAN_MIN_GRAN
         self.hex_carry = b""
+        # strings state machine (kind == "strings")
+        self.str_start = None
+        self.str_buf = bytearray()
+        self.str_total = 0
 
 
 def _parse_aob(pattern: str) -> tuple[bytes, bytes]:
@@ -598,7 +610,15 @@ class MockAgent:
             if cmd == CMD_SCAN_CANCEL:
                 return self._scan_cancel(payload)
             return self._scan_clear(payload)
-        if cmd in (CMD_WRITE_TXN, CMD_SYMBOL_BATCH, CMD_STRINGS_SCAN,
+        if cmd == CMD_SYMBOL_BATCH:
+            if not self.agent_caps & AGENT_CAP_SYMBOL_BATCH:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._symbol_batch(payload)
+        if cmd == CMD_STRINGS_SCAN:
+            if not self.agent_caps & AGENT_CAP_STRINGS:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._strings_scan(payload)
+        if cmd in (CMD_WRITE_TXN,
                    CMD_DUMP_START, CMD_DUMP_STATUS, CMD_DUMP_PULL,
                    CMD_APK_INFO, CMD_DISASSEMBLE, CMD_DUMP_CLEANUP):
             # implemented in later milestones; undeclared-or-unimplemented ops
@@ -607,6 +627,206 @@ class MockAgent:
         raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
 
     # -- device-local scan engine (PROTOCOL.md §7 reference implementation) ------
+
+    # -- cmd 61 symbol_batch (v1.2 draft §3.1 reference implementation) -----------
+
+    def _module_groups(self, module):
+        """Group exec file-backed maps by basename; explicit module or all
+        (ascending base). Returns [(name, first_map, mem_size)]."""
+        groups = {}
+        for m in self.target_maps:
+            if not m["path"] or not (m["flags"] & 4):  # exec only
+                continue
+            base = m["path"].rsplit("/", 1)[-1].split(" (deleted)")[0]
+            if module and base != module:
+                continue
+            groups.setdefault(base, []).append(m)
+        if module and not groups:
+            raise ProtocolFail("not_found", detail=f"module {module!r} not found")
+        out = []
+        for name, maps in sorted(groups.items(), key=lambda kv: min(m["start"] for m in kv[1])):
+            first = min(m["start"] for m in maps)
+            out.append((name, first, max(m["end"] for m in maps) - first))
+        return out
+
+    def _symbol_batch(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        fmt = payload.get("format", "json")
+        if fmt not in ("json", "packed"):
+            raise ProtocolFail("bad_request", detail=f"unknown format {fmt!r}")
+        if fmt == "packed" and not self.agent_caps & AGENT_CAP_BINARY_FRAMES:
+            raise ProtocolFail("bad_request", detail="packed requires BINARY_FRAMES capability")
+        max_symbols = payload.get("max_symbols", 65536)
+        if not isinstance(max_symbols, int) or max_symbols <= 0:
+            raise ProtocolFail("bad_request", detail="max_symbols must be a positive integer")
+        filter_re = None
+        raw_filter = payload.get("filter")
+        if raw_filter:
+            try:
+                filter_re = re.compile(raw_filter)  # ECMAScript regex_search analogue
+            except re.error as exc:
+                raise ProtocolFail("bad_request", detail=f"invalid filter regex: {exc}")
+        # NOTE: include_undef is accepted but the mock's loader (host symbols.py
+        # semantics) always excludes SHN_UNDEF; true matches false here.
+
+        from tanyao.symbols import SymbolError, load_symbols
+
+        collected = []  # (module_name, symbol)
+        modules_order = []
+        for name, first, mem_size in self._module_groups(payload.get("module")):
+            try:
+                header = self.memory.read(first, 0x1000)
+                syms = load_symbols(self.memory.read, first, mem_size, header)
+            except (SymbolError, MemoryFault):
+                if payload.get("module"):
+                    raise ProtocolFail("not_found", detail=f"no dynamic segment in {name!r}")
+                continue  # merged mode: best effort per module
+            for sym in syms:
+                if filter_re is not None and not filter_re.search(sym.name):
+                    continue  # server-side filter precedes max_symbols counting
+                if name not in modules_order:
+                    modules_order.append(name)
+                collected.append((name, sym))
+
+        truncated = len(collected) > max_symbols
+        collected = collected[:max_symbols]
+        contributing = [n for n in modules_order if any(n == c[0] for c in collected)]
+        module_index = {n: i for i, n in enumerate(contributing)}
+
+        if fmt == "json":
+            return {
+                "count": len(collected),
+                "truncated": truncated,
+                "modules": contributing,
+                "module_indexes": [module_index[n] for n, _s in collected],
+                "names": [s.name for _n, s in collected],
+                "addresses": [hx(s.address) for _n, s in collected],
+                "sizes": [s.size for _n, s in collected],
+                "types": [s.kind for _n, s in collected],
+            }
+        # packed: header + 20B entries + name_blob + module_blob (all big-endian)
+        name_blob = bytearray()
+        name_offs = []
+        for _n, s in collected:
+            name_offs.append(len(name_blob))
+            name_blob += s.name.encode("utf-8") + b"\x00"
+        module_blob = bytearray()
+        module_offs = {}
+        for n in contributing:
+            module_offs[n] = len(module_blob)
+            module_blob += n.encode("utf-8") + b"\x00"
+        out = bytearray(PACKED_SYMBOL_HEADER.pack(
+            len(collected), len(contributing), len(name_blob), len(module_blob)))
+        for (n, s), noff in zip(collected, name_offs):
+            out += PACKED_SYMBOL_ENTRY.pack(s.address, s.size, noff, module_offs[n])
+        out += name_blob
+        out += module_blob
+        return bytes(out)
+
+    # -- cmd 62 strings_scan (v1.2 draft §3.2 reference implementation) -----------
+
+    STRINGS_SYNC_LIMIT = 256 * 1024 * 1024  # documented threshold
+
+    def _strings_scan(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        spec = {"pid": pid, "kind": "strings", "preset": "", "module": "",
+                "epsilon": 0.0, "alignment": 0}
+        min_len = payload.get("min_len", 4)
+        max_len = payload.get("max_len", 256)
+        max_results = payload.get("max_results", 1024)
+        if not isinstance(min_len, int) or not isinstance(max_len, int) or not isinstance(max_results, int):
+            raise ProtocolFail("bad_request", detail="min_len/max_len/max_results must be ints")
+        spec["min_len"] = min_len
+        spec["max_len"] = max_len
+        spec["max_results"] = max_results
+        regex = payload.get("regex")
+        if regex:
+            try:
+                spec["regex_re"] = re.compile(regex)
+            except re.error as exc:
+                raise ProtocolFail("bad_request", detail=f"invalid regex: {exc}")
+        ranges = []
+        if payload.get("preset"):
+            spec["preset"] = str(payload["preset"])
+            ranges = self._preset_ranges(spec["preset"], "")
+        elif payload.get("addr") is not None and payload.get("size") is not None:
+            addr = _u64(payload["addr"], "addr")
+            size = _u64(payload["size"], "size")
+            ranges = [(addr, addr + size)]
+        else:
+            raise ProtocolFail("bad_request", detail="strings_scan needs preset or addr+size")
+        if not ranges:
+            raise ProtocolFail("backend_error", 0, "preset matched no readable ranges")
+        total = sum(hi - lo for lo, hi in ranges)
+        async_run = bool(payload.get("async", False))
+        if async_run:
+            with self._scan_lock:
+                cancelled_old = False
+                old = self._scan_job
+                if old is not None and old.state == "running":
+                    old.cancel.set()
+                    old.state = "cancelled"
+                    cancelled_old = True
+                self._scan_seq += 1
+                job = MockScanJob(self._scan_seq, spec, ranges)
+                self._scan_job = job
+            threading.Thread(target=self._run_scan, args=(job,), daemon=True,
+                             name=f"mock-strings-{job.id}").start()
+            resp = {"job_id": job.id, "state": "running"}
+            if cancelled_old:
+                resp["cancelled_old"] = True
+            return resp
+        if total > self.STRINGS_SYNC_LIMIT:
+            raise ProtocolFail("bad_request", 0,
+                               f"sync range {total}B exceeds threshold; limit the preset or use async")
+        job = MockScanJob(0, spec, ranges)  # transient: synchronous execution
+        started = time.monotonic()
+        for lo, hi in ranges:
+            job.hex_carry = b""
+            self._strings_reset(job)
+            self._scan_region(job, lo, hi, SCAN_CHUNK)
+        self._strings_flush(job)
+        return {
+            "count": len(job.hits),
+            "truncated": job.truncated,
+            "scanned_bytes": hx(job.scanned),
+            "skipped_bytes": hx(sum(hi - lo for lo, hi in self._merged_skipped(job))),
+            "elapsed_sec": round(time.monotonic() - started, 3),
+            "results": [{"address": hx(h["address"]), "length": h["length"],
+                         "value": h["value"]} for h in job.hits],
+        }
+
+    @staticmethod
+    def _strings_reset(job):
+        # runs never cross VMAs or skipped holes
+        job.str_start = None
+        job.str_buf = bytearray()
+        job.str_total = 0
+
+    def _strings_flush(self, job):
+        if job.str_start is None:
+            return
+        if job.str_total >= job.spec["min_len"]:
+            value = bytes(job.str_buf).decode("ascii", "replace")
+            regex_re = job.spec.get("regex_re")
+            if regex_re is None or regex_re.search(value):
+                if len(job.hits) < job.spec["max_results"]:
+                    job.hits.append({"address": job.str_start,
+                                     "length": job.str_total,  # pre-truncation length
+                                     "value": value})
+                else:
+                    job.truncated = True
+        job.str_start = None
+        job.str_buf = bytearray()
+        job.str_total = 0
 
     def _preset_ranges(self, preset: str, module: str) -> list[tuple[int, int]]:
         """Range selection per scan_engine.cpp prepare_ranges (device parity)."""
@@ -718,6 +938,8 @@ class MockAgent:
         job = self._current_job(payload)
         if job.state == "running":
             raise ProtocolFail("bad_request", detail="scan job still running")
+        if job.spec["kind"] == "strings":
+            raise ProtocolFail("bad_request", detail="refine not supported for strings jobs")
         mode = payload.get("mode")
         modes = ("eq", "neq", "changed", "unchanged", "increased", "decreased")
         if mode not in modes:
@@ -812,9 +1034,13 @@ class MockAgent:
                 if job.cancel.is_set():
                     break
                 job.hex_carry = b""  # matches never cross VMAs
+                if job.spec["kind"] == "strings":
+                    self._strings_reset(job)
                 self._scan_region(job, lo, hi, SCAN_CHUNK)
                 if job.truncated:
                     break
+            if job.spec["kind"] == "strings":
+                self._strings_flush(job)
         except Exception as exc:  # noqa: BLE001
             job.state = "error"
             job.error = f"{type(exc).__name__}: {exc}"
@@ -837,6 +1063,8 @@ class MockAgent:
                 eff = job.dead_gran
                 if take <= eff:
                     job.skipped.append((pos, pos + take))
+                    if job.spec["kind"] == "strings":
+                        self._strings_reset(job)
                     pos += take
                     job.dead_gran = min(SCAN_MAX_GRAN, eff * 2)
                     continue
@@ -853,6 +1081,20 @@ class MockAgent:
 
     def _on_chunk(self, job: "MockScanJob", pos: int, data: bytes) -> None:
         job.scanned += len(data)
+        if job.spec["kind"] == "strings":
+            max_len = job.spec["max_len"]
+            for i, b in enumerate(data):
+                if 0x20 <= b <= 0x7E or b == 0x09:  # printable ASCII + TAB
+                    if job.str_start is None:
+                        job.str_start = pos + i
+                        job.str_buf = bytearray()
+                        job.str_total = 0
+                    job.str_total += 1
+                    if len(job.str_buf) < max_len:
+                        job.str_buf.append(b)  # cap the recorded value at max_len
+                else:
+                    self._strings_flush(job)
+            return
         if job.spec["kind"] == "value":
             fmt, size, _is_float = SCAN_TYPES[job.spec["type"]]
             align = job.spec["alignment"] or size
@@ -907,8 +1149,13 @@ class MockAgent:
 
     # -- framing ------------------------------------------------------------------
 
-    def _send(self, conn: socket.socket, seq: int, cmd: int, payload: dict, flags: int) -> None:
-        body = json_dumps(payload)
+    def _send(self, conn: socket.socket, seq: int, cmd: int, payload, flags: int) -> None:
+        if isinstance(payload, (bytes, bytearray)):
+            # v1.2 draft §2: raw payload responses carry flags bit2
+            body = bytes(payload)
+            flags |= FLAG_PAYLOAD_BINARY
+        else:
+            body = json_dumps(payload)
         conn.sendall(HEADER.pack(FRAME_MAGIC, PROTOCOL_VERSION, flags, 0, seq, cmd, len(body)) + body)
 
     def _recv(self, conn: socket.socket, buffer: bytearray):

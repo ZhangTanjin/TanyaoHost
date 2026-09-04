@@ -29,6 +29,8 @@ from .constants import (
     CMD_SCAN_START,
     CMD_SCAN_STATUS,
     CMD_SESSION_INFO,
+    CMD_STRINGS_SCAN,
+    CMD_SYMBOL_BATCH,
     CMD_TARGET_CLOSE,
     CMD_TARGET_MAPS,
     CMD_TARGET_OPEN,
@@ -40,6 +42,7 @@ from .constants import (
     parse_u64,
 )
 from .connection import AgentConnection, AgentError
+from .frames import Frame, decode_packed_symbols
 
 # Protocol v1 returns bytes as base64 inside a 16MiB JSON payload. A 4MiB raw
 # ceiling leaves room for base64 expansion and JSON metadata while keeping
@@ -162,8 +165,9 @@ class TanyaoService:
         with self._lock:
             return self._conn.generation if self._conn else None
 
-    def _execute(self, cmd: int, payload: dict) -> dict:
-        """Run one RPC with reconnect-once semantics. Caller must hold lock (or accept races)."""
+    def _execute_frame(self, cmd: int, payload: dict) -> Frame:
+        """Run one RPC with reconnect-once semantics, returning the raw Frame
+        (binary-payload ops use this). Caller must hold lock (or accept races)."""
         if self._conn is None:
             if not self._auto_reconnect:
                 raise AgentUnavailable("not connected")
@@ -171,7 +175,7 @@ class TanyaoService:
         assert self._conn is not None
         old_generation = self._conn.generation
         try:
-            return self._conn.request(cmd, payload)
+            return self._conn.request_raw(cmd, payload)
         except (ConnectionError, TimeoutError, OSError) as exc:
             # transport-level failure: drop and optionally retry once
             self._drop_connection()
@@ -183,7 +187,7 @@ class TanyaoService:
                 # agent restarted; handles/cookies are gone, sessions rebuilt on demand
                 self._targets.clear()
             try:
-                return self._conn.request(cmd, payload)
+                return self._conn.request_raw(cmd, payload)
             except (ConnectionError, TimeoutError, OSError) as exc2:
                 self._drop_connection()
                 raise AgentUnavailable(f"agent connection lost twice: {exc2}") from exc2
@@ -197,6 +201,13 @@ class TanyaoService:
             # parsing garbage from a desynced buffer.
             self._drop_connection()
             raise AgentError("protocol_error", detail=str(exc)) from exc
+
+    def _execute(self, cmd: int, payload: dict) -> dict:
+        """JSON-op variant of _execute_frame."""
+        frame = self._execute_frame(cmd, payload)
+        if isinstance(frame.payload, bytes):
+            raise AgentError("protocol_error", detail=f"cmd {cmd}: unexpected binary payload")
+        return frame.payload
 
     def _require_handle(self, pid: int) -> TargetSession:
         """Get or reopen the target session for pid.
@@ -261,8 +272,9 @@ class TanyaoService:
             return self._conn.agent_capabilities
 
     def has_agent_cap(self, bit: int) -> bool:
+        """bit is an AGENT_CAP_* mask (e.g. AGENT_CAP_SCAN = 1 << 0)."""
         with self._lock:
-            return bool(self.agent_capabilities() & (1 << bit))
+            return bool(self.agent_capabilities() & bit)
 
     def ping(self) -> dict:
         with self._lock:
@@ -437,6 +449,74 @@ class TanyaoService:
         """cmd 55: clear results, keep range configuration."""
         with self._lock:
             return self._execute(CMD_SCAN_CLEAR, {})
+
+    # -- symbol batch / strings scan (v1.2 draft §3.1/§3.2) -----------------------
+
+    def symbol_batch(
+        self,
+        pid: int,
+        *,
+        module: str | None = None,
+        filter: str | None = None,
+        format: str = "json",
+        max_symbols: int = 65536,
+        include_undef: bool = False,
+    ) -> dict:
+        """cmd 61 symbol_batch. format="packed" returns the binary-frame layout
+        decoded into the same column shape (types not represented on packed wire)."""
+        with self._lock:
+            payload: dict = {
+                "pid": pid,
+                "format": format,
+                "max_symbols": int(max_symbols),
+                "include_undef": bool(include_undef),
+            }
+            if module:
+                payload["module"] = module
+            if filter:
+                payload["filter"] = filter
+            if format == "packed":
+                frame = self._execute_frame(CMD_SYMBOL_BATCH, payload)
+                if not isinstance(frame.payload, bytes):
+                    raise AgentError("protocol_error", detail="packed symbol_batch: JSON response")
+                decoded = decode_packed_symbols(frame.payload)
+                return decoded
+            resp = self._execute(CMD_SYMBOL_BATCH, payload)
+            resp.setdefault("module_indexes", [])
+            return resp
+
+    def strings_scan(
+        self,
+        pid: int,
+        *,
+        preset: str | None = None,
+        addr: int | None = None,
+        size: int | None = None,
+        min_len: int = 4,
+        max_len: int = 256,
+        regex: str | None = None,
+        max_results: int = 1024,
+        async_run: bool = False,
+    ) -> dict:
+        """cmd 62 strings_scan (sync mode; async jobs surface via scan_status)."""
+        with self._lock:
+            payload: dict = {
+                "pid": pid,
+                "min_len": int(min_len),
+                "max_len": int(max_len),
+                "max_results": int(max_results),
+                "async": bool(async_run),
+            }
+            if preset:
+                payload["preset"] = preset
+            elif addr is not None and size:
+                payload["addr"] = hex_u64(addr)
+                payload["size"] = hex_u64(size)
+            else:
+                raise AgentError("bad_request", detail="strings_scan needs preset or addr+size")
+            if regex:
+                payload["regex"] = regex
+            return self._execute(CMD_STRINGS_SCAN, payload)
 
     # -- memory -------------------------------------------------------------------
 
