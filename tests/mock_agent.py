@@ -102,6 +102,83 @@ SCAN_MAX_GRAN = 64 * 1024 * 1024
 PACKED_SYMBOL_HEADER = struct.Struct(">IIII")
 PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
 
+APK_PATH = "/data/app/~~x/com.example.re/base.apk"
+APK_START = 0x7100000000
+DUMP_DIR_BUDGET = 512 * 1024 * 1024
+DUMP_CHUNK_HEADER = struct.Struct(">QIIB3xI")  # offset|data_len|raw_len|flags|rsvd|crc32
+DUMP_CHUNK_DEFLATE = 0x01
+DUMP_CHUNK_LAST = 0x02
+
+
+def _build_axml_manifest() -> bytes:
+    """Minimal binary AXML manifest (same construction style as the real one:
+    UTF-16 string pool + start/end tag stream)."""
+    strings = [
+        "manifest", "package", "com.example.re", "versionName", "1.2.3",
+        "versionCode", "uses-permission", "name", "android.permission.INTERNET",
+        "activity", "com.example.re.MainActivity", "intent-filter", "action",
+        "android.intent.action.MAIN", "category", "android.intent.category.LAUNCHER",
+    ]
+    S = {name: i for i, name in enumerate(strings)}
+    utf16 = b"".join(struct.pack("<H", len(x)) + x.encode("utf-16-le") + b"\x00\x00"
+                     for x in strings)
+    count = len(strings)
+    header = 28
+    offsets, cur = [], 0
+    for x in strings:
+        offsets.append(cur)
+        cur += 2 + len(x) * 2 + 2
+    strings_start = header + 4 * count
+    pool = struct.pack("<HHIIIIII", 0x0001, header, strings_start + len(utf16),
+                       count, 0, 0, strings_start, 0) \
+        + b"".join(struct.pack("<I", o) for o in offsets) + utf16
+
+    def start(name_idx, attrs):
+        attr_bytes = b""
+        for aname, avalue, atype in attrs:
+            attr_bytes += struct.pack("<iiIHBBI", -1, S[aname], 0xFFFFFFFF, 8, 0, atype, avalue)
+        csize = 36 + len(attr_bytes)
+        return (struct.pack("<HHI", 0x0102, 16, csize)
+                + struct.pack("<ii", 0, -1)
+                + struct.pack("<ii", -1, name_idx)
+                + struct.pack("<HHHHHH", 20, 20, len(attrs), 0, 0, 0)
+                + attr_bytes)
+
+    def end(name_idx):
+        return (struct.pack("<HHI", 0x0103, 16, 24)
+                + struct.pack("<ii", 0, -1)
+                + struct.pack("<ii", -1, name_idx))
+
+    chunks = [pool,
+              start(S["manifest"], [("package", S["com.example.re"], 0x03),
+                                    ("versionName", S["1.2.3"], 0x03),
+                                    ("versionCode", 123, 0x10)]),
+              start(S["uses-permission"], [("name", S["android.permission.INTERNET"], 0x03)]),
+              end(S["uses-permission"]),
+              start(S["activity"], [("name", S["com.example.re.MainActivity"], 0x03)]),
+              start(S["intent-filter"], []),
+              start(S["action"], [("name", S["android.intent.action.MAIN"], 0x03)]),
+              end(S["action"]),
+              start(S["category"], [("name", S["android.intent.category.LAUNCHER"], 0x03)]),
+              end(S["category"]),
+              end(S["intent-filter"]),
+              end(S["activity"]),
+              end(S["manifest"])]
+    body = b"".join(chunks)
+    return struct.pack("<HHI", 0x0003, 8, 8 + len(body)) + body
+
+
+def _build_apk_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("AndroidManifest.xml", _build_axml_manifest())
+        zf.writestr("classes.dex", b"dex\n")
+    return buf.getvalue()
+
+
 # name -> (little-endian struct fmt, size, is_float); mirrors host scan.TYPES
 SCAN_TYPES: dict[str, tuple[str, int, bool]] = {
     "u8": ("<B", 1, False), "u16": ("<H", 2, False), "u32": ("<I", 4, False),
@@ -135,11 +212,13 @@ def build_elf64() -> bytes:
                      1,        # e_version
                      0x1B40,   # e_entry
                      phoff,    # e_phoff
-                     0,        # e_shoff
+                     0x1F00,   # e_shoff: DANGLING section table (device parity:
+                               # header copied from memory, table never captured)
+
                      0,        # e_flags
                      ehsize,   # e_ehsize
                      phentsize, phnum,   # e_phentsize, e_phnum
-                     0, 0, 0)  # shentsize/shnum/shstrndx
+                     64, 2, 1)  # shentsize/shnum/shstrndx (dangling, sanitized on dump)
     # PT_LOAD 1: file vaddr 0, exec (p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align)
     struct.pack_into("<IIQQQQQQ", e, phoff,
                      1, 5, 0, 0, 0x3000, 0x3000, 0, 0x1000)
@@ -291,7 +370,8 @@ def hx(v: int) -> str:
 
 class MockAgent:
     def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None,
-                 agent_caps: int = 0) -> None:
+                 agent_caps: int = 0, disasm_available: bool = True) -> None:
+        self.disasm_available = disasm_available
         self.token = token if token is not None else os.environ.get("TANYAO_MOCK_TOKEN", "tanyao-dev-token")
         self.agent_caps = agent_caps
         self.generation = 1
@@ -361,6 +441,13 @@ class MockAgent:
         hmarker = b"TANYAO_STRINGS_WINDOW_MARKER\x00"
         heap[0xB000:0xB000 + len(hmarker)] = hmarker
 
+        # v1.2 world: a mapped base.apk (zip with AXML manifest) for the dump
+        # pipeline path-pull (cmd 65 `path`) and apk_info (cmd 66)
+        self.apk_bytes = _build_apk_bytes()
+        self.memory.add(APK_START, len(self.apk_bytes), self.apk_bytes)
+        self.pullable_paths = {APK_PATH: self.apk_bytes}
+        self.dumps: dict[str, dict] = {}
+
         # Canonical target_maps snapshot shared by cmd 22 and the device scan
         # engine presets (same table a real agent gets from the kernel).
         self.target_maps = [
@@ -372,6 +459,8 @@ class MockAgent:
              "flags": 2 | 8, "path": MODULE_PATH},
             {"start": HEAP_START, "end": HEAP_START + 0x10000, "file_offset": 0,
              "flags": 1 | 2 | 8 | 32, "path": ""},
+            {"start": APK_START, "end": APK_START + len(self.apk_bytes),
+             "file_offset": 0, "flags": 1 | 8, "path": APK_PATH},
         ]
 
     # -- networking ----------------------------------------------------------------
@@ -475,8 +564,10 @@ class MockAgent:
                     resp = self._dispatch(cmd, payload)
                     self._send(conn, seq, cmd, resp, FLAG_RESPONSE)
                 except ProtocolFail as exc:
-                    self._send(conn, seq, cmd, {"ok": False, "error": exc.error, "errno": exc.errno,
-                                                "detail": exc.detail}, FLAG_RESPONSE | FLAG_ERROR)
+                    body = {"ok": False, "error": exc.error, "errno": exc.errno,
+                            "detail": exc.detail}
+                    body.update(exc.extra)
+                    self._send(conn, seq, cmd, body, FLAG_RESPONSE | FLAG_ERROR)
                     if exc.fatal:
                         break
                 if cmd == CMD_SHUTDOWN:
@@ -618,13 +709,241 @@ class MockAgent:
             if not self.agent_caps & AGENT_CAP_STRINGS:
                 raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
             return self._strings_scan(payload)
-        if cmd in (CMD_WRITE_TXN,
-                   CMD_DUMP_START, CMD_DUMP_STATUS, CMD_DUMP_PULL,
-                   CMD_APK_INFO, CMD_DISASSEMBLE, CMD_DUMP_CLEANUP):
-            # implemented in later milestones; undeclared-or-unimplemented ops
-            # behave exactly like unknown cmds (unsupported_cmd, no disconnect)
-            raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+        if cmd == CMD_WRITE_TXN:
+            if not self.agent_caps & AGENT_CAP_WRITE_TXN:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._write_txn(payload)
+        if cmd in (CMD_DUMP_START, CMD_DUMP_STATUS, CMD_DUMP_PULL, CMD_DUMP_CLEANUP):
+            if not self.agent_caps & AGENT_CAP_DUMP_PIPELINE:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            if cmd == CMD_DUMP_START:
+                return self._dump_start(payload)
+            if cmd == CMD_DUMP_STATUS:
+                return self._dump_status(payload)
+            if cmd == CMD_DUMP_PULL:
+                return self._dump_pull(payload)
+            return self._dump_cleanup(payload)
+        if cmd == CMD_APK_INFO:
+            if not self.agent_caps & AGENT_CAP_APK_INFO:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._apk_info(payload)
+        if cmd == CMD_DISASSEMBLE:
+            if not self.agent_caps & AGENT_CAP_DISASSEMBLE:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._disassemble(payload)
+        # undeclared-or-unimplemented ops behave exactly like unknown cmds
+        # (unsupported_cmd, no disconnect)
         raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+
+    # -- cmd 60 write_txn (PROTOCOL.md §7.5) ---------------------------------------
+
+    def _write_txn(self, payload):
+        import base64
+
+        handle = _u64(payload.get("handle", "0x0"), "handle")
+        if handle != DEMO_PID << 8:
+            raise ProtocolFail("bad_request", detail="unknown handle")
+        addr = _u64(payload.get("addr"), "addr")
+        data = base64.b64decode(payload.get("data_b64", ""))
+        expect_old = payload.get("expect_old_b64")
+        expect_old = base64.b64decode(expect_old) if expect_old else None
+        verify = bool(payload.get("verify", True))
+        try:
+            old = self.memory.read(addr, len(data))
+        except MemoryFault:
+            raise ProtocolFail("backend_error", -14, "read old failed")
+        if expect_old is not None and old != expect_old:
+            raise ProtocolFail("expect_old_mismatch", 0, "expect_old mismatch",
+                               extra={"old_b64": base64.b64encode(old).decode()})
+        self.memory.write(addr, data)
+        if verify:
+            back = self.memory.read(addr, len(data))
+            if back != data:
+                try:
+                    self.memory.write(addr, old)  # best-effort rollback
+                except MemoryFault:
+                    pass
+                raise ProtocolFail("verify_failed", 0, "readback mismatch; rolled back")
+        return {"ok": True, "old_b64": base64.b64encode(old).decode(),
+                "result_size": hx(len(data)), "verified": verify, "rolled_back": False}
+
+    # -- cmd 63/64/65/68 dump pipeline (v1.2 draft §3.3-§3.5) -----------------------
+
+    def _dump_start(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        module = payload.get("module")
+        if not isinstance(module, str) or not module:
+            raise ProtocolFail("bad_request", detail="module required")
+        out_name = payload.get("out_name") or module
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", out_name) or ".." in out_name:
+            raise ProtocolFail("bad_request", detail=f"illegal out_name {out_name!r}")
+        include_anonymous = bool(payload.get("include_anonymous", False))
+        if sum(len(d["image"]) for d in self.dumps.values()) >= DUMP_DIR_BUDGET:
+            raise ProtocolFail("disk_budget", 0, "dump directory over budget; cleanup first")
+
+        from tanyao.dump import dump_module as build_dump
+        from tanyao.service import MapEntry
+
+        maps = [MapEntry(start=m["start"], end=m["end"], file_offset=m["file_offset"],
+                         flags=m["flags"], path=m["path"]) for m in self.target_maps]
+        try:
+            image, manifest = build_dump(pid, module, maps,
+                                         read_fn=self.memory.read,
+                                         include_anonymous=include_anonymous)
+        except ValueError as exc:
+            raise ProtocolFail("not_found", 0, str(exc))
+        sha = hashlib.sha256(image).hexdigest()
+        dump_id = f"{out_name}-{os.urandom(2).hex()}"
+        while dump_id in self.dumps:  # collision regenerate
+            dump_id = f"{out_name}-{os.urandom(2).hex()}"
+        self.dumps[dump_id] = {"image": image, "manifest": manifest.to_dict(),
+                               "sha256": sha, "created": time.monotonic()}
+        path = f"/data/local/tmp/tanyao-dump/{dump_id}.so"
+        return {"dump_id": dump_id, "path": path, "size": hx(len(image)), "sha256": sha,
+                "manifest_path": path + ".manifest.json",
+                "mappings": len(manifest.entries), "sanitized": bool(manifest.sanitized),
+                "maps_source": manifest.maps_source, "skipped": manifest.skipped,
+                "manifest": manifest.to_dict()}
+
+    def _dump_status(self, payload):
+        if payload.get("list"):
+            now = time.monotonic()
+            return {"dumps": [{"dump_id": k, "size": hx(len(v["image"])),
+                               "age_sec": round(now - v["created"], 1)}
+                              for k, v in self.dumps.items()]}
+        dump_id = payload.get("dump_id")
+        entry = self.dumps.get(dump_id)
+        if entry is None:
+            return {"exists": False}
+        return {"exists": True, "size": hx(len(entry["image"])),
+                "sha256": entry["sha256"],
+                "age_sec": round(time.monotonic() - entry["created"], 1)}
+
+    def _dump_pull(self, payload):
+        offset = _u64(payload.get("offset", "0x0"), "offset")
+        chunk = _u64(payload.get("chunk", "0x40000"), "chunk")
+        if chunk <= 0 or chunk > MAX_PAYLOAD - DUMP_CHUNK_HEADER.size:
+            raise ProtocolFail("bad_request", detail="chunk out of range")
+        compress = bool(payload.get("compress", True))
+        if payload.get("path"):
+            path = payload["path"]
+            if not path.startswith("/data/app/"):
+                raise ProtocolFail("bad_request", detail="path pull limited to /data/app/")
+            blob = self.pullable_paths.get(path)
+            if blob is None:
+                raise ProtocolFail("not_found", detail=f"no such device file {path!r}")
+        else:
+            dump_id = payload.get("dump_id")
+            entry = self.dumps.get(dump_id) if dump_id else None
+            if entry is None:
+                raise ProtocolFail("not_found", detail=f"no such dump_id {dump_id!r}")
+            blob = entry["image"]
+        if offset >= len(blob):
+            data, raw, flags = b"", 0, DUMP_CHUNK_LAST
+        else:
+            raw_blob = blob[offset:offset + chunk]
+            raw = len(raw_blob)
+            flags = 0
+            data = raw_blob
+            if compress:
+                data = zlib.compress(raw_blob)
+                flags |= DUMP_CHUNK_DEFLATE
+            if offset + chunk >= len(blob):
+                flags |= DUMP_CHUNK_LAST
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        return bytes(DUMP_CHUNK_HEADER.pack(offset, len(data), raw, flags, crc) + data)
+
+    def _dump_cleanup(self, payload):
+        dump_id = payload.get("dump_id")
+        if dump_id not in self.dumps:
+            raise ProtocolFail("not_found", detail=f"no such dump_id {dump_id!r}")
+        del self.dumps[dump_id]
+        return {"ok": True}
+
+    # -- cmd 66 apk_info (v1.2 draft §3.6) -------------------------------------------
+
+    def _apk_info(self, payload):
+        import io
+        import zipfile
+
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        apk_maps = [m for m in self.target_maps
+                    if m["path"].startswith("/data/app/") and m["path"].endswith("/base.apk")]
+        if not apk_maps:
+            raise ProtocolFail("not_found", 0, "no base.apk mapping in target maps")
+        path = apk_maps[0]["path"]
+        try:
+            blob = self.pullable_paths.get(path)
+            if blob is None:
+                start = apk_maps[0]["start"]
+                blob = self.memory.read(start, apk_maps[0]["end"] - start)
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                xml = zf.read("AndroidManifest.xml")
+            from tanyao.native import parse_axml
+
+            info = parse_axml(xml)
+        except Exception as exc:  # noqa: BLE001 — zip/AXML failures are internal
+            raise ProtocolFail("internal", 0, f"apk parse failed: {exc}")
+        launchers = info.get("launcher_activities", [])
+        return {"apk_path": path,
+                "package": info.get("package"),
+                "version_name": info.get("version_name"),
+                "version_code": info.get("version_code"),
+                "entry_activity": launchers[0] if launchers else None,
+                "permissions": info.get("permissions", []),
+                "activities": info.get("activities", []),
+                "launcher_activities": launchers,
+                "split_apks": [p for p in self.pullable_paths if p != path]}
+
+    # -- cmd 67 disassemble (v1.2 draft §3.7, optional capability) --------------------
+
+    def _disassemble(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        if not self.disasm_available:
+            raise ProtocolFail("unsupported", 0, "built without capstone")
+        addr = _u64(payload.get("addr"), "addr")
+        count = payload.get("count")
+        size = payload.get("size")
+        if (count is None) == (size is None):
+            raise ProtocolFail("bad_request", detail="count or size required (one)")
+        if count is not None:
+            if not isinstance(count, int) or count <= 0 or count > 4096:
+                raise ProtocolFail("bad_request", detail="count out of range")
+            read_size = count * 4
+        else:
+            read_size = _u64(size, "size")
+            if read_size > 64 * 1024:
+                raise ProtocolFail("bad_request", detail="size out of range")
+        try:
+            data = self.memory.read(addr, read_size)
+        except MemoryFault:
+            raise ProtocolFail("backend_error", -14, "mem_read failed")
+        from tanyao.native import CAPSTONE_OK, disassemble_a64_ex
+
+        if not CAPSTONE_OK:
+            raise ProtocolFail("unsupported", 0, "capstone unavailable")
+        decoded = disassemble_a64_ex(data, addr,
+                                     max_instructions=count if count else read_size // 4,
+                                     engine="capstone")
+        instructions = []
+        for ins in decoded["instructions"]:
+            parts = ins["text"].split(" ", 1)
+            instructions.append({"address": ins["addr"], "bytes_hex": ins["bytes"],
+                                 "mnemonic": parts[0],
+                                 "op_str": parts[1] if len(parts) > 1 else ""})
+        return {"engine": "capstone", "count": len(instructions), "instructions": instructions}
 
     # -- device-local scan engine (PROTOCOL.md §7 reference implementation) ------
 
@@ -1176,12 +1495,14 @@ class MockAgent:
 
 
 class ProtocolFail(Exception):
-    def __init__(self, error: str, errno: int | None = None, detail: str = "", fatal: bool = False):
+    def __init__(self, error: str, errno: int | None = None, detail: str = "", fatal: bool = False,
+                 extra: dict | None = None):
         super().__init__(error)
         self.error = error
         self.errno = errno
         self.detail = detail
         self.fatal = fatal
+        self.extra = extra or {}
 
 
 def hmac_equal(a: str, b: str) -> bool:

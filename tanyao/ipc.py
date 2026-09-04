@@ -176,7 +176,8 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             need_pid(p), str(p["out"]),
         ),
         "apk_info": lambda p: facade.apk_info(
-            str(p["apk_path"]),
+            str(p["apk_path"]) if p.get("apk_path") else None,
+            pid=int(p["pid"]) if p.get("pid") else None,
         ),
         "decompile_start": lambda p: facade.decompile_start(
             need_pid(p),

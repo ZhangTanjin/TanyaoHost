@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 
 from .constants import (
     AGENT_CAP_SCAN,
+    CMD_APK_INFO,
     CMD_BACKEND_INFO,
+    CMD_DISASSEMBLE,
+    CMD_DUMP_CLEANUP,
+    CMD_DUMP_PULL,
+    CMD_DUMP_START,
+    CMD_DUMP_STATUS,
     CMD_MEM_READ,
     CMD_MEM_READV,
     CMD_MEM_WRITE,
@@ -34,6 +40,7 @@ from .constants import (
     CMD_TARGET_CLOSE,
     CMD_TARGET_MAPS,
     CMD_TARGET_OPEN,
+    CMD_WRITE_TXN,
     DEFAULT_PORT,
     ProtocolError,
     b64_decode,
@@ -42,7 +49,7 @@ from .constants import (
     parse_u64,
 )
 from .connection import AgentConnection, AgentError
-from .frames import Frame, decode_packed_symbols
+from .frames import Frame, decode_dump_chunk, decode_packed_symbols
 
 # Protocol v1 returns bytes as base64 inside a 16MiB JSON payload. A 4MiB raw
 # ceiling leaves room for base64 expansion and JSON metadata while keeping
@@ -517,6 +524,82 @@ class TanyaoService:
             if regex:
                 payload["regex"] = regex
             return self._execute(CMD_STRINGS_SCAN, payload)
+
+    # -- dump pipeline / apk / disassemble / write_txn (v1.2 draft §3.3-§3.7) ------
+
+    def dump_start(self, pid: int, *, module: str, include_anonymous: bool = False,
+                   out_name: str | None = None) -> dict:
+        """cmd 63: device-side file-layout dump to /data/local/tmp/tanyao-dump."""
+        with self._lock:
+            payload: dict = {"pid": pid, "module": module,
+                             "include_anonymous": bool(include_anonymous)}
+            if out_name:
+                payload["out_name"] = out_name
+            return self._execute(CMD_DUMP_START, payload)
+
+    def dump_status(self, dump_id: str | None = None, *, list_all: bool = False) -> dict:
+        """cmd 64: single-dump status or the directory listing."""
+        with self._lock:
+            payload = {"list": True} if list_all else {"dump_id": dump_id}
+            return self._execute(CMD_DUMP_STATUS, payload)
+
+    def dump_pull(self, dump_id: str | None = None, *, path: str | None = None,
+                  offset: int = 0, chunk: int = 256 * 1024, compress: bool = True):
+        """cmd 65: one chunk as a verified DumpChunk (24B sub-header + data)."""
+        with self._lock:
+            payload: dict = {"offset": hex_u64(offset), "chunk": hex_u64(chunk),
+                             "compress": bool(compress)}
+            if dump_id:
+                payload["dump_id"] = dump_id
+            elif path:
+                payload["path"] = path  # draft §3.6: /data/app/ prefix only
+            else:
+                raise AgentError("bad_request", detail="dump_pull needs dump_id or path")
+            frame = self._execute_frame(CMD_DUMP_PULL, payload)
+        if not isinstance(frame.payload, bytes):
+            raise AgentError("protocol_error", detail="dump_pull returned a JSON frame")
+        try:
+            return decode_dump_chunk(frame.payload)
+        except ProtocolError as exc:
+            raise AgentError("internal", detail=str(exc)) from exc
+
+    def dump_cleanup(self, dump_id: str) -> dict:
+        """cmd 68: explicit, auditable device-side cleanup (never automatic)."""
+        with self._lock:
+            return self._execute(CMD_DUMP_CLEANUP, {"dump_id": dump_id})
+
+    def apk_info_remote(self, pid: int) -> dict:
+        """cmd 66: zero-mirror apk metadata resolved from the target's maps."""
+        with self._lock:
+            return self._execute(CMD_APK_INFO, {"pid": pid})
+
+    def disassemble_remote(self, pid: int, addr: int, *, count: int | None = None,
+                           size: int | None = None) -> dict:
+        """cmd 67: device-side capstone disassembly (draft-shaped instructions)."""
+        with self._lock:
+            payload: dict = {"pid": pid, "addr": hex_u64(addr)}
+            if count is not None:
+                payload["count"] = int(count)
+            if size is not None:
+                payload["size"] = hex_u64(size)
+            return self._execute(CMD_DISASSEMBLE, payload)
+
+    def write_txn(self, pid: int, addr: int, data: bytes, *,
+                  expect_old: bytes | None = None, verify: bool = True) -> dict:
+        """cmd 60 (PROTOCOL.md §7.5): single-round-trip write transaction. The
+        write GATE and expect/verify POLICY stay host-side; the device just
+        executes old-read → compare → write → readback atomically-ish."""
+        with self._lock:
+            session = self._require_handle(pid)
+            payload: dict = {
+                "handle": hex_u64(session.handle),
+                "addr": hex_u64(addr),
+                "data_b64": b64_encode(data),
+                "verify": bool(verify),
+            }
+            if expect_old is not None:
+                payload["expect_old_b64"] = b64_encode(expect_old)
+            return self._execute(CMD_WRITE_TXN, payload)
 
     # -- memory -------------------------------------------------------------------
 

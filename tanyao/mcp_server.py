@@ -308,10 +308,13 @@ TOOLS = [
     },
     {
         "name": "apk_info",
-        "description": "Parse AndroidManifest.xml from a local APK: package, versions, activities, launcher entry, permissions.",
+        "description": "APK metadata. Give exactly ONE of: apk_path (host file, local AXML parse) or pid (device resolves the APK backing that process via the agent, zero-copy; requires agent APK_INFO capability). Returns package, versions, activities, launcher entry, permissions.",
         "inputSchema": _obj(
-            {"apk_path": {"type": "string", "description": "host path to the .apk file"}},
-            ["apk_path"],
+            {
+                "apk_path": {"type": "string", "description": "host path to the .apk file"},
+                "pid": {"type": "integer", "description": "resolve the APK of this device process (zero-mirror; agent capability dependent)"},
+            },
+            [],
         ),
     },
     {

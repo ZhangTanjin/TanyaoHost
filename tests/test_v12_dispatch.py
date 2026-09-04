@@ -8,6 +8,8 @@ like unknown cmds (unsupported_cmd, no disconnect). Run:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import struct
 import sys
@@ -286,6 +288,153 @@ class TestCaps3BSymbolsStrings(MatrixBase):
         self.assertTrue(any(h["value"] == "tanyao_mock_engine" for h in hits))
         self.assertNotIn("value_hex", hits[0])  # strings hits carry length, not value_hex
         self.assertIn("length", hits[0])
+
+
+class TestCaps1FFFullPipeline(MatrixBase):
+    """caps=0x1ff: dump pipeline, apk_info(pid), disassemble, write_txn all on
+    the device; host keeps gate/policy and verifies integrity end to end."""
+
+    AGENT_CAPS = 0x1FF
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out_dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def test_dump_module_agent_pipeline(self):
+        out = os.path.join(self.out_dir, "libdemo.pipeline.dump")
+        result = self.facade.dump_module(DEMO_PID, "libdemo.so", out)
+        self.assertEqual(result["engine"], "agent-dump")
+        self.assertEqual(result["size"], 0x3000)  # same file extent as host rebuild
+        self.assertTrue(result["sha256"])
+        self.assertEqual(len(result["sha256"]), 64)
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(4), b"\x7fELF")
+        with open(out + ".manifest.json", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["module"], "libdemo.so")
+        self.assertTrue(manifest["sanitized"])
+        # explicit cleanup ran: device-side dump directory is empty again
+        self.assertEqual(self.agent.dumps, {})
+
+    def test_dump_agent_bytes_equal_host_engine(self):
+        agent_path = os.path.join(self.out_dir, "agent.dump")
+        agent_out = self.facade.dump_module(DEMO_PID, "libdemo.so", agent_path)
+        host_agent = MockAgent(port=0, token=TOKEN, agent_caps=0x0)
+        host_agent.start()
+        try:
+            svc = TanyaoService("127.0.0.1", host_agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            host_path = os.path.join(self.out_dir, "host.dump")
+            host_out = facade.dump_module(DEMO_PID, "libdemo.so", host_path)
+            self.assertEqual(host_out["engine"], "host-dump")
+            with open(agent_path, "rb") as fa, open(host_path, "rb") as fh:
+                self.assertEqual(hashlib.sha256(fa.read()).hexdigest(),
+                                 hashlib.sha256(fh.read()).hexdigest())
+        finally:
+            host_agent.stop()
+
+    def test_dump_status_and_cleanup(self):
+        start = self.service.dump_start(DEMO_PID, module="libdemo.so")
+        dump_id = start["dump_id"]
+        st = self.service.dump_status(dump_id)
+        self.assertTrue(st["exists"])
+        self.assertEqual(int(st["size"], 16), int(start["size"], 16))
+        listing = self.service.dump_status(list_all=True)
+        self.assertIn(dump_id, [d["dump_id"] for d in listing["dumps"]])
+        self.service.dump_cleanup(dump_id)
+        with self.assertRaises(AgentError) as ctx:
+            self.service.dump_cleanup(dump_id)
+        self.assertEqual(ctx.exception.error, "not_found")
+
+    def test_apk_info_pid_routing(self):
+        out = self.facade.apk_info(pid=DEMO_PID)
+        self.assertEqual(out["engine"], "agent-apk")
+        self.assertEqual(out["package"], "com.example.re")
+        self.assertEqual(out["launcher_activities"], ["com.example.re.MainActivity"])
+        self.assertTrue(out["path"].endswith("/base.apk"))
+        # exactly-one enforcement (DESIGN_V3_HOST §3.4)
+        with self.assertRaises(AgentError):
+            self.facade.apk_info(pid=DEMO_PID, apk_path="/tmp/x.apk")
+        with self.assertRaises(AgentError):
+            self.facade.apk_info()
+
+    def test_apk_info_pid_without_bit7_is_structured_error(self):
+        caps_agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        caps_agent.start()
+        try:
+            svc = TanyaoService("127.0.0.1", caps_agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            with self.assertRaises(AgentError) as ctx:
+                facade.apk_info(pid=DEMO_PID)
+            self.assertEqual(ctx.exception.error, "bad_request")
+            self.assertIn("pull_apk", str(ctx.exception))
+        finally:
+            caps_agent.stop()
+
+    def test_pull_apk_via_pipeline(self):
+        out = os.path.join(self.out_dir, "pulled.apk")
+        result = self.facade.pull_apk(DEMO_PID, out)
+        self.assertEqual(result["engine"], "agent-dump")
+        self.assertTrue(result["remote"].endswith("/base.apk"))
+        self.assertEqual(result["size"], len(self.agent.apk_bytes))
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(2), b"PK")
+
+    def test_disassemble_agent_and_unsupported_fallback(self):
+        out = self.facade.disassemble(DEMO_PID, BASE + 0x800, count=5)
+        self.assertEqual(out["engine"], "agent-capstone")
+        self.assertEqual(out["count"], 5)
+        self.assertTrue(all(i["text"] for i in out["instructions"]))
+        self.assertTrue(out["instructions"][0]["text"].startswith("stp"))
+        # declared bit8 but device built without capstone → host fallback
+        no_disasm = MockAgent(port=0, token=TOKEN, agent_caps=0x1FF,
+                              disasm_available=False)
+        no_disasm.start()
+        try:
+            svc = TanyaoService("127.0.0.1", no_disasm.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            out = facade.disassemble(DEMO_PID, BASE + 0x800, count=5)
+            self.assertIn(out["engine"], ("capstone", "subset"))
+        finally:
+            no_disasm.stop()
+
+    def test_write_txn_agent_path(self):
+        addr = HEAP_START + 0x6000  # scratch area away from other fixtures
+        self.service.mem_write(DEMO_PID, addr, b"\x11" * 4)
+        out = self.facade.write_bytes(DEMO_PID, addr, b"\x22" * 4,
+                                      expect_old=b"\x11" * 4)
+        self.assertEqual(out["engine"], "agent-write-txn")
+        self.assertTrue(out["verified"])
+        self.assertFalse(out["rolled_back"])
+        self.assertEqual(self.facade.read_memory(DEMO_PID, addr, 4)["data_hex"], "22222222")
+        with self.assertRaises(AgentError) as ctx:
+            self.facade.write_bytes(DEMO_PID, addr, b"\x33" * 4,
+                                    expect_old=b"\x11" * 4)
+        self.assertEqual(ctx.exception.error, "expect_old_mismatch")
+        self.service.mem_write(DEMO_PID, addr, b"\x00" * 4)
+
+    def test_decompile_data_source_via_pipeline(self):
+        """decompile_start only swaps the dump source (Ghidra absent here, so we
+        assert the pipeline dump materialized synchronously before job start)."""
+        if not os.path.exists("/opt/ghidra/support/analyzeHeadless"):
+            self.skipTest("Ghidra not installed")
+        try:
+            out = self.facade.decompile_start(DEMO_PID, "libdemo.so",
+                                              out_dir=os.path.join(self.out_dir, "dec"))
+        except AgentError as exc:
+            self.assertIn(str(exc.error), ("unavailable",))
+            return
+        self.assertIn("job_id", out)
 
 
 if __name__ == "__main__":

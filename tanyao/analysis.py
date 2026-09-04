@@ -18,15 +18,20 @@ from typing import Any
 
 from .connection import AgentError
 from .constants import (
+    AGENT_CAP_APK_INFO,
+    AGENT_CAP_DISASSEMBLE,
+    AGENT_CAP_DUMP_PIPELINE,
     AGENT_CAP_SCAN,
     AGENT_CAP_STRINGS,
     AGENT_CAP_SYMBOL_BATCH,
+    AGENT_CAP_WRITE_TXN,
     MAP_EXEC,
     MAP_READ,
     MAP_WRITE,
     parse_u64,
 )
 from .dump import dump_module as _dump_module
+from .dump import pull_dump_with_resume
 from .dump import watch as _watch
 from .elfinfo import ElfParseError, parse_elf64
 from .jobs import JobManager, ScanCancelled
@@ -73,6 +78,8 @@ class AnalysisFacade:
         self._scan_presets: dict[int, str] = {}
         self._agent_scan_meta: dict[int, dict] = {}
         self._agent_job_map: dict[str, int] = {}
+        # dump pipeline resume checkpoints (pull_dump_with_resume store)
+        self._pull_states: dict[str, dict] = {}
 
     # -- helpers ----------------------------------------------------------------
 
@@ -214,6 +221,18 @@ class AnalysisFacade:
             raise WriteDisabled(
                 "memory write is disabled; set TANYAO_ALLOW_WRITE=1 on the host to enable"
             )
+        if self.service.has_agent_cap(AGENT_CAP_WRITE_TXN):
+            # bit1: the gate stays here, the expect→write→verify round trip
+            # collapses into cmd 60 (PROTOCOL.md §7.5, DESIGN_V3_HOST §3.5)
+            resp = self.service.write_txn(pid, address, data, expect_old=expect_old, verify=True)
+            return {
+                "pid": pid,
+                "address": f"0x{address:x}",
+                "bytes_written": parse_u64(resp.get("result_size", "0x0"), field="result_size"),
+                "verified": bool(resp.get("verified", False)),
+                "rolled_back": bool(resp.get("rolled_back", False)),
+                "engine": "agent-write-txn",
+            }
         if expect_old is not None:
             old = self.service.mem_read(pid, address, len(expect_old))
             if old != expect_old:
@@ -228,6 +247,7 @@ class AnalysisFacade:
             "address": f"0x{address:x}",
             "bytes_written": written,
             "verified": verify == data,
+            "engine": "host-write",
         }
 
     def resolve_offset_chain(
@@ -685,7 +705,8 @@ class AnalysisFacade:
     def disassemble(self, pid: int, address: int, count: int = 48, module: str | None = None,
                     engine: str = "auto") -> dict:
         """Disassemble a live A64 window. Engine: capstone (full ISA, default
-        when installed) or "subset" (built-in length-decoded fallback)."""
+        when installed) or "subset" (built-in length-decoded fallback). With
+        bit8 the device decodes via cmd 67 (engine=agent-capstone)."""
         maps = self.service.target_maps(pid)
         name, entries = self._resolve_module_maps(maps, module, address)
         if not entries:
@@ -697,6 +718,32 @@ class AnalysisFacade:
         if region is None:
             raise AgentError("bad_request", detail=f"address 0x{address:x} not inside module {name}")
         count = max(1, min(int(count), 4096))
+        if self.service.has_agent_cap(AGENT_CAP_DISASSEMBLE) and engine in ("auto", "capstone"):
+            try:
+                resp = self.service.disassemble_remote(pid, address, count=count)
+            except AgentError as exc:
+                if exc.error != "unsupported":
+                    raise  # draft §3.7: missing capstone → host-side fallback
+            else:
+                instructions = [
+                    {
+                        "addr": ins["address"],
+                        "rva": int(str(ins["address"]), 16) - load_bias,
+                        "bytes": ins["bytes_hex"],
+                        "text": f"{ins['mnemonic']} {ins['op_str']}".strip(),
+                    }
+                    for ins in resp.get("instructions", [])
+                ]
+                return {
+                    "pid": pid,
+                    "module": name,
+                    "address": f"0x{address:x}",
+                    "rva": f"0x{address - load_bias:x}",
+                    "engine": "agent-capstone",
+                    "count": len(instructions),
+                    "instructions": instructions,
+                    "source": "live_memory",
+                }
         end = min(address + count * 4, region.end)
         read_fn = self._read_for(pid)
         data = read_fn(address, end - address)
@@ -810,12 +857,17 @@ class AnalysisFacade:
         }
 
     def pull_apk(self, pid: int, out_path: str) -> dict:
-        """Pull the APK backing this pid to the host (host adb; no agent command)."""
+        """Pull the APK backing this pid to the host. With bit6 the file comes
+        through the dump-pull pipeline (chunked, compressed); otherwise host adb."""
         maps = self.service.target_maps(pid)
         apk_paths = [m.path for m in maps if m.path.endswith("/base.apk")]
         if not apk_paths:
             raise AgentError("not_found", detail="no base.apk mapping found for this pid")
         src = apk_paths[0]
+        if self.service.has_agent_cap(AGENT_CAP_DUMP_PIPELINE):
+            result = pull_dump_with_resume(self.service, out_path, path=src)
+            return {"pid": pid, "remote": src, "local": result["path"],
+                    "size": result["size"], "engine": "agent-dump"}
         adb = shutil.which("adb")
         if not adb:
             raise AgentError("unavailable", detail="adb not found on host PATH")
@@ -829,10 +881,37 @@ class AnalysisFacade:
             raise AgentError("backend_error",
                              detail=f"adb pull failed: {proc.stderr.strip()[:300]}")
         return {"pid": pid, "remote": src, "local": os.path.abspath(out_path),
-                "size": os.path.getsize(out_path)}
+                "size": os.path.getsize(out_path), "engine": "host-adb"}
 
-    def apk_info(self, apk_path: str) -> dict:
-        """Parse AndroidManifest.xml (binary AXML) from a local APK file."""
+    def apk_info(self, apk_path: str | None = None, *, pid: int | None = None) -> dict:
+        """APK metadata. Exactly one of apk_path (host file, v2 behavior) or
+        pid (device-resolved via cmd 66, requires bit7 — DESIGN_V3_HOST §3.4;
+        no silent fallback to pull_apk: that is an implicit bulk transfer)."""
+        if (apk_path is None) == (pid is None):
+            raise AgentError("bad_request",
+                             detail="apk_info: give exactly one of apk_path= or pid=")
+        if pid is not None:
+            if not self.service.has_agent_cap(AGENT_CAP_APK_INFO):
+                raise AgentError(
+                    "bad_request",
+                    detail="agent does not declare APK_INFO (bit7); "
+                           "use pull_apk + apk_info(apk_path=...) instead",
+                )
+            resp = self.service.apk_info_remote(pid)
+            return {
+                "path": resp.get("apk_path"),
+                "package": resp.get("package"),
+                "version_name": resp.get("version_name"),
+                "version_code": resp.get("version_code"),
+                "min_sdk": resp.get("min_sdk"),
+                "target_sdk": resp.get("target_sdk"),
+                "entry_activity": resp.get("entry_activity"),
+                "activities": resp.get("activities", []),
+                "launcher_activities": resp.get("launcher_activities", []),
+                "permissions": resp.get("permissions", []),
+                "split_apks": resp.get("split_apks", []),
+                "engine": "agent-apk",
+            }
         if not os.path.exists(apk_path):
             raise AgentError("not_found", detail=f"{apk_path} not found on host")
         try:
@@ -840,6 +919,7 @@ class AnalysisFacade:
         except (ApkParseError, zipfile.BadZipFile) as exc:
             raise AgentError("bad_request", detail=f"apk parse failed: {exc}") from exc
         info["path"] = os.path.abspath(apk_path)
+        info["engine"] = "host-apk"
         return info
 
     # -- decompile (Ghidra headless, async jobs) ----------------------------------
@@ -920,6 +1000,11 @@ class AnalysisFacade:
     # -- dump -------------------------------------------------------------------------------
 
     def dump_module(self, pid: int, module: str, out_path: str, *, include_anonymous: bool = False) -> dict:
+        """Module dump. bit6: device rebuilds to file layout (cmd 63), host pulls
+        it chunked with crc32/resume/sha256 (cmd 65) and cleans up (cmd 68);
+        without bit6 the frozen host-side chunked-read reconstruction runs."""
+        if self.service.has_agent_cap(AGENT_CAP_DUMP_PIPELINE):
+            return self._agent_dump_module(pid, module, out_path, include_anonymous)
         maps = self.service.target_maps(pid)
         read_fn = self._read_for(pid)
         image, manifest = _dump_module(pid, module, maps, read_fn, include_anonymous=include_anonymous)
@@ -939,6 +1024,58 @@ class AnalysisFacade:
             "manifest": manifest_path,
             "mappings": len(manifest.entries),
             "skipped": len(manifest.skipped),
+            "engine": "host-dump",
+        }
+
+    def _agent_dump_module(self, pid: int, module: str, out_path: str,
+                           include_anonymous: bool) -> dict:
+        out_name = _re.sub(r"[^A-Za-z0-9._-]", "_", module) or "dump"
+        start = self.service.dump_start(pid, module=module,
+                                        include_anonymous=include_anonymous,
+                                        out_name=out_name)
+        dump_id = str(start["dump_id"])
+        expected_sha = start.get("sha256")
+        raw_size = start.get("size")
+        expected_size = parse_u64(raw_size, field="size") if raw_size is not None else None
+        result = pull_dump_with_resume(
+            self.service, out_path, dump_id=dump_id,
+            expected_sha256=expected_sha, expected_size=expected_size,
+            state_store=self._pull_states,
+        )
+        manifest = start.get("manifest")
+        if not isinstance(manifest, dict):
+            # device without the manifest amendment: reconstruct a faithful shell
+            manifest = {
+                "pid": pid,
+                "module": module,
+                "total_size": expected_size,
+                "maps_source": start.get("maps_source"),
+                "mappings": [],
+                "skipped": start.get("skipped", []),
+                "sanitized": ["e_shoff", "e_shentsize", "e_shnum", "e_shstrndx"]
+                if start.get("sanitized") else [],
+            }
+        manifest_path = out_path + ".manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        # explicit cleanup after the verified pull (host responsibility, §4.3)
+        try:
+            self.service.dump_cleanup(dump_id)
+        except AgentError:
+            pass  # best effort; dump_status(list) exposes leftovers
+        return {
+            "pid": pid,
+            "module": module,
+            "out": result["path"],
+            "size": result["size"],
+            "manifest": manifest_path,
+            "mappings": len(manifest.get("mappings", [])),
+            "skipped": len(manifest.get("skipped", [])),
+            "dump_id": dump_id,
+            "sha256": result["sha256"],
+            "maps_source": start.get("maps_source"),
+            "sanitized": bool(start.get("sanitized")),
+            "engine": "agent-dump",
         }
 
 
