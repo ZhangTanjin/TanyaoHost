@@ -253,6 +253,34 @@ def _terminal_pull_error(exc) -> bool:
     return isinstance(exc, AgentError) and exc.error in ("not_found", "bad_request", "disk_budget")
 
 
+def _read_state_file(state_path: str) -> dict | None:
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("offset") else None
+
+
+def _write_state_atomic(state_path: str, payload: dict) -> None:
+    """Crash-safe checkpoint for the pull position.
+
+    kill -9 (the D3 failure mode) does not lose OS page cache, so write +
+    atomic replace is sufficient; fsync would only matter for whole-OS crashes
+    and is skipped to keep per-chunk overhead near zero on 7000-chunk pulls."""
+    tmp = state_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, state_path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def pull_dump_with_resume(
     service,
     out_path: str,
@@ -270,9 +298,15 @@ def pull_dump_with_resume(
 
     Per-chunk crc32 is verified by decode; corrupted chunks retry once at the
     same offset, then fail with AgentError('internal') KEEPING already-received
-    data so a later call can resume. Resume state lives in `state_store`
-    (facade-owned dict) plus a `<out>.part`/`<out>.part.state` sidecar pair so
-    a serve restart can pick up where it left off (draft §3.2).
+    data so a later call can resume.
+
+    Resume state, in priority order (D3): the facade-owned `state_store` dict,
+    the per-chunk atomic `<out>.pull.state` checkpoint (updated after EVERY
+    verified chunk, so it survives serve kill -9 — the pre-R1 sidecar was only
+    written on clean failures and went missing on hard kills), and finally the
+    legacy `.part.state` format. A dump_id pull additionally reconciles against
+    dump_status (sha256) before trusting a checkpoint; the device-side answer
+    is advisory only — its absence never blocks a resume.
     """
     from .connection import AgentError
 
@@ -280,19 +314,17 @@ def pull_dump_with_resume(
         raise AgentError("bad_request", detail="pull needs dump_id or path")
     out_path = os.path.abspath(out_path)
     part_path = out_path + ".part"
-    sidecar = out_path + ".part.state"
+    pull_state_path = out_path + ".pull.state"
+    legacy_sidecar = out_path + ".part.state"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    offset = 0
+    state_key = dump_id or path
     store = state_store if state_store is not None else {}
-    st = store.get(dump_id or path) if (dump_id or path) else None
-    if st is None and os.path.exists(sidecar):
-        try:
-            with open(sidecar, encoding="utf-8") as fh:
-                st = json.load(fh)
-        except (OSError, ValueError):
-            st = None
-    if st is not None and os.path.exists(part_path) and st.get("offset"):
+    st = store.get(state_key) or _read_state_file(pull_state_path) \
+        or _read_state_file(legacy_sidecar)
+
+    offset = 0
+    if st and os.path.exists(part_path) and st.get("offset"):
         resume_ok = os.path.getsize(part_path) == st["offset"]
         if resume_ok and dump_id is not None:
             # reconcile with the device before trusting a stale checkpoint
@@ -306,6 +338,13 @@ def pull_dump_with_resume(
         if resume_ok:
             offset = int(st["offset"])
 
+    def checkpoint(current: int) -> None:
+        payload = {"path": out_path, "offset": current,
+                   "sha256": expected_sha256 or "", "chunk_size": chunk,
+                   "dump_id": dump_id or ""}
+        store[state_key] = payload
+        _write_state_atomic(pull_state_path, payload)
+
     mode = "ab" if offset else "wb"
     try:
         with open(part_path, mode) as fh:
@@ -316,16 +355,13 @@ def pull_dump_with_resume(
                     if _terminal_pull_error(exc):
                         raise
                     # one retry at the SAME offset (draft §3.2), then give up
-                    # with the partial data intact (resume-able, no auto-wipe)
+                    # with the partial data intact — the per-chunk checkpoint
+                    # is already current, so resume needs no cleanup here
                     try:
                         data, last = _pull_chunk_bytes(service, dump_id, path, offset, chunk, compress)
                     except AgentError as exc2:
                         if _terminal_pull_error(exc2):
                             raise
-                        store[dump_id or path] = {"offset": offset, "sha256": expected_sha256 or ""}
-                        with open(sidecar, "w", encoding="utf-8") as fh2:
-                            json.dump({"dump_id": dump_id, "path": path,
-                                       "offset": offset, "sha256": expected_sha256 or ""}, fh2)
                         raise AgentError(
                             "internal",
                             detail=f"dump_pull failed twice at 0x{offset:x}: {exc2}; "
@@ -334,6 +370,7 @@ def pull_dump_with_resume(
                 fh.write(data)
                 fh.flush()
                 offset += len(data)
+                checkpoint(offset)
                 if progress is not None:
                     progress(offset)
                 if last:
@@ -351,12 +388,11 @@ def pull_dump_with_resume(
     if expected_sha256 and hasher.hexdigest() != expected_sha256:
         raise AgentError("internal", detail=f"dump sha256 mismatch: got {hasher.hexdigest()}")
     os.replace(part_path, out_path)
-    for cleanup in (sidecar,):
+    for stale in (pull_state_path, legacy_sidecar):
         try:
-            if os.path.exists(cleanup):
-                os.remove(cleanup)
+            if os.path.exists(stale):
+                os.remove(stale)
         except OSError:
             pass
-    if dump_id is not None:
-        store.pop(dump_id, None)
+    store.pop(state_key, None)
     return {"path": out_path, "size": offset, "sha256": hasher.hexdigest()}

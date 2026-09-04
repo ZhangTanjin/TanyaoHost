@@ -53,6 +53,7 @@ class FakeDumpService:
         self.fail_once = set(fail_once)
         self.fail_always = set(fail_always)
         self.compress = compress
+        self.served_bytes = 0  # total plain bytes actually transferred
 
     def dump_status(self, dump_id, **_kw):
         return {"exists": True, "size": f"0x{len(self.blob):x}",
@@ -67,6 +68,7 @@ class FakeDumpService:
             raise AgentError("backend_error", errno=-104, detail="transient hiccup")
         chunk = min(chunk, self.chunk)
         raw = self.blob[offset:offset + chunk]
+        self.served_bytes += len(raw)
         last = offset + chunk >= len(self.blob)
         data = zlib.compress(raw) if self.compress else raw
         flags = (DUMP_CHUNK_DEFLATE if self.compress else 0)
@@ -148,21 +150,51 @@ class TestPullDump(unittest.TestCase):
         with open(self.out, "rb") as fh:
             self.assertEqual(fh.read(), self.blob)
 
-    def test_resume_from_sidecar_after_restart(self):
+    def test_hard_kill_resume_via_per_chunk_state(self):
+        """D3: the checkpoint must exist after a mid-transfer abort WITHOUT any
+        clean-failure path running (kill -9 analogue), and resume must not need
+        any hand-written sidecar."""
         broken = FakeDumpService(self.blob, chunk=64 * 1024,
                                  fail_always=[1 * 64 * 1024])
         with self.assertRaises(AgentError):
-            # no state_store: only the sidecar survives (serve restart)
+            # fresh state_store: only the on-disk checkpoint survives (restart)
             pull_dump_with_resume(broken, self.out, dump_id="x-05",
-                                  expected_sha256=self.sha)
-        self.assertTrue(os.path.exists(self.out + ".part.state"))
+                                  expected_sha256=self.sha, state_store={})
+        state_path = self.out + ".pull.state"
+        self.assertTrue(os.path.exists(state_path))
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.assertEqual(state["offset"], 64 * 1024)  # after the first verified chunk
+        self.assertEqual(state["chunk_size"], 256 * 1024)  # pull client's request size
+        self.assertEqual(os.path.getsize(self.out + ".part"), 64 * 1024)
+
         good = FakeDumpService(self.blob, chunk=64 * 1024)
         result = pull_dump_with_resume(good, self.out, dump_id="x-05",
                                        expected_sha256=self.sha,
                                        expected_size=len(self.blob),
                                        state_store={})
         self.assertEqual(result["size"], len(self.blob))
-        self.assertFalse(os.path.exists(self.out + ".part.state"))
+        self.assertEqual(result["sha256"], self.sha)
+        # transferred ≈ the remainder, not a full re-pull
+        self.assertEqual(good.served_bytes, len(self.blob) - 64 * 1024)
+        self.assertFalse(os.path.exists(state_path))
+        self.assertFalse(os.path.exists(self.out + ".part"))
+
+    def test_legacy_part_state_sidecar_still_honored(self):
+        """Pre-R1 format (tester's hand-written workaround) keeps working."""
+        offset = 2 * 64 * 1024
+        with open(self.out + ".part", "wb") as fh:
+            fh.write(self.blob[:offset])
+        with open(self.out + ".part.state", "w", encoding="utf-8") as fh:
+            json.dump({"dump_id": "x-legacy", "offset": offset,
+                       "sha256": self.sha}, fh)
+        good = FakeDumpService(self.blob, chunk=64 * 1024)
+        result = pull_dump_with_resume(good, self.out, dump_id="x-legacy",
+                                       expected_sha256=self.sha,
+                                       expected_size=len(self.blob),
+                                       state_store={})
+        self.assertEqual(result["sha256"], self.sha)
+        self.assertEqual(good.served_bytes, len(self.blob) - offset)
 
     def test_terminal_error_not_retried(self):
         class NotFound(FakeDumpService):
