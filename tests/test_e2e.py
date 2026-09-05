@@ -67,7 +67,10 @@ class TestE2E(unittest.TestCase):
 
     def test_process_find(self):
         self.assertEqual(self.facade.find_process("com.demo.game")["pid"], DEMO_PID)
-        self.assertFalse(self.facade.find_process("nope")["found"])
+        miss = self.facade.find_process("nope")  # O4: miss carries a corrective hint
+        self.assertFalse(miss["found"])
+        self.assertIn("hint", miss)
+        self.assertIn("list_processes", miss["hint"])
 
     def test_list_modules(self):
         out = self.facade.list_modules(DEMO_PID)

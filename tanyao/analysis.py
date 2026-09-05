@@ -115,7 +115,17 @@ class AnalysisFacade:
             return {"pid": self.service.process_find(name)}
         except AgentError as exc:
             if exc.error == "not_found":
-                return {"pid": None, "found": False}
+                # O4: the kernel legacy match needs the FULL cmdline name. Guide
+                # the caller instead of auto-retrying or enumerating — parameter
+                # choice stays with the AI (no fuzzy match host-side: cmd 41
+                # returns bare pids without names).
+                return {
+                    "pid": None,
+                    "found": False,
+                    "hint": "use the FULL package/process name as in /proc/<pid>/cmdline "
+                            "(e.g. com.tencent.lolm); short names (lolm) are not matched — "
+                            "call list_processes to enumerate pids",
+                }
             raise
 
     def list_modules(self, pid: int, name_filter: str | None = None) -> dict:

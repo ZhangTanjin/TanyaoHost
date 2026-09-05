@@ -163,8 +163,13 @@ def main() -> int:
                 assert_true(any(m["name"] == "libc.so" for m in mods_b["modules"]), "switch back failed")
             check("single-active-target: cross-pid switch no EBUSY", _open_alt)
 
-        check("find_process: missing -> found=false (not error)", lambda: assert_true(
-            call_tool("find_process", {"name": "no-such-proc-xyz"})["found"] is False, ""))
+        def find_process_miss():
+            miss = call_tool("find_process", {"name": "no-such-proc-xyz"})
+            assert_true(miss["found"] is False, str(miss)[:120])
+            assert_true("hint" in miss and "list_processes" in miss["hint"],
+                        f"O4 hint missing: {miss}")
+            return "hint present"
+        check("find_process: missing -> found=false + O4 hint", find_process_miss)
 
         lp = call_tool("list_processes", {})
         check("list_processes: non-empty", lambda: assert_true(len(lp["pids"]) > 5, f"{len(lp['pids'])} pids"))

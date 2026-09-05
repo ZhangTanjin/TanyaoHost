@@ -52,8 +52,8 @@ TOOLS = [
     },
     {
         "name": "find_process",
-        "description": "Find a process PID by exact name on the device.",
-        "inputSchema": _obj({"name": {"type": "string", "description": "exact process name"}}, ["name"]),
+        "description": "Find a process PID on the device. 'name' must be the FULL package/process name as shown in /proc/<pid>/cmdline (e.g. com.tencent.lolm); short names (lolm) are NOT matched. If unsure, call list_processes first.",
+        "inputSchema": _obj({"name": {"type": "string", "description": "full package/process name, e.g. com.tencent.lolm"}}, ["name"]),
     },
     {
         "name": "list_processes",
