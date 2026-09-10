@@ -11,6 +11,7 @@ Security constraints (from AndroidMiniMem docs, adapted):
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -68,6 +69,9 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         build = facade.service.agent_build()
         if build:
             out["agent_build"] = build  # omitted entirely when the agent has no build field
+        transport = os.environ.get("TANYAO_TRANSPORT")
+        if transport:
+            out["transport"] = transport  # "adb-forward" | "direct-tcp" (D12)
         return out
 
     methods = {

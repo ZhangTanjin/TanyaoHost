@@ -46,6 +46,11 @@ def main() -> int:
         return 2
     if token is None:
         token = os.environ.get("TANYAO_TOKEN") or None
+    # D12: transport label for diagnostics (start-serve.sh sets adb forward for
+    # loopback targets; direct TCP otherwise)
+    os.environ["TANYAO_TRANSPORT"] = (
+        "adb-forward" if host in ("127.0.0.1", "localhost", "::1") else "direct-tcp"
+    )
 
     service = TanyaoService(host, args.port, token)
     facade = AnalysisFacade(service)
