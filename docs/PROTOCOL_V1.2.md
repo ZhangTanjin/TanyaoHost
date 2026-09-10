@@ -89,12 +89,19 @@ DT_HASH/GNU_HASH`（兼容 bionic 的 raw/absolute 两种地址形态，与 host
 {"count":1483,"truncated":false,
  "modules":["libc.so"],"module_indexes":[0,0,...],
  "names":["pthread_create",...],"addresses":["0x7dd2ef1160",...],
- "sizes":[64,...],"types":["FUNC",...]}
+ "sizes":[64,...],"types":["FUNC",...],
+ "binds":["GLOBAL",...]}
 ```
 
 - `modules`：本次结果涉及的模块 basename 表（去重，按首次出现序）；
   `module_indexes[i]` 是第 i 个符号对 `modules` 的下标。两字段**恒在**
   （单模块请求时 `modules` 长度为 1），解析方无需分形态处理。
+- **v1.2.2 附录（2026-09-06，实战 D11 裁定）**：json 响应新增 `binds` 列
+  （与 names 下标一一对应），取值 `LOCAL|GLOBAL|WEAK|GNU_UNIQUE`（源自
+  `st_info>>4`，UNDEF 过滤后仍可为 GLOBAL 导出）。**仅 json 路径提供**；
+  packed 布局维持 20B 不变（packed 消费方如需 bind 走 v1.3）。旧解析方
+  忽略未知键，向后兼容；新解析方在旧 agent（无该列）面前必须容忍缺失
+  （置空串）。
 
 响应（`format:"packed"`，二进制帧 payload，**大端**）：
 
