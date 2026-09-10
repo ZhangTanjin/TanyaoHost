@@ -265,6 +265,19 @@ class TestCaps3BSymbolsStrings(MatrixBase):
             self.facade.symbol_find(DEMO_PID, "no_such_symbol_xyz")
         self.assertEqual(ctx.exception.error, "not_found")
 
+    def test_symbol_binds_passthrough_and_missing_tolerance(self):
+        """D11 (v1.2.2 附录): json binds column flows into symbol rows; rows
+        from agents WITHOUT the column degrade to empty string, not errors."""
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so")
+        binds = {s["name"]: s["bind"] for s in out["symbols"]}
+        self.assertEqual(binds["demo_start"], "GLOBAL")
+        self.assertEqual(binds["demo_data"], "GLOBAL")
+        # tolerance: a pre-1.2.2 response without the column
+        row = self.facade._symbol_row(
+            {"names": ["x"], "addresses": ["0x1000"], "sizes": [4], "types": ["FUNC"]},
+            0, "libc.so")
+        self.assertEqual(row["bind"], "")
+
     def test_packed_matches_json(self):
         j = self.service.symbol_batch(DEMO_PID, module="libdemo.so")
         p = self.service.symbol_batch(DEMO_PID, module="libdemo.so", format="packed")

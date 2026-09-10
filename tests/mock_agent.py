@@ -1044,6 +1044,7 @@ class MockAgent:
                 "addresses": [hx(s.address) for _n, s in collected],
                 "sizes": [s.size for _n, s in collected],
                 "types": [s.kind for _n, s in collected],
+                "binds": [s.bind for _n, s in collected],  # v1.2.2 附录 (D11)
             }
         # packed: header + 20B entries + name_blob + module_blob (all big-endian)
         name_blob = bytearray()

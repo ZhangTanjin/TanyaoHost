@@ -704,12 +704,16 @@ class AnalysisFacade:
         module: str | None = default_module
         if i < len(idx) and isinstance(idx[i], int) and 0 <= idx[i] < len(modules):
             module = modules[idx[i]]
+        binds = resp.get("binds") or []
+        # D11 (v1.2.2 附录): json carries a binds column; old agents without it
+        # degrade to the empty string — never an error
+        bind = binds[i] if i < len(binds) and binds[i] else ""
         return {
             "name": resp["names"][i],
             "address": resp["addresses"][i],
             "size": resp["sizes"][i],
             "type": resp["types"][i] or "NOTYPE",
-            "bind": "",
+            "bind": bind,
             "module": module,
         }
 
