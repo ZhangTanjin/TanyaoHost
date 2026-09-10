@@ -89,6 +89,34 @@ class AnalysisFacade:
 
     # -- helpers ----------------------------------------------------------------
 
+    @staticmethod
+    def _module_of(path: str) -> str | None:
+        """Module attribution = basename of the mapping path (containment:
+        an address belongs to whoever's mapping it falls in — D9)."""
+        return path.rstrip("/").split("/")[-1] if path else None
+
+    @classmethod
+    def _runtime_to_file_offset(cls, maps, addr: int):
+        """D9 per-mapping translation: runtime → (module basename, file offset)
+        with runtime = m.start + (F − m.file_offset) — same semantics as the
+        device dump/symbol engines. None for anonymous mappings / unmapped."""
+        for m in maps:
+            if m.start <= addr < m.end:
+                if not m.path:
+                    return None
+                return cls._module_of(m.path), addr - m.start + m.file_offset
+        return None
+
+    @staticmethod
+    def _file_offset_to_runtime(maps, module: str, file_offset: int):
+        """D9 per-mapping translation: file offset → runtime address within the
+        named module's mapping whose file window covers it; None if uncovered."""
+        for m in maps:
+            if (m.path and AnalysisFacade._module_of(m.path) == module
+                    and m.file_offset <= file_offset < m.file_offset + m.size):
+                return m.start + (file_offset - m.file_offset)
+        return None
+
     def _read_for(self, pid: int):
         def read_fn(addr: int, size: int) -> bytes:
             return self.service.mem_read(pid, addr, size)
@@ -162,7 +190,7 @@ class AnalysisFacade:
 
     def resolve_module(self, pid: int, name: str) -> dict:
         maps = self.service.target_maps(pid)
-        module_maps = [m for m in maps if m.path.rstrip("/").split("/")[-1] == name]
+        module_maps = [m for m in maps if self._module_of(m.path) == name]
         if not module_maps:
             raise AgentError("not_found", detail=f"module {name!r} not mapped in pid {pid}")
         first = min(module_maps, key=lambda m: m.start)
@@ -176,13 +204,24 @@ class AnalysisFacade:
         mirror = any(
             m.file_offset == 0 and m.start != base and m.size >= first.size * 2 for m in module_maps
         )
-        load_bias_abs = base - info.load_bias  # absolute address where the ELF's vaddr 0 lands
+        load_bias_abs = base - info.load_bias  # ELF-arithmetic anchor (legacy field)
+        bss = None
+        if info.bss_end:
+            bss_lo = info.bss_start + load_bias_abs
+            bss_hi = info.bss_end + load_bias_abs
+            # D9: arithmetic BSS bounds must never leak past THIS module's own
+            # mappings — on multi-bias modules the single-anchor arithmetic
+            # spills into a neighbor's territory (field: lolm libil2cpp BSS end
+            # landing inside libunity.so)
+            module_hi = max(m.end for m in module_maps)
+            if bss_lo < module_hi:
+                bss = [f"0x{bss_lo:x}", f"0x{min(bss_hi, module_hi):x}"]
         return {
             "pid": pid,
             "module": name,
             "first_map": f"0x{base:x}",
             "load_bias": f"0x{load_bias_abs:x}",
-            "bss": [f"0x{info.bss_start + load_bias_abs:x}", f"0x{info.bss_end + load_bias_abs:x}"] if info.bss_end else None,
+            "bss": bss,
             "mirror_detected": mirror,
         }
 
@@ -190,6 +229,7 @@ class AnalysisFacade:
         maps = self.service.target_maps(pid)
         for m in maps:
             if m.start <= address < m.end:
+                module = self._module_of(m.path)
                 out: dict[str, Any] = {
                     "pid": pid,
                     "address": f"0x{address:x}",
@@ -197,19 +237,24 @@ class AnalysisFacade:
                     "end": f"0x{m.end:x}",
                     "permissions": m.flags_str(),
                     "path": m.path,
-                    "module": m.path.rstrip("/").split("/")[-1] if m.path else None,
+                    "module": module,
                     "module_offset": f"0x{address - m.start + m.file_offset:x}" if m.path else None,
                 }
                 if m.path and m.flags & MAP_EXEC:
                     try:
-                        resolved = self.resolve_module(pid, m.path.rstrip("/").split("/")[-1])
-                        bias_text = resolved.get("load_bias")
-                        if isinstance(bias_text, str):
-                            bias = int(bias_text, 16)
-                            out["load_bias"] = bias_text
-                            out["rva"] = f"0x{address - bias:x}"
+                        resolved = self.resolve_module(pid, module)
+                        if isinstance(resolved.get("load_bias"), str):
+                            out["load_bias"] = resolved["load_bias"]
                     except AgentError:
                         pass
+                if m.path:
+                    # D9: file-layout rva straight from the per-mapping
+                    # translation — the old single-bias subtraction produced
+                    # out-of-file values on multi-bias modules (lolm
+                    # libil2cpp: rva 0x1888b9158 > dump size)
+                    file_offset = address - m.start + m.file_offset
+                    out["file_offset"] = f"0x{file_offset:x}"
+                    out["rva"] = out["file_offset"]
                 return out
         raise AgentError("not_found", detail=f"address 0x{address:x} not in any mapping of pid {pid}")
 
@@ -767,11 +812,13 @@ class AnalysisFacade:
             detail = (f"address 0x{address:x} not inside any mapped module"
                       if module is None else f"module {module!r} not found")
             raise AgentError("not_found", detail=detail)
-        load_bias = min(e.start for e in entries)
         region = next((e for e in entries if e.start <= address < e.end), None)
         if region is None:
             raise AgentError("bad_request", detail=f"address 0x{address:x} not inside module {name}")
         count = max(1, min(int(count), 4096))
+        # D9: file-layout rva via the per-mapping translation — the old
+        # min(start) single-bias subtraction mislabeled multi-bias modules
+        rva = address - region.start + region.file_offset
         if self.service.has_agent_cap(AGENT_CAP_DISASSEMBLE) and engine in ("auto", "capstone"):
             try:
                 resp = self.service.disassemble_remote(pid, address, count=count)
@@ -782,7 +829,7 @@ class AnalysisFacade:
                 instructions = [
                     {
                         "addr": ins["address"],
-                        "rva": int(str(ins["address"]), 16) - load_bias,
+                        "rva": int(str(ins["address"]), 16) - region.start + region.file_offset,
                         "bytes": ins["bytes_hex"],
                         "text": f"{ins['mnemonic']} {ins['op_str']}".strip(),
                     }
@@ -792,7 +839,7 @@ class AnalysisFacade:
                     "pid": pid,
                     "module": name,
                     "address": f"0x{address:x}",
-                    "rva": f"0x{address - load_bias:x}",
+                    "rva": f"0x{rva:x}",
                     "engine": "agent-capstone",
                     "count": len(instructions),
                     "instructions": instructions,
@@ -806,7 +853,7 @@ class AnalysisFacade:
             "pid": pid,
             "module": name,
             "address": f"0x{address:x}",
-            "rva": f"0x{address - load_bias:x}",
+            "rva": f"0x{rva:x}",
             "engine": decoded["engine"],
             "count": len(decoded["instructions"]),
             "instructions": decoded["instructions"],
