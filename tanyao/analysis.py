@@ -862,12 +862,18 @@ class AnalysisFacade:
 
     def strings(self, pid: int, *, module: str | None = None, address: int | None = None,
                 size: int | None = None, min_length: int = 4, limit: int = 200,
-                filter: str | None = None) -> dict:
+                filter: str | None = None, async_run: bool = False) -> dict:
         """Extract printable-ASCII strings from a module's readable segments
-        (module mode, chunked with per-chunk fault skip) or an explicit window."""
+        (module mode, chunked with per-chunk fault skip) or an explicit window.
+        async_run=True (D10): device-side job via cmd 62 async — returns
+        {'job_id',...}; poll scan_status / scan_results (kind=strings)."""
         if self.service.has_agent_cap(AGENT_CAP_STRINGS):
             return self._agent_strings(pid, module=module, address=address, size=size,
-                                       min_length=min_length, limit=limit, filter=filter)
+                                       min_length=min_length, limit=limit, filter=filter,
+                                       async_run=async_run)
+        if async_run:
+            raise AgentError("bad_request",
+                             detail="strings async=true requires agent STRINGS capability (bit5)")
         read_fn = self._read_for(pid)
         if module is not None:
             maps = self.service.target_maps(pid)
@@ -917,45 +923,108 @@ class AnalysisFacade:
 
     def _agent_strings(self, pid: int, *, module: str | None, address: int | None,
                        size: int | None, min_length: int, limit: int,
-                       filter: str | None) -> dict:
+                       filter: str | None, async_run: bool = False) -> dict:
         """cmd 62 path: device extracts strings, host maps back to the
         {offset,length,value} shape (offset = absolute address)."""
-        def _rows(resp: dict) -> list[dict]:
-            out = []
-            for r in resp.get("results", []):
-                out.append({
-                    "offset": int(str(r["address"]), 16),
-                    "length": int(r.get("length", len(str(r["value"])))),
-                    "value": r["value"],
-                })
-            return out
-
         if module is not None:
-            resp = self.service.strings_scan(pid, preset=f"module:{module}",
-                                             min_len=min_length, max_results=limit,
-                                             regex=filter)
+            preset, win = f"module:{module}", None
+        elif address is not None and size:
+            preset, win = None, (address, min(int(size), 0x1000000))
+        else:
+            raise AgentError("bad_request", detail="strings: provide module= or address=")
+
+        if async_run:
+            # D10: explicit async entry — device job shared with the scan slot;
+            # polled via scan_status/scan_results (kind=strings). No silent
+            # auto-async on the sync path (explicit over surprise).
+            resp = self.service.strings_scan(
+                pid, preset=preset,
+                addr=win[0] if win else None, size=win[1] if win else None,
+                min_len=min_length, max_results=limit, regex=filter, async_run=True)
+            dev_job = int(resp["job_id"])
+            cancel_event = threading.Event()
+
+            def run(progress) -> dict:
+                st = self._agent_strings_wait(dev_job, progress, cancel_event)
+                rows = self._agent_strings_rows(self.service.agent_scan_results(0, limit))
+                return {
+                    "count": len(rows),
+                    "truncated": bool(st.get("truncated", False)),
+                    "scanned_bytes": parse_u64(st.get("scanned_bytes", "0x0"), field="scanned_bytes"),
+                    "skipped_bytes": parse_u64(st.get("skipped_bytes", "0x0"), field="skipped_bytes"),
+                    "strings": rows,
+                    "engine": "agent-strings",
+                }
+
+            job_id = self._jobs.start(pid, "strings", run, cancel_event=cancel_event)
+            self._agent_job_map[job_id] = dev_job
+            return {"job_id": job_id, "pid": pid, "kind": "strings", "state": "running",
+                    "async": True, "poll": "scan_status"}
+
+        try:
+            resp = self.service.strings_scan(
+                pid, preset=preset,
+                addr=win[0] if win else None, size=win[1] if win else None,
+                min_len=min_length, max_results=limit, regex=filter)
+        except AgentError as exc:
+            if exc.error == "bad_request":
+                # D10: keep the device's threshold rejection, add the exit ramp
+                exc.detail = f"{exc.detail} (module too large for sync scan — use async=true)".lstrip(" (")
+            raise
+        rows = self._agent_strings_rows(resp)
+        if module is not None:
             return {
                 "pid": pid, "module": module, "count": int(resp["count"]),
-                "strings": _rows(resp),
+                "strings": rows,
                 "scanned_bytes": parse_u64(resp.get("scanned_bytes", "0x0"), field="scanned_bytes"),
                 "skipped_bytes": parse_u64(resp.get("skipped_bytes", "0x0"), field="skipped_bytes"),
                 "truncated": bool(resp.get("truncated", False)),
                 "engine": "agent-strings",
             }
-        if address is None:
-            raise AgentError("bad_request", detail="strings: provide module= or address=")
-        if not size or size <= 0:
-            raise AgentError("bad_request", detail="strings: address mode requires size")
-        size = min(int(size), 0x1000000)
-        resp = self.service.strings_scan(pid, addr=address, size=size,
-                                         min_len=min_length, max_results=limit,
-                                         regex=filter)
         return {
-            "pid": pid, "address": f"0x{address:x}", "size": size,
-            "count": int(resp["count"]), "strings": _rows(resp),
+            "pid": pid, "address": f"0x{win[0]:x}", "size": win[1],
+            "count": int(resp["count"]), "strings": rows,
             "truncated": bool(resp.get("truncated", False)),
             "engine": "agent-strings",
         }
+
+    @staticmethod
+    def _agent_strings_rows(resp: dict) -> list[dict]:
+        out = []
+        for r in resp.get("results", []) + resp.get("hits", []):
+            out.append({
+                "offset": int(str(r["address"]), 16),
+                "length": int(r.get("length", len(str(r["value"])))),
+                "value": r["value"],
+            })
+        return out
+
+    def _agent_strings_wait(self, dev_job: int, progress=None, cancel_event=None,
+                            timeout: float = 3600.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    self.service.agent_scan_cancel(dev_job)
+                except AgentError:
+                    pass
+                raise ScanCancelled()
+            st = self.service.agent_scan_status(dev_job)
+            if progress is not None:
+                progress(
+                    parse_u64(st.get("scanned_bytes", "0x0"), field="scanned_bytes"),
+                    parse_u64(st.get("total_bytes", "0x0"), field="total_bytes"),
+                )
+            state = st.get("state")
+            if state == "done":
+                return st
+            if state == "cancelled":
+                raise ScanCancelled()
+            if state == "error":
+                raise AgentError("backend_error", detail=str(st.get("error") or "strings job failed"))
+            if time.monotonic() > deadline:
+                raise AgentError("backend_error", detail=f"strings job {dev_job} timed out")
+            time.sleep(0.1)
 
     def pull_apk(self, pid: int, out_path: str) -> dict:
         """Pull the APK backing this pid to the host. With bit6 the file comes

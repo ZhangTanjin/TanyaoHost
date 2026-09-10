@@ -349,6 +349,24 @@ def main() -> int:
             check("v1.2: strings engine=agent-strings", lambda: assert_true(
                 strs.get("engine") == "agent-strings", f"engine={strs.get('engine')}"))
 
+            def strings_async_roundtrip():
+                # D10: explicit async entry — full poll chain via scan_status
+                job = call_tool("strings", {"pid": pid, "module": "libc.so",
+                                            "min_length": 10, "limit": 5, "async": True})
+                assert_true(job.get("async") and job.get("job_id"), str(job)[:120])
+                status = {}
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    status = call_tool("scan_status", {"pid": pid, "job_id": job["job_id"]})
+                    if status.get("state") != "running":
+                        break
+                    time.sleep(0.3)
+                assert_true(status.get("state") == "done", str(status)[:200])
+                summary = status.get("summary") or {}
+                assert_true(summary.get("engine") == "agent-strings", str(summary)[:160])
+                return f"count={summary.get('count')}"
+            check("D10: strings async job roundtrip (device)", strings_async_roundtrip)
+
         try:
             pa = call_tool("pull_apk", {"pid": pid, "out": "/tmp/mcp-regression-pull.apk"}, timeout=180)
             has_apk = pa.get("remote", "").endswith("/base.apk")

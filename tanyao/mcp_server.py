@@ -281,7 +281,7 @@ TOOLS = [
     },
     {
         "name": "strings",
-        "description": "Extract printable-ASCII strings from a module's readable segments (chunked, fault-tolerant) or an explicit address window. Optional regex filter.",
+        "description": "Extract printable-ASCII strings from a module's readable segments (chunked, fault-tolerant) or an explicit address window. Optional regex filter. For large modules (device rejects sync scans over 256MiB) use async=true and poll scan_status/scan_results (kind=strings).",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
@@ -291,6 +291,7 @@ TOOLS = [
                 "min_length": {"type": "integer", "description": "minimum string length (default 4)"},
                 "limit": {"type": "integer", "description": "max strings returned (default 200)"},
                 "filter": {"type": "string", "description": "regex filter on string values"},
+                "async": {"type": "boolean", "description": "run as a device-side job: returns job_id immediately; poll scan_status (kind=strings) and scan_results (default false)"},
             },
             ["pid"],
         ),

@@ -300,6 +300,48 @@ class TestCaps3BSymbolsStrings(MatrixBase):
             self.service.strings_scan(DEMO_PID, preset="module:libdemo.so", regex="([bad")
         self.assertEqual(ctx.exception.error, "bad_request")
 
+    def test_strings_async_facade_roundtrip(self):
+        """D10: the MCP-visible async entry — strings(async=true) returns a
+        job id, the host job wraps the device job and maps the final page into
+        {offset,length,value} rows."""
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6,
+                                  async_run=True)
+        self.assertTrue(out["async"])
+        self.assertEqual(out["kind"], "strings")
+        st = {}
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            st = self.facade.scan_status(DEMO_PID, out["job_id"])
+            if st["state"] != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(st["state"], "done", st.get("error"))
+        summary = st["summary"]
+        self.assertEqual(summary["engine"], "agent-strings")
+        vals = [r["value"] for r in summary["strings"]]
+        self.assertIn("tanyao_mock_engine", vals)
+        self.assertTrue(all({"offset", "length", "value"} <= set(r) for r in summary["strings"]))
+
+    def test_strings_sync_threshold_keeps_hint_no_silent_async(self):
+        """D10: the device's sync-threshold rejection surfaces with the async
+        exit ramp appended; the facade must NOT auto-convert to async."""
+        calls = {}
+        original = self.service.strings_scan
+
+        def fake(pid, **kw):
+            calls.update(kw)
+            raise AgentError("bad_request", detail="sync range 402653184B exceeds threshold")
+
+        self.service.strings_scan = fake  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6)
+        finally:
+            self.service.strings_scan = original  # type: ignore[method-assign]
+        self.assertFalse(calls.get("async_run"))
+        self.assertIn("exceeds threshold", ctx.exception.detail)
+        self.assertIn("async=true", ctx.exception.detail)
+
     def test_strings_async_job_roundtrip(self):
         out = self.service.strings_scan(DEMO_PID, preset="module:libdemo.so",
                                         min_len=6, async_run=True)

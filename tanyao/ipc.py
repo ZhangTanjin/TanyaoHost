@@ -182,6 +182,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             min_length=int(p.get("min_length", 4)),
             limit=int(p.get("limit", 200)),
             filter=p.get("filter"),
+            async_run=bool(p.get("async", False)),
         ),
         "pull_apk": lambda p: facade.pull_apk(
             need_pid(p), str(p["out"]),
