@@ -934,10 +934,15 @@ class AnalysisFacade:
             "module": module,
         }
 
-    def symbol_list(self, pid: int, name: str, *, limit: int = 512, filter: str | None = None) -> dict:
+    def symbol_list(self, pid: int, name: str, *, limit: int = 512,
+                    filter: str | None = None, fields: str = "full") -> dict:
+        """fields: "full" (default) or "names_only" (F4 — trims rows to
+        {name,address} for large modules / quick lookups)."""
         if self.service.has_agent_cap(AGENT_CAP_SYMBOL_BATCH):
             resp = self.service.symbol_batch(pid, module=name, filter=filter)
             symbols = [self._symbol_row(resp, i, name) for i in range(resp["count"])]
+            if fields == "names_only":
+                symbols = [{"name": r["name"], "address": r["address"]} for r in symbols]
             return {
                 "pid": pid,
                 "module": name,
@@ -961,12 +966,15 @@ class AnalysisFacade:
         if filter:
             f = filter.lower()
             syms = [s for s in syms if f in s.name.lower()]
+        rows = [s.to_dict() for s in syms[:limit]]
+        if fields == "names_only":
+            rows = [{"name": r["name"], "address": r["address"]} for r in rows]
         return {
             "pid": pid,
             "module": name,
             "total": len(syms),
             "shown": min(len(syms), limit),
-            "symbols": [s.to_dict() for s in syms[:limit]],
+            "symbols": rows,
             "engine": "host-symbols",
         }
 
@@ -1329,15 +1337,75 @@ class AnalysisFacade:
     GHIDRA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "ghidra_scripts", "TanyaoDecomp.java")
 
+    @staticmethod
+    def _page_entropy(data: bytes) -> float:
+        """Shannon entropy in bits/byte (F5 pre-flight: encrypted/compressed
+        pages read as near-uniform, ~8.0, and waste hours of Ghidra time)."""
+        import math
+
+        if not data:
+            return 0.0
+        freq = [0] * 256
+        for b in data:
+            freq[b] += 1
+        n = len(data)
+        ent = 0.0
+        for f in freq:
+            if f:
+                p = f / n
+                ent -= p * math.log2(p)
+        return ent
+
+    def _entropy_guard(self, pid: int, entries, *, force: bool) -> str | None:
+        """F5: for >64MB modules, sample strided pages and warn when a majority
+        read as high-entropy. Returns a note (forced/None) or raises when the
+        caller has not passed force=true."""
+        total = sum(e.end - e.start for e in entries if e.flags & MAP_READ)
+        if total <= 64 * 1024 * 1024:
+            return None
+        readable = [e for e in entries if e.flags & MAP_READ]
+        if not readable:
+            return None
+        read_fn = self._read_for(pid)
+        page, samples = 0x1000, 16
+        high = checked = 0
+        for i in range(samples):
+            e = readable[i % len(readable)]
+            span = e.end - e.start
+            addr = e.start + (span * (i + 1)) // (samples + 2)
+            addr -= addr % page
+            take = min(page, e.end - addr)
+            if take <= 0:
+                continue
+            try:
+                data = read_fn(addr, take)
+            except AgentError:
+                continue
+            checked += 1
+            if self._page_entropy(data) > 7.5:
+                high += 1
+        if checked and high / checked > 0.5:
+            note = f"{high}/{checked} sampled pages >7.5 bits/byte"
+            if not force:
+                raise AgentError(
+                    "bad_request",
+                    detail=f"module looks encrypted/compressed ({note}) — decompiling it "
+                           f"typically wastes hours; re-call with force=true to proceed")
+            return f"forced past high-entropy warning ({note})"
+        return None
+
     def decompile_start(self, pid: int, module: str, out_dir: str | None = None,
-                        max_functions: int = 2000) -> dict:
+                        max_functions: int = 2000, force: bool = False) -> dict:
         """Dump a module, import it into headless Ghidra, auto-analyze and
         decompile all functions to C. Long-running: returns a job id immediately;
-        poll decompile_status. C sources + index.json land in out_dir."""
+        poll decompile_status (progress = elapsed seconds of the 3600s budget,
+        F5 heartbeat). C sources + index.json land in out_dir. Modules >64MB
+        get an entropy pre-flight (F5): pass force=true to override."""
         maps = self.service.target_maps(pid)
         name, entries = self._resolve_module_maps(maps, module, None)
         if not entries:
             raise AgentError("not_found", detail=f"module {module!r} not found")
+        entropy_note = self._entropy_guard(pid, entries, force=force)
         if not os.path.exists(self.GHIDRA_HEADLESS):
             raise AgentError("unavailable", detail="Ghidra not installed at /opt/ghidra")
         if not os.path.exists(self.GHIDRA_SCRIPT):
@@ -1358,12 +1426,32 @@ class AnalysisFacade:
             "-deleteProject",
         ]
 
+        cancel_event = threading.Event()
+
         def run(progress):
+            # F5: Popen poll loop — liveness heartbeat every 10s (progress =
+            # elapsed seconds of the 3600s budget) and a cancel path that
+            # actually kills the hung child instead of blocking forever.
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            except subprocess.TimeoutExpired as exc:
-                raise AgentError("backend_error", detail="ghidra headless timed out (3600s)") from exc
-            log = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True)
+            except OSError as exc:
+                raise AgentError("backend_error", detail=f"ghidra failed to start: {exc}") from exc
+            deadline = time.monotonic() + 3600
+            while proc.poll() is None:
+                if cancel_event.is_set():
+                    proc.kill()
+                    proc.wait(timeout=30)
+                    raise ScanCancelled()
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait(timeout=30)
+                    raise AgentError("backend_error", detail="ghidra headless timed out (3600s)")
+                heartbeat = min(99, int(time.monotonic() - (deadline - 3600)))
+                progress(heartbeat, 3600)
+                time.sleep(10)
+            out, err = proc.communicate(timeout=30)
+            log = (out or "") + "\n" + (err or "")
             if "TANYAO_DECOMP_DONE" not in log:
                 err_lines = [ln for ln in log.splitlines()
                              if "ERROR" in ln or "TANYAO_DECOMP_ERROR" in ln][:6]
@@ -1379,16 +1467,18 @@ class AnalysisFacade:
                 "dump": dump_info["out"],
                 "function_count": len(funcs),
                 "functions": funcs,
+                "entropy_note": entropy_note,
                 "log_tail": [ln for ln in log.strip().splitlines() if ln.strip()][-4:],
             }
 
-        job_id = self._jobs.start(pid, "decompile", run)
+        job_id = self._jobs.start(pid, "decompile", run, cancel_event=cancel_event)
         return {
             "job_id": job_id,
             "pid": pid,
             "module": name,
             "out_dir": out_dir,
             "dump": dump_info["out"],
+            "entropy_note": entropy_note,
             "note": "poll decompile_status(pid, job_id); .c files + index.json land in out_dir",
         }
 

@@ -193,5 +193,86 @@ class TestMapsViewOnSixSegmentFixture(unittest.TestCase):
         self.assertEqual(out["first_map"], mods[MODULE]["base"])
 
 
+class TestF4F6(unittest.TestCase):
+    """F4 symbol_list fields=names_only; F6 preset category summary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN)
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def setUp(self):
+        self.service = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        self.facade = AnalysisFacade(self.service)
+        self.service.connect()
+
+    def tearDown(self):
+        self.service.close()
+
+    def test_symbol_list_names_only(self):
+        full = self.facade.symbol_list(DEMO_PID, "libdemo.so")
+        self.assertIn("bind", full["symbols"][0])
+        slim = self.facade.symbol_list(DEMO_PID, "libdemo.so", fields="names_only")
+        self.assertTrue(all(set(r) == {"name", "address"} for r in slim["symbols"]))
+        self.assertEqual(len(slim["symbols"]), full["shown"])
+
+    def test_preset_categories_summary(self):
+        out = self.facade.scan_set_default_ranges(DEMO_PID, preset="module:libdemo.so")
+        self.assertEqual(out["categories"]["module"], 2)
+        self.assertEqual(out["categories"]["anon"], 0)
+        self.assertGreater(out["total_bytes"], 0)
+        anon = self.facade.scan_set_default_ranges(DEMO_PID, preset="anon")
+        self.assertGreaterEqual(anon["categories"]["anon"], 1)
+
+
+class TestF5Entropy(unittest.TestCase):
+    """F5: page entropy math + the force gate on a >64MB high-entropy module."""
+
+    def test_page_entropy_values(self):
+        facade = AnalysisFacade(TanyaoService("127.0.0.1", 1, "x"))  # no connect needed
+        import random
+        self.assertAlmostEqual(facade._page_entropy(b"\x00" * 4096), 0.0, places=6)
+        rng = random.Random(7)
+        blob = bytes(rng.getrandbits(8) for _ in range(4096))
+        self.assertGreater(facade._page_entropy(blob), 7.9)
+        text = (b"the quick brown fox jumps over the lazy dog\n" * 90)
+        self.assertLess(facade._page_entropy(text), 5.0)
+
+    def test_force_gate_on_big_high_entropy_module(self):
+        import random
+
+        class BigHighEntropyService(_MetaServiceWithSource):
+            def __init__(self):
+                super().__init__()
+                from tanyao.service import MapEntry
+                rng = random.Random(11)
+                big = MapEntry(start=0x3000_0000_0000, end=0x3000_5000_0000,
+                               file_offset=0, flags=1 | 4,
+                               path="/data/app/libbig.so")
+                self.maps.append(big)
+                self._big = (big.start, big.end,
+                             bytes(rng.getrandbits(8) for _ in range(0x1000)))
+
+            def mem_read(self, _pid, addr, size):
+                lo, hi, page = self._big
+                if lo <= addr and addr + size <= hi:
+                    off = (addr - lo) % 0x1000
+                    tile = (page * ((size // 0x1000) + 2))[off: off + size]
+                    return tile
+                return super().mem_read(_pid, addr, size)
+
+        facade = AnalysisFacade(BigHighEntropyService())  # type: ignore[arg-type]
+        with self.assertRaises(Exception) as ctx:
+            facade.decompile_start(PID, "libbig.so")
+        self.assertIn("force=true", str(ctx.exception))
+        note = facade._entropy_guard(
+            PID, facade.service.target_maps(PID)[-1:], force=True)
+        self.assertIn("forced", note)
+
+
 if __name__ == "__main__":
     unittest.main()

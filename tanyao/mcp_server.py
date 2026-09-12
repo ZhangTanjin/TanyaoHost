@@ -165,13 +165,14 @@ TOOLS = [
     },
     {
         "name": "symbol_list",
-        "description": "List dynamic symbols (dynsym) of a mapped module read from live memory: name, absolute address, size, type, bind.",
+        "description": "List dynamic symbols (dynsym) of a mapped module read from live memory: name, absolute address, size, type, bind. fields=names_only trims rows to {name,address} for large modules.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
                 "module": {"type": "string"},
                 "limit": {"type": "integer"},
                 "filter": {"type": "string", "description": "case-insensitive substring on symbol name"},
+                "fields": {"type": "string", "description": "full (default) | names_only", "enum": ["full", "names_only"]},
             },
             ["pid", "module"],
         ),
@@ -186,7 +187,7 @@ TOOLS = [
     },
     {
         "name": "scan_set_default_ranges",
-        "description": "Set scan ranges: preset 'anon' (readable anonymous/heap, default), 'stack', 'module:<name>', or 'all_readable'.",
+        "description": "Set scan ranges: preset 'anon' (readable anonymous/heap, default), 'stack', 'module:<name>', or 'all_readable' (EVERY readable file mapping incl. ART boot images — huge; scope deliberately). Response reports the actual selected segments/bytes/classes (F6).",
         "inputSchema": _obj(
             {"pid": {"type": "integer"}, "preset": {"type": "string", "description": "anon | stack | module:<name> | all_readable"}},
             ["pid"],
@@ -355,13 +356,14 @@ TOOLS = [
     },
     {
         "name": "decompile_start",
-        "description": "Dump a module, import into headless Ghidra, auto-analyze and decompile all functions to C sources (+ index.json). Long-running: returns job_id; poll decompile_status. Requires Ghidra at /opt/ghidra.",
+        "description": "Dump a module, import into headless Ghidra, auto-analyze and decompile all functions to C sources (+ index.json). Long-running: returns job_id; poll decompile_status (progress = elapsed seconds of the 3600s budget). Modules >64MB get an entropy pre-flight — mostly-encrypted images are rejected unless force=true. Requires Ghidra at /opt/ghidra.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
                 "module": {"type": "string"},
                 "out_dir": {"type": "string", "description": "host output dir (default /tmp/tanyao-decomp/<module>-<pid>)"},
                 "max_functions": {"type": "integer", "description": "cap on decompiled functions (default 2000)"},
+                "force": {"type": "boolean", "description": "proceed past the high-entropy warning (default false)"},
             },
             ["pid", "module"],
         ),

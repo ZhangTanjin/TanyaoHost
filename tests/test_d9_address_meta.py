@@ -88,9 +88,15 @@ class _MetaService:
         return self.maps
 
     def mem_read(self, _pid, addr, size):
-        for start, buf in self.mem.items():
-            if start <= addr and addr + size <= start + len(buf):
-                return bytes(buf[addr - start: addr - start + size])
+        # overlays are materialized per-map; anything else inside a registered
+        # map extent reads as zeros (keeps >64MB fixture maps virtual)
+        for m in self.maps:
+            if m.start <= addr and addr + size <= m.end:
+                buf = self.mem.get(m.start)
+                if buf is not None and addr + size <= m.start + len(buf):
+                    off = addr - m.start
+                    return bytes(buf[off: off + size])
+                return b"\x00" * size
         raise RuntimeError(f"fixture read outside mappings: 0x{addr:x}")
 
     def has_agent_cap(self, _bit):

@@ -182,6 +182,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             need_pid(p), str(p["module"]),
             limit=int(p.get("limit", 512)),
             filter=p.get("filter"),
+            fields=str(p.get("fields", "full")),
         ),
         "symbol_find": lambda p: facade.symbol_find(
             need_pid(p), str(p["name"]),
@@ -216,6 +217,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             str(p["module"]),
             out_dir=str(p["out_dir"]) if p.get("out_dir") else None,
             max_functions=int(p.get("max_functions", 2000)),
+            force=bool(p.get("force", False)),
         ),
         "decompile_status": lambda p: facade.decompile_status(
             need_pid(p), str(p["job_id"]),
