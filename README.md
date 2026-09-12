@@ -23,8 +23,9 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
 
 ## 能力面（31 个 MCP 工具，v3 按能力位自动分派）
 
-- 侦察：`get_status`（含 `agent_capabilities`/`skipped_caps`）`find_process`
-  （name 须为完整包名/cmdline，短名不匹配——O4 短期口径；模糊匹配为 V1.3 候选）
+- 侦察：`get_status`（含 `agent_capabilities`/`skipped_caps`/`transport`/
+  `agent_build`）`find_process`（默认 exact 须完整包名；agent 声明 bit10 时
+  `mode="substring"` 支持短名，多命中带 `matches` 计数）
   `list_processes` `list_modules`
   `resolve_module`（ELF load bias/BSS/mirror）`address_resolve`（RVA）
 - 内存：`read_memory`（原始/typed）`read_batch`（批量）`write_bytes`
