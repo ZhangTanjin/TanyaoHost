@@ -22,8 +22,11 @@ from .constants import (
     AGENT_CAP_APK_INFO,
     AGENT_CAP_DISASSEMBLE,
     AGENT_CAP_DUMP_PIPELINE,
+    AGENT_CAP_FUZZY_FIND,
+    AGENT_CAP_PACKED_BIND,
     AGENT_CAP_SCAN,
     AGENT_CAP_SCAN_EXPLICIT_RANGES,
+    AGENT_CAP_SCAN_VALUES,
     AGENT_CAP_STRINGS,
     AGENT_CAP_SYMBOL_BATCH,
     CMD_BACKEND_INFO,
@@ -114,6 +117,8 @@ def main() -> int:
     parser.add_argument("--token", default=os.environ.get("TANYAO_TOKEN", ""))
     parser.add_argument("--token-file", default=None)
     parser.add_argument("--pid", type=int, required=True, help="a live process pid on the device")
+    parser.add_argument("--target-hint", default="tanyao",
+                        help="substring term for the bit10 fuzzy-find check")
     parser.add_argument("--allow-write", action="store_true", help="include write+readback test")
     args = parser.parse_args()
 
@@ -361,6 +366,88 @@ def main() -> int:
         ok &= check("strings_scan sync (cmd 62)", do_strings_scan)
     else:
         skipped_caps.append("strings")
+
+    if not caps & AGENT_CAP_FUZZY_FIND:
+        skipped_caps.append("fuzzy_find")
+    else:
+        def do_fuzzy_find():
+            # substring for a short term; the exact full name must still hit
+            resp = conn.request(CMD_PROCESS_FIND,
+                                {"name": args.target_hint, "mode": "substring"})
+            pid_found = _as_int(resp.get("pid"), "pid")
+            assert pid_found > 0, f"substring find returned {resp}"
+            if "matches" in resp:
+                assert _as_int(resp["matches"], "matches") >= 1
+            print(f"     NOTE: fuzzy find '{args.target_hint}': pid={pid_found}, "
+                  f"matches={resp.get('matches', 1)}")
+        ok &= check("fuzzy find substring (cmd 44 mode, bit10)", do_fuzzy_find)
+
+    if not caps & AGENT_CAP_SCAN_VALUES:
+        skipped_caps.append("scan_values")
+    else:
+        def do_scan_values():
+            import struct as _struct
+            assert first_rx_map is not None
+            base = parse_u64(first_rx_map["start"], field="start")
+            module = (first_rx_map.get("path") or "").rsplit("/", 1)[-1]
+            vals = []
+            for off in (0x100, 0x110):
+                resp = conn.request(CMD_MEM_READ, {"handle": f"0x{handle:x}",
+                                                   "addr": f"0x{base + off:x}",
+                                                   "size": "0x4"})
+                vals.append(_struct.unpack("<I", b64_decode(resp["data_b64"]))[0])
+            job = conn.request(50, {"pid": args.pid, "kind": "value", "type": "u32",
+                                    "values": vals, "preset": f"module:{module}"})
+            deadline = time.time() + 60
+            status = {"state": "running"}
+            while time.time() < deadline:
+                status = conn.request(51, {"job_id": job["job_id"]})
+                if status.get("state") != "running":
+                    break
+                time.sleep(0.2)
+            assert status.get("state") == "done", f"values scan state={status.get('state')}"
+            results = conn.request(53, {"offset": 0, "limit": 64})
+            hits = results.get("hits", [])
+            assert hits, "values scan returned zero hits"
+            for h in hits:
+                assert _as_int(h.get("value_index"), "value_index") in (0, 1), \
+                    f"bad value_index: {h}"
+            indexes = sorted({_as_int(h.get("value_index"), "value_index") for h in hits})
+            print(f"     NOTE: values scan {vals}: {len(hits)} hits, indexes={indexes}")
+        ok &= check("scan values[] multi-value (cmd 50, bit11)", do_scan_values)
+
+    if not caps & AGENT_CAP_PACKED_BIND:
+        skipped_caps.append("packed_bind")
+    else:
+        def do_packed_bind():
+            from .frames import decode_packed_symbols
+
+            candidates = []
+            if first_rx_map is not None:
+                candidates.append((first_rx_map.get("path") or "").rsplit("/", 1)[-1])
+            candidates += ["libc.so", "linker64", "linker"]
+            for module in dict.fromkeys(candidates):
+                if not module:
+                    continue
+                try:
+                    j = conn.request(CMD_SYMBOL_BATCH, {"pid": args.pid, "module": module,
+                                                        "format": "json"})
+                except AgentError as exc:
+                    if exc.error == "not_found":
+                        continue
+                    raise
+                frame = conn.request_raw(CMD_SYMBOL_BATCH, {"pid": args.pid, "module": module,
+                                                            "format": "packed"})
+                if not isinstance(frame.payload, bytes):
+                    raise AssertionError("packed returned a JSON frame")
+                p = decode_packed_symbols(frame.payload)
+                assert p["names"] == j["names"], "packed/json name mismatch"
+                if "binds" in j and "binds" in p:
+                    assert p["binds"] == j["binds"], "packed binds != json binds"
+                print(f"     NOTE: packed 24B {module}: binds={p.get('binds')}")
+                return
+            print("     NOTE: packed bind: no dynsym-bearing module on this target")
+        ok &= check("packed 24B bind decode (cmd 61, bit12)", do_packed_bind)
 
     if not caps & AGENT_CAP_DUMP_PIPELINE:
         skipped_caps.append("dump_pipeline")

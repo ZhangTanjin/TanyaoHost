@@ -480,6 +480,18 @@ def main() -> int:
             pt.get("targets") and pt["targets"][0]["address"] == pthread_addr
             and isinstance(pt["targets"][0]["found"], int)
             and pt.get("ranges", 0) >= 1, str(pt)[:200]))
+        if caps_mask & 2048:  # bit11 SCAN_VALUES
+            check("v1.3: pointers_to single values[] round trip", lambda: assert_true(
+                pt.get("scans") == 1 and pt.get("match") == "exact-u64",
+                f"scans={pt.get('scans')} match={pt.get('match')}"))
+        if caps_mask & 1024:  # bit10 FUZZY_FIND
+            def v13_fuzzy_find():
+                out = call_tool("find_process", {"name": "surfaceflinger",
+                                                 "mode": "substring"})
+                assert_true(out.get("pid") == pid,
+                            f"substring pid={out.get('pid')} != {pid}")
+                return "substring hit"
+            check("v1.3: find_process mode=substring", v13_fuzzy_find)
 
         check("unknown tool -> isError", lambda: assert_true(
             _expect_error(lambda: call_tool("no_such_tool", {})), ""))

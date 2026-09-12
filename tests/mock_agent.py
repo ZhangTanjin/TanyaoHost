@@ -108,6 +108,7 @@ PACKED_SYMBOL_HEADER = struct.Struct(">IIII")
 PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
 PACKED_SYMBOL_HEADER_V13 = struct.Struct(">IIIII")
 PACKED_SYMBOL_ENTRY_V13 = struct.Struct(">QIIIBBH")  # + bind u8 | rsv u8 | rsv u16
+PACKED_SYMBOL_ENTRY_V13_SIZE = 24
 
 APK_PATH = "/data/app/~~x/com.example.re/base.apk"
 APK_START = 0x7100000000
