@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from .constants import (
     AGENT_CAP_SCAN,
     CMD_APK_INFO,
+    CMD_CALL_EXPORT,
     CMD_BACKEND_INFO,
     CMD_DISASSEMBLE,
     CMD_DUMP_CLEANUP,
@@ -608,6 +609,21 @@ class TanyaoService:
             return decode_dump_chunk(frame.payload)
         except ProtocolError as exc:
             raise AgentError("internal", detail=str(exc)) from exc
+
+    def call_export(self, pid: int, module: str, symbol: str, *, args: list | None = None,
+                    ret_type: str = "u64", probe_ret: bool = False) -> dict:
+        """cmd 80 (v1.4): controlled in-process call of an allowlisted export.
+        Requires the agent to declare bit13 CALL_EXPORT; the device enforces
+        its own allowlist and audit; slugs: not_in_allowlist/call_timeout/
+        call_failed."""
+        with self._lock:
+            payload: dict = {"pid": pid, "module": module, "symbol": symbol,
+                             "ret_type": ret_type}
+            if args:
+                payload["args"] = list(args)
+            if probe_ret:
+                payload["probe_ret"] = True
+            return self._execute(CMD_CALL_EXPORT, payload)
 
     def dump_cleanup(self, dump_id: str) -> dict:
         """cmd 68: explicit, auditable device-side cleanup (never automatic)."""

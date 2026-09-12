@@ -68,6 +68,7 @@ CMD_DUMP_PULL = 65
 CMD_APK_INFO = 66
 CMD_DISASSEMBLE = 67
 CMD_DUMP_CLEANUP = 68
+CMD_CALL_EXPORT = 80  # v1.4: controlled in-process call
 
 CAP_SESSION = 1 << 0
 CAP_TARGET_HANDLE = 1 << 1
@@ -84,6 +85,24 @@ AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # v1.2.1: cmd 50 `ranges` support
 AGENT_CAP_FUZZY_FIND = 1 << 10    # v1.3: cmd 44 mode=substring
 AGENT_CAP_SCAN_VALUES = 1 << 11   # v1.3: cmd 50 values[] multi-value scan
 AGENT_CAP_PACKED_BIND = 1 << 12   # v1.3: cmd 61 packed 24B entry with bind
+AGENT_CAP_CALL_EXPORT = 1 << 13   # v1.4: cmd 80 controlled call (allowlist-gated)
+
+# v1.4 §5.1 baseline: 13 il2cpp pure-read getters (module: libil2cpp.so)
+CALL_ALLOWLIST_BASELINE = [
+    ("libil2cpp.so", "il2cpp_domain_get"),
+    ("libil2cpp.so", "il2cpp_domain_get_assemblies"),
+    ("libil2cpp.so", "il2cpp_class_get_name"),
+    ("libil2cpp.so", "il2cpp_class_get_field_from_name"),
+    ("libil2cpp.so", "il2cpp_image_get_name"),
+    ("libil2cpp.so", "il2cpp_class_from_name"),
+    ("libil2cpp.so", "il2cpp_class_get_methods"),
+    ("libil2cpp.so", "il2cpp_class_get_fields"),
+    ("libil2cpp.so", "il2cpp_class_get_method_from_name"),
+    ("libil2cpp.so", "il2cpp_assembly_get_image"),
+    ("libil2cpp.so", "il2cpp_class_num_fields"),
+    ("libil2cpp.so", "il2cpp_image_get_class_count"),
+    ("libil2cpp.so", "il2cpp_class_get_method_count"),
+]
 AGENT_CAP_SYMBOL_BATCH = 1 << 3
 AGENT_CAP_BINARY_FRAMES = 1 << 4
 AGENT_CAP_STRINGS = 1 << 5
@@ -379,9 +398,19 @@ def hx(v: int) -> str:
 class MockAgent:
     def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None,
                  agent_caps: int = 0, disasm_available: bool = True,
-                 build: str | None = None) -> None:
+                 build: str | None = None,
+                 call_allowlist: list[tuple[str, str]] | None = None,
+                 call_behavior: str = "ok") -> None:
         self.disasm_available = disasm_available
         self.build = build
+        # v1.4 §3: bit13 is declared only with a non-empty allowlist; empty or
+        # absent → cmd 80 answers unsupported (default-decline)
+        self.call_allowlist = set(call_allowlist if call_allowlist is not None
+                                  else CALL_ALLOWLIST_BASELINE)
+        self.call_behavior = call_behavior  # ok | timeout | fail
+        self.call_audit: list[dict] = []
+        self._call_audit_seq = 0
+        self._call_in_flight = False
         self.token = token if token is not None else os.environ.get("TANYAO_MOCK_TOKEN", "tanyao-dev-token")
         self.agent_caps = agent_caps
         self.generation = 1
@@ -543,9 +572,12 @@ class MockAgent:
                 "generation": self.generation,
                 "challenge": challenge,
             }
-            if self.agent_caps:
+            caps = self.agent_caps
+            if caps & AGENT_CAP_CALL_EXPORT and not self.call_allowlist:
+                caps &= ~AGENT_CAP_CALL_EXPORT  # default-decline (v1.4 §3.1)
+            if caps:
                 # v1.0 agents omit the field entirely; host treats absent as 0.
-                hello["capabilities"] = hex(self.agent_caps)
+                hello["capabilities"] = hex(caps)
             if self.build:
                 hello["build"] = self.build  # v1.2.1 附录 (D2 prevention)
             self._send(conn, 0, CMD_HELLO, hello, 0)
@@ -748,6 +780,10 @@ class MockAgent:
             if not self.agent_caps & AGENT_CAP_APK_INFO:
                 raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
             return self._apk_info(payload)
+        if cmd == CMD_CALL_EXPORT:
+            if not self.agent_caps & AGENT_CAP_CALL_EXPORT or not self.call_allowlist:
+                raise ProtocolFail("unsupported", 0, "call_export unavailable (no allowlist)")
+            return self._call_export(payload)
         if cmd == CMD_DISASSEMBLE:
             if not self.agent_caps & AGENT_CAP_DISASSEMBLE:
                 raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
@@ -965,6 +1001,64 @@ class MockAgent:
                                  "mnemonic": parts[0],
                                  "op_str": parts[1] if len(parts) > 1 else ""})
         return {"engine": "capstone", "count": len(instructions), "instructions": instructions}
+
+    # -- cmd 80 call_export (v1.4 draft reference implementation) ------------------
+
+    def _call_export(self, payload: dict) -> dict:
+        if self._call_in_flight:
+            # v1.4 §3.5 single-flight (mock loop is serial; kept for shape)
+            raise ProtocolFail("already_running", 0, "another call in flight")
+        self._call_in_flight = True
+        try:
+            return self._call_export_inner(payload)
+        finally:
+            self._call_in_flight = False
+
+    def _call_export_inner(self, payload: dict) -> dict:
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        module = payload.get("module")
+        symbol = payload.get("symbol")
+        if not isinstance(module, str) or not module or not isinstance(symbol, str) or not symbol:
+            raise ProtocolFail("bad_request", detail="module and symbol required")
+        ret_type = payload.get("ret_type", "u64")
+        if ret_type not in ("u64", "f64", "void"):
+            raise ProtocolFail("bad_request", detail=f"unknown ret_type {ret_type!r}")
+        args = payload.get("args", [])
+        if not isinstance(args, list) or len(args) > 8:
+            raise ProtocolFail("bad_request", detail="args must be a list of at most 8 entries")
+        probe_ret = bool(payload.get("probe_ret", False))
+        audit_id = self._call_audit_seq + 1
+
+        def audit(result: str) -> None:
+            self._call_audit_seq += 1
+            self.call_audit.append({
+                "audit_id": self._call_audit_seq, "pid": pid, "module": module,
+                "symbol": symbol, "result": result, "args": args,
+            })
+
+        # §3.1 default-deny: (module basename, symbol) must be whitelisted
+        if (module.rsplit("/", 1)[-1], symbol) not in self.call_allowlist:
+            audit("not_in_allowlist")
+            raise ProtocolFail("not_in_allowlist", 0, f"{module}:{symbol} is not whitelisted")
+        if self.call_behavior == "timeout":
+            audit("call_timeout")
+            raise ProtocolFail("call_timeout", 0, "call exceeded the 3s wall-clock budget")
+        if self.call_behavior == "fail":
+            audit("call_failed")
+            raise ProtocolFail("call_failed", -1, "ptrace attach failed", )
+
+        # synthetic deterministic return (device executes the real function)
+        if ret_type == "void":
+            ret = None
+        else:
+            ret = hx(0x600D0000 | (len(symbol) & 0xFFFF))
+        resp = {"ret": ret, "elapsed_us": 812, "audit_id": audit_id}
+        if probe_ret:
+            resp["ret_readable"] = True
+        audit("ok")
+        return resp
 
     # -- cmd 44 process_find (v1.3 §2.1 reference implementation) -----------------
 

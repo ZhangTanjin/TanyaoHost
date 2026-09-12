@@ -258,6 +258,21 @@ TOOLS = [
         ),
     },
     {
+        "name": "call_export",
+        "description": "RISK: controlled in-process call of an allowlisted export function on the LIVE target (ptrace attach is observable by anti-cheat — detection/ban risk borne by the operator; every attempt is audited device-side). DISABLED unless serve was started with TANYAO_ALLOW_CALL=1. Args: up to 8 u64 values (x0-x7). This is an explicitly authorised live-target operation.",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "module": {"type": "string", "description": "module basename, e.g. libil2cpp.so"},
+                "symbol": {"type": "string", "description": "export symbol (must be in the device allowlist)"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "up to 8 u64 args (0x hex or decimal), mapped to x0-x7"},
+                "ret_type": {"type": "string", "description": "u64 (default) | f64 | void", "enum": ["u64", "f64", "void"]},
+                "probe_ret": {"type": "boolean", "description": "device probes 1 byte at the return value first; response carries ret_readable"},
+            },
+            ["pid", "module", "symbol"],
+        ),
+    },
+    {
         "name": "resolve_rva",
         "description": "Resolve an RVA/file offset to a runtime address inside a module. Give exactly ONE of rva (vaddr flavour — converted via live phdrs, for cross-checking R4-era offline records) or file_offset (the tool-face convention: address_resolve/disassemble 'rva' fields and dump manifests are FILE OFFSETS). Mirror segments never bear translations; the response carries the bearing segment (translation_base) so the addition identity address == translation_base + rva is verifiable.",
         "inputSchema": _obj(

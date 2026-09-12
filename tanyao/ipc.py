@@ -63,9 +63,13 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             "generation": facade.service.generation(),
             "backend": _backend_dict(facade.service),
             "write_enabled": facade._write_enabled,
+            "call_enabled": facade._call_enabled,
             "agent_capabilities": hex(caps),
             "skipped_caps": undeclared_agent_caps(caps),
         }
+        if facade._call_allowlist is not None:
+            # host-side mirror list; None when unset (agent list governs)
+            out["call_allowlist_entries"] = len(facade._call_allowlist)
         build = facade.service.agent_build()
         if build:
             out["agent_build"] = build  # omitted entirely when the agent has no build field
@@ -108,6 +112,12 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             vtype=p.get("vtype", "u64"),
             strip_pac=bool(p.get("strip_pac", True)),
             pointer_mask=int(p["pointer_mask"], 16) if isinstance(p.get("pointer_mask"), str) else p.get("pointer_mask"),
+        ),
+        "call_export": lambda p: facade.call_export(
+            need_pid(p), str(p["module"]), str(p["symbol"]),
+            args=p.get("args") or None,
+            ret_type=str(p.get("ret_type", "u64")),
+            probe_ret=bool(p.get("probe_ret", False)),
         ),
         "resolve_rva": lambda p: facade.resolve_rva(
             need_pid(p), str(p["module"]),

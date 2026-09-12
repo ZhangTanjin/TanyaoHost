@@ -122,9 +122,9 @@ def main() -> int:
             "scan_hex", "scan_next", "scan_results", "scan_clear", "dump_module", "watch",
             "disassemble", "strings", "pull_apk", "apk_info",
             "decompile_start", "decompile_status",
-            "watch_many", "pointers_to", "resolve_rva",
+            "watch_many", "pointers_to", "resolve_rva", "call_export",
         ])
-        check("mcp: tools/list == 32 expected", lambda: assert_true(
+        check("mcp: tools/list == 33 expected", lambda: assert_true(
             tool_names == expected, f"got {len(tool_names)}: missing="
             f"{set(expected) - set(tool_names)}, extra={set(tool_names) - set(expected)}"))
 
@@ -511,6 +511,21 @@ def main() -> int:
                             f"substring pid={out.get('pid')} != {pid}")
                 return "substring hit"
             check("v1.3: find_process mode=substring", v13_fuzzy_find)
+
+        # -- v1.4 D23: call_export gate (default OFF — the tool must refuse
+        # without touching the live target; gate-on runs only against the
+        # tester's own sacrificial target per V1.4 §4 discipline) -------------
+        st2 = call_tool("get_status", {})
+        check("v1.4: get_status exposes call gate", lambda: assert_true(
+            isinstance(st2.get("call_enabled"), bool), str(st2.get("call_enabled"))))
+        if not st2.get("call_enabled"):
+            check("v1.4: call_export refuses with gate off", lambda: assert_true(
+                _expect_error(lambda: call_tool(
+                    "call_export", {"pid": pid, "module": "libc.so",
+                                    "symbol": "pthread_create"})), ""))
+        else:
+            check("v1.4: call_export gate ON — skipped (own-target DoD only)",
+                  lambda: "skipped: gate on; live-target chain is tester DoD")
 
         check("unknown tool -> isError", lambda: assert_true(
             _expect_error(lambda: call_tool("no_such_tool", {})), ""))

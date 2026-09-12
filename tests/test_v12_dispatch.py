@@ -526,6 +526,109 @@ class TestV13ScanValues(unittest.TestCase):
         self.assertGreaterEqual(out["scans"], 1)
 
 
+class TestV14CallExport(unittest.TestCase):
+    """V1.4 cmd 80: host gate, allowlist paths, audit, probe_ret."""
+
+    def setUp(self):
+        self.agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 13))
+        self.agent.start()
+
+    def tearDown(self):
+        self.agent.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_gate_off_refuses_before_wire(self):
+        os.environ.pop("TANYAO_ALLOW_CALL", None)
+        facade = self._facade(self.agent)
+        with self.assertRaises(AgentError) as ctx:
+            facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+        self.assertEqual(ctx.exception.error, "call_disabled")
+        self.assertNotIn("TANYAO_ALLOW_CALL", os.environ)
+
+    def test_gate_on_whitelist_hit_synthetic_return(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            out = facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+            self.assertTrue(out["ret"].startswith("0x"))
+            self.assertGreater(out["elapsed_us"], 0)
+            self.assertIn("audit_id", out)
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_gate_on_allowlist_miss(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            with self.assertRaises(AgentError) as ctx:
+                facade.call_export(DEMO_PID, "libil2cpp.so", "system_write_everything")
+            self.assertEqual(ctx.exception.error, "not_in_allowlist")
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_device_side_failures_and_audit(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            svc = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            try:
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "system_write_everything")
+                self.assertEqual(ctx.exception.error, "not_in_allowlist")
+                self.agent.call_behavior = "timeout"
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                self.assertEqual(ctx.exception.error, "call_timeout")
+                self.agent.call_behavior = "fail"
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                self.assertEqual(ctx.exception.error, "call_failed")
+                # audit recorded every attempt, including the rejections
+                results = [a["result"] for a in self.agent.call_audit]
+                self.assertIn("not_in_allowlist", results)
+                self.assertIn("call_timeout", results)
+                self.assertIn("call_failed", results)
+                self.agent.call_behavior = "ok"
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                results = [a["result"] for a in self.agent.call_audit]
+                self.assertIn("ok", results)
+            finally:
+                self.agent.call_behavior = "ok"
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_probe_ret_and_args_validation(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            out = facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_class_from_name",
+                                     args=["0x72990c6590", 42], probe_ret=True)
+            self.assertTrue(out.get("ret_readable"))
+            with self.assertRaises(AgentError):
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_class_from_name",
+                                   args=["0x1"] * 9)
+            with self.assertRaises(AgentError):
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get",
+                                   ret_type="ptr")
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_get_status_call_fields(self):
+        from tanyao.ipc import build_method_table
+
+        facade = self._facade(self.agent)
+        st = build_method_table(facade)["get_status"]({})
+        self.assertFalse(st["call_enabled"])
+        self.assertNotIn("call_allowlist_entries", st)  # no host list configured
+
+
 class TestCaps1FFFullPipeline(MatrixBase):
     """caps=0x1ff: dump pipeline, apk_info(pid), disassemble, write_txn all on
     the device; host keeps gate/policy and verifies integrity end to end."""

@@ -51,6 +51,7 @@ CMD_DUMP_PULL = 65
 CMD_APK_INFO = 66
 CMD_DISASSEMBLE = 67
 CMD_DUMP_CLEANUP = 68
+CMD_CALL_EXPORT = 80  # v1.4 draft: controlled in-process call (bit13)
 
 DEFAULT_PORT = 52730
 
@@ -69,6 +70,7 @@ AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # cmd 50 accepts explicit `ranges` (v1.
 AGENT_CAP_FUZZY_FIND = 1 << 10    # cmd 44 mode=substring (v1.3)
 AGENT_CAP_SCAN_VALUES = 1 << 11   # cmd 50 values[] multi-value scan (v1.3)
 AGENT_CAP_PACKED_BIND = 1 << 12   # cmd 61 packed 24B entry with bind (v1.3)
+AGENT_CAP_CALL_EXPORT = 1 << 13   # cmd 80 controlled in-process call (v1.4)
 
 AGENT_CAP_TABLE = (
     (AGENT_CAP_SCAN, "scan"),
@@ -83,6 +85,7 @@ AGENT_CAP_TABLE = (
     (AGENT_CAP_FUZZY_FIND, "fuzzy_find"),
     (AGENT_CAP_SCAN_VALUES, "scan_values"),
     (AGENT_CAP_PACKED_BIND, "packed_bind"),
+    (AGENT_CAP_CALL_EXPORT, "call_export"),
 )
 
 

@@ -19,6 +19,7 @@ from typing import Any
 from .connection import AgentError
 from .constants import (
     AGENT_CAP_APK_INFO,
+    AGENT_CAP_CALL_EXPORT,
     AGENT_CAP_FUZZY_FIND,
     AGENT_CAP_SCAN_VALUES,
     b64_decode,
@@ -76,6 +77,13 @@ class AnalysisFacade:
         self._scans: dict[int, ScanEngine] = {}
         self._jobs = JobManager()
         self._write_enabled = os.environ.get("TANYAO_ALLOW_WRITE") == "1"
+        # v1.4 §3.2: call gate mirrors the write gate — serve must be started
+        # with TANYAO_ALLOW_CALL=1 for the call_export tool to exist
+        self._call_enabled = os.environ.get("TANYAO_ALLOW_CALL") == "1"
+        self._call_allowlist: set[tuple[str, str]] | None = None
+        allowlist_path = os.environ.get("TANYAO_CALL_ALLOWLIST")
+        if allowlist_path:
+            self._call_allowlist = self._load_call_allowlist(allowlist_path)
         # v3 engine dispatch state (agent-scan path): last preset per pid for
         # cmd 50 passthrough, per-pid device-job metadata, and a map of host
         # job ids to device job ids so scan_cancel reaches the agent.
@@ -335,6 +343,52 @@ class AnalysisFacade:
             out["file_offset"] = f"0x{file_offset:x}"
             out["rva"] = out["file_offset"]
         return out
+
+    @staticmethod
+    def _load_call_allowlist(path: str) -> set[tuple[str, str]]:
+        """Host-side mirror of the device allowlist (v1.4 §3.1 line format:
+        'group:module_basename:symbol' or 'module_basename:symbol'). Used for
+        pre-validation and the get_status entries count — the agent-side list
+        remains authoritative."""
+        entries: set[tuple[str, str]] = set()
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) == 3:
+                    entries.add((parts[1], parts[2]))
+                elif len(parts) == 2:
+                    entries.add((parts[0], parts[1]))
+        return entries
+
+    def call_export(self, pid: int, module: str, symbol: str, *, args: list | None = None,
+                    ret_type: str = "u64", probe_ret: bool = False) -> dict:
+        """V1.4 cmd 80: controlled in-process call of an allowlisted export.
+        Double gate (host TANYAO_ALLOW_CALL=1 + agent allowlist); this is an
+        EXPLICITLY AUTHORISED operation on the target — every attempt is
+        audited device-side, and TP anti-cheat may observe the attach."""
+        if not self._call_enabled:
+            raise AgentError(
+                "call_disabled",
+                detail="call_export is disabled; start serve with TANYAO_ALLOW_CALL=1 "
+                       "(explicit authorisation for live-target calls)")
+        args = list(args or [])
+        if len(args) > 8:
+            raise AgentError("bad_request", detail="at most 8 args (x0-x7)")
+        if not self.service.has_agent_cap(AGENT_CAP_CALL_EXPORT):
+            raise AgentError(
+                "unsupported",
+                detail="agent does not declare CALL_EXPORT (bit13); it either predates "
+                       "v1.4 or runs without a call allowlist")
+        if self._call_allowlist is not None:
+            key = (module.rsplit("/", 1)[-1], symbol)
+            if key not in self._call_allowlist:
+                raise AgentError("not_in_allowlist",
+                                 detail=f"{module}:{symbol} is not in the host allowlist")
+        return self.service.call_export(pid, module, symbol, args=args,
+                                        ret_type=ret_type, probe_ret=probe_ret)
 
     # -- memory ----------------------------------------------------------------------
 
