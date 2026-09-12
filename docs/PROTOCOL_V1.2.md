@@ -328,3 +328,14 @@ host 侧选择逻辑只看 hello.capabilities，不做版本号判断。
   符号表金样本；host 单测覆盖帧编解码、CRC 校验失败注入、断点续传。
 - `interop.py` 按能力位条件化：声明了才检查，未声明跳过并记录 `skipped_caps`。
 - 带宽验收指标（真机）见各项目设计文档 `DESIGN_V3_*.md` 的里程碑表。
+
+### §5 附录 v1.2.3（2026-09-10，D17 裁定）
+
+错误 slug 表新增：
+
+| slug | 含义 |
+| --- | --- |
+| `already_running` | 扫描 job 槽已被占用且本次请求不适用同 pid auto-cancel（如不同 pid 的 scan_start 并行、或 running 期间的 refine/status 目标错位）。detail 必须携带当前占用 job 的 `job_id`，供调用方决策（取消或等待） |
+
+同 pid scan_start 的 auto-cancel 语义（v1.1 §7.2）不变；本 slug 只覆盖
+auto-cancel 不适用的并发冲突，取代此前误用的 `bad_request`。
