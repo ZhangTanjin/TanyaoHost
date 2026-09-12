@@ -281,7 +281,7 @@ TOOLS = [
     },
     {
         "name": "strings",
-        "description": "Extract printable-ASCII strings from a module's readable segments (chunked, fault-tolerant) or an explicit address window. Optional regex filter. For large modules (device rejects sync scans over 256MiB) use async=true and poll scan_status/scan_results (kind=strings).",
+        "description": "Extract printable-ASCII strings from a module's readable segments (chunked, fault-tolerant) or an explicit address window. Optional regex filter. Rows carry {address (0x hex), length, value} — NOT a decimal offset. For large modules (device rejects sync scans over 256MiB) use async=true and poll scan_status/scan_results (kind=strings).",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},

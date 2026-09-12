@@ -37,7 +37,8 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
   （bit3 → cmd 61 设备端 dynsym 批量，否则活内存解析回退）
   `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback）
-  `strings`（bit5 → cmd 62 设备端扫描）`dump_module`（bit6 → 设备端落盘 +
+  `strings`（bit5 → cmd 62 设备端扫描；行字段为 `address`/`length`/`value`
+  ——R5 起不再使用十进制 `offset` 旧字段名）`dump_module`（bit6 → 设备端落盘 +
   压缩分块拉取 + sha256 对账 + 显式清理，否则主机分块读重建）
   `pull_apk`（bit6 时走 dump_pull path 变体）`apk_info`（`pid` 或
   `apk_path` 二选一：pid 走 cmd 66 零镜像过网）`watch`

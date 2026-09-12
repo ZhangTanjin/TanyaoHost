@@ -203,6 +203,21 @@ class TestCaps3AgentScan(MatrixBase):
         after = self.facade.scan_results(DEMO_PID)
         self.assertEqual(after["count"], 0)
 
+    def test_scan_results_pagination_pointer(self):
+        """D18: a partial page must carry next_offset; the final page must not."""
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["count"], 4)
+        page1 = self.facade.scan_results(DEMO_PID, offset=0, limit=2)
+        self.assertEqual(len(page1["results"]), 2)
+        self.assertEqual(page1["next_offset"], 2)
+        page2 = self.facade.scan_results(DEMO_PID, offset=2, limit=2)
+        self.assertEqual(len(page2["results"]), 2)
+        self.assertNotIn("next_offset", page2)
+        # limit beyond the hit count: single page, no pointer
+        full = self.facade.scan_results(DEMO_PID, offset=0, limit=32)
+        self.assertNotIn("next_offset", full)
+
     def test_agent_scan_skipped_accounting(self):
         """P1 parity on the device engine: poison hole skipped, later hits kept."""
         self.facade.scan_set_default_ranges(DEMO_PID)

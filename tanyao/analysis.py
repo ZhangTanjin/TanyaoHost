@@ -470,8 +470,15 @@ class AnalysisFacade:
 
         job_id = self._jobs.start(pid, kind, run, cancel_event=cancel_event)
         self._agent_job_map[job_id] = dev_job
-        return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
-                "async": True, "poll": "scan_status"}
+        out = {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
+               "async": True, "poll": "scan_status"}
+        engine = self._scans.get(pid)
+        if engine and engine.state.ranges:
+            # D18: volume estimate — all_readable-class scans announce their
+            # size up front (device total_bytes arrives via scan_status)
+            out["ranges"] = len(engine.state.ranges)
+            out["total_bytes_estimate"] = sum(e - s for s, e in engine.state.ranges)
+        return out
 
     def compute_preset_ranges(self, pid: int, preset: str) -> tuple[list[tuple[int, int]], dict]:
         """Single truth for preset → range selection (D13/D14: every consumer
@@ -705,17 +712,28 @@ class AnalysisFacade:
         return engine.summary() | {"found": found, "engine": "host-scan"}
 
     def scan_results(self, pid: int, *, offset: int = 0, limit: int = 256) -> dict:
+        """D18: truncation must be explicit — when more hits exist beyond this
+        page the response carries next_offset; truncated stays at top level.
+        Silent tail-drops are never OK."""
         if self._agent_scan_enabled(pid):
             meta = self._agent_scan_meta.get(pid)
             if meta is None:
                 raise AgentError("bad_request", detail="no scan for this pid")
             st = self.service.agent_scan_status(meta["dev_job"])
             summary = self._agent_summary(pid, st, meta)
-            return summary | {"results": self._agent_results_page(meta["dev_job"], offset, limit)}
+            results = self._agent_results_page(meta["dev_job"], offset, limit)
+            out = summary | {"results": results}
+            if offset + len(results) < int(summary.get("count", 0)):
+                out["next_offset"] = offset + len(results)
+            return out
         engine = self._scans.get(pid)
         if engine is None:
             raise AgentError("bad_request", detail="no scan for this pid")
-        return engine.summary() | {"results": engine.results(offset, limit), "engine": "host-scan"}
+        results = engine.results(offset, limit)
+        out = engine.summary() | {"results": results, "engine": "host-scan"}
+        if offset + len(results) < engine.state.count:
+            out["next_offset"] = offset + len(results)
+        return out
 
     def scan_clear(self, pid: int) -> dict:
         if self._agent_scan_enabled(pid):
