@@ -276,3 +276,44 @@ class TestF5Entropy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMirrorAnnotation(unittest.TestCase):
+    """R5 residual: whole-file mirror segments are flagged and excluded from
+    the load_base anchor (field: lolm libil2cpp seg0 — 207MB r--p offset-0
+    whole-file image far from the real loader segments)."""
+
+    def test_mirror_flag_and_load_base(self):
+        from tanyao.mapsview import MapsView
+        from collections import namedtuple
+        Map = namedtuple("Map", "start end file_offset flags path")
+        P = "/data/app/~~x/com.tencent.lolm/lib/arm64/libil2cpp.so"
+        R, X, RW, PRIV = 1, 4, 3, 8
+        maps = [
+            Map(0x70F39CD000, 0x7100000000, 0x0, R | PRIV, P),
+            Map(0x728D53B000, 0x72990BC000, 0x0, X | PRIV, P),
+            Map(0x72990BF000, 0x729943E000, 0xBB80000, R | PRIV, P),
+            Map(0x7299441000, 0x7299B5C000, 0xBEFE000, RW | PRIV, P),
+        ]
+        view = MapsView.from_maps(maps)
+        v = view.modules["libil2cpp.so"]
+        self.assertTrue(v.segments[0].mirror, "offset-0 r--p duplicate of the exec mapping is a mirror")
+        self.assertFalse(v.segments[1].mirror)
+        self.assertFalse(v.segments[2].mirror)
+        self.assertEqual(v.load_base, 0x728D53B000, "load_base skips the mirror")
+        self.assertEqual(v.first_map, 0x70F39CD000, "first_map keeps the absolute first")
+
+    def test_no_mirror_without_exec_duplicate(self):
+        from tanyao.mapsview import MapsView
+        from collections import namedtuple
+        Map = namedtuple("Map", "start end file_offset flags path")
+        P = "/system/lib64/libdemo.so"
+        R, X, PRIV = 1, 4, 8
+        maps = [
+            Map(0x700000, 0x701000, 0x0, R | PRIV, P),
+            Map(0x701000, 0x708000, 0x1000, X | PRIV, P),
+        ]
+        view = MapsView.from_maps(maps)
+        v = view.modules["libdemo.so"]
+        self.assertFalse(any(s.mirror for s in v.segments))
+        self.assertEqual(v.load_base, 0x700000)

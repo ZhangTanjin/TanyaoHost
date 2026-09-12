@@ -27,6 +27,25 @@ def _is_anonymous_path(path: str) -> bool:
     return not path or path.startswith("[")
 
 
+def _mark_mirrors(segments: list["Segment"]) -> None:
+    """Flag whole-file mirror mappings (R5 residual note).
+
+    A loader's PT_LOADs never share a page-aligned file offset, so when
+    several mappings of one module do, the executable member is the loader
+    layout and the non-exec duplicates are whole-file mirrors the target
+    mmapped for its own purposes (field: lolm libil2cpp's 207MB r--p
+    offset-0 image far away from the real load segments)."""
+    by_offset: dict[int, list[Segment]] = {}
+    for s in segments:
+        by_offset.setdefault(s.file_offset & ~0xFFF, []).append(s)
+    for group in by_offset.values():
+        if len(group) < 2 or not any(s.flags & MAP_EXEC for s in group):
+            continue
+        for s in group:
+            if not (s.flags & MAP_EXEC):
+                s.mirror = True
+
+
 @dataclass(slots=True)
 class Segment:
     start: int
@@ -34,6 +53,7 @@ class Segment:
     file_offset: int
     flags: int
     path: str = ""
+    mirror: bool = False
 
     @property
     def size(self) -> int:
@@ -60,6 +80,16 @@ class ModuleView:
     @property
     def first_map(self) -> int:
         return self.segments[0].start
+
+    @property
+    def load_base(self) -> int:
+        """First non-mirror segment — the loader-layout anchor consumers
+        should prefer for base/rva arithmetic. Falls back to first_map when
+        nothing is (or everything is) marked."""
+        for s in self.segments:
+            if not s.mirror:
+                return s.start
+        return self.first_map
 
     @property
     def max_end(self) -> int:
@@ -109,6 +139,7 @@ class MapsView:
                 view.segments.append(seg)
         for view in modules.values():
             view.segments.sort(key=lambda s: s.start)
+            _mark_mirrors(view.segments)
         anonymous.sort(key=lambda s: s.start)
         return cls(modules=modules, anonymous=anonymous)
 

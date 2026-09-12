@@ -169,7 +169,9 @@ class AnalysisFacade:
             modules.append({
                 "name": v.name,
                 "path": v.path,
-                "base": f"0x{v.first_map:x}",
+                "base": f"0x{v.load_base:x}",
+                "first_map": f"0x{v.first_map:x}",
+                "mirror_present": any(s.mirror for s in v.segments),
                 "segments": [
                     {
                         "start": f"0x{s.start:x}",
@@ -177,6 +179,7 @@ class AnalysisFacade:
                         "size": s.size,
                         "file_offset": f"0x{s.file_offset:x}",
                         "permissions": s.flags_str(),
+                        "mirror": s.mirror,
                     }
                     for s in v.segments
                 ],
@@ -189,11 +192,15 @@ class AnalysisFacade:
         }
 
     def resolve_module(self, pid: int, name: str) -> dict:
-        maps = self.service.target_maps(pid)
-        module_maps = [m for m in maps if self._module_of(m.path) == name]
-        if not module_maps:
+        view = MapsView.from_maps(self.service.target_maps(pid))
+        v = view.modules.get(name)
+        if v is None:
             raise AgentError("not_found", detail=f"module {name!r} not mapped in pid {pid}")
-        first = min(module_maps, key=lambda m: m.start)
+        # Mirror segments carry a valid ELF header too (whole-file image), but
+        # PT_LOAD arithmetic describes the loader layout — anchor on the first
+        # non-mirror segment when one exists.
+        segs = [s for s in v.segments if not s.mirror] or v.segments
+        first = segs[0]
         header_size = 0x1000
         data = self.service.mem_read(pid, first.start, min(header_size, first.size))
         try:
@@ -201,9 +208,7 @@ class AnalysisFacade:
         except ElfParseError as exc:
             return {"pid": pid, "module": name, "first_map": f"0x{first.start:x}", "error": str(exc)}
         base = first.start
-        mirror = any(
-            m.file_offset == 0 and m.start != base and m.size >= first.size * 2 for m in module_maps
-        )
+        mirror = any(s.mirror for s in v.segments)
         load_bias_abs = base - info.load_bias  # ELF-arithmetic anchor (legacy field)
         bss = None
         if info.bss_end:
@@ -213,7 +218,7 @@ class AnalysisFacade:
             # mappings — on multi-bias modules the single-anchor arithmetic
             # spills into a neighbor's territory (field: lolm libil2cpp BSS end
             # landing inside libunity.so)
-            module_hi = max(m.end for m in module_maps)
+            module_hi = max(s.end for s in segs)
             if bss_lo < module_hi:
                 bss = [f"0x{bss_lo:x}", f"0x{min(bss_hi, module_hi):x}"]
         return {
