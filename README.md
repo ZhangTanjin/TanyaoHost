@@ -27,7 +27,9 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   `agent_build`）`find_process`（默认 exact 须完整包名；agent 声明 bit10 时
   `mode="substring"` 支持短名，多命中带 `matches` 计数）
   `list_processes` `list_modules`
-  `resolve_module`（ELF load bias/BSS/mirror）`address_resolve`（RVA）
+  `resolve_module`（全段表 + 每段 translation_base；load_bias 在 mirror/
+  多 bias 布局下为 null+ambiguous——换算请用 disassemble 自报 rva 或
+  translation_base）`address_resolve`（rva=映射表文件偏移，带自洽断言）
 - 内存：`read_memory`（原始/typed）`read_batch`（批量）`write_bytes`
   （双门禁 + expect-old/verify；agent 声明 bit1 时单往返走 cmd 60，门禁仍在 host）
 - 扫描：`scan_set_default_ranges`（preset）`scan_value` `scan_hex`
@@ -40,7 +42,8 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   默认掩顶两字节）
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
   （bit3 → cmd 61 设备端 dynsym 批量，否则活内存解析回退）
-  `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback）
+  `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback；
+  自报 rva 是 runtime↔文件偏移换算的权威基准）
   `strings`（bit5 → cmd 62 设备端扫描；行字段为 `address`/`length`/`value`
   ——R5 起不再使用十进制 `offset` 旧字段名）`dump_module`（bit6 → 设备端落盘 +
   压缩分块拉取 + sha256 对账 + 显式清理，否则主机分块读重建）

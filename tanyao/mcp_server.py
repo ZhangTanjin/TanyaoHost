@@ -79,7 +79,7 @@ TOOLS = [
     },
     {
         "name": "resolve_module",
-        "description": "Resolve a mapped module's ELF semantics: first mapping, load bias, BSS bounds, mirror detection.",
+        "description": "Resolve a mapped module's ELF semantics: full segment table (translation_base per segment), load bias (null + load_bias_ambiguous on mirror/multi-anchor layouts — do not use it as a conversion base there), BSS bounds, mirror detection.",
         "inputSchema": _obj({"pid": {"type": "integer"}, "name": {"type": "string"}}, ["pid", "name"]),
     },
     {
@@ -309,7 +309,7 @@ TOOLS = [
     },
     {
         "name": "disassemble",
-        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. Use dump_module + decompile/Ghidra for full-fidelity analysis.",
+        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile/Ghidra for full-fidelity analysis.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
