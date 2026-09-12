@@ -84,7 +84,7 @@ TOOLS = [
     },
     {
         "name": "address_resolve",
-        "description": "Resolve which module/mapping contains an address; returns module offset and RVA.",
+        "description": "Resolve which module/mapping contains an address. Returns module, file_offset and rva — ALL tool-face rva fields are FILE OFFSETS (same as dump manifests). Addition identity: address == bearing_segment.translation_base + rva; adding load_bias works only when it equals the bearing segment's translation_base (multi-bias segments like .data.rel.ro will drift).",
         "inputSchema": _obj({"pid": {"type": "integer"}, "address": {"type": "string", "description": "0x hex address"}}, ["pid", "address"]),
     },
     {
@@ -322,7 +322,7 @@ TOOLS = [
     },
     {
         "name": "disassemble",
-        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile/Ghidra for full-fidelity analysis.",
+        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method; address == bearing_segment.translation_base + rva) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile/Ghidra for full-fidelity analysis.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},

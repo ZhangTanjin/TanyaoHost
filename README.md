@@ -40,6 +40,12 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
 - 观测/检索（R5 新增）：`watch_many`（多地址批量采样，MEM_READV 编排）
   `pointers_to`（找指向给定地址的指针——u64 扫描语义化封装，strip_pac
   默认掩顶两字节）
+- 换算（R8/D20）：`resolve_rva(pid, module, rva|file_offset)` —— 逆向
+  file-offset/vaddr → runtime（vaddr 走活体 phdr 换算，服务 R4 时代
+  vaddr 口径离线记录的复核）；**全工具面 rva 字段 = 文件偏移**，
+  加法恒等式 `address == 承载段.translation_base + rva`（用 load_bias
+  加法仅当其等于承载段 tb；R4 历史 "RVA" 为 vaddr 口径，复现旧记录时
+  注意 0x4000 类漂移坑）
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
   （bit3 → cmd 61 设备端 dynsym 批量，否则活内存解析回退）
   `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback；
