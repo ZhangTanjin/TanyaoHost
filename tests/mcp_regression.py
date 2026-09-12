@@ -481,9 +481,22 @@ def main() -> int:
             and isinstance(pt["targets"][0]["found"], int)
             and pt.get("ranges", 0) >= 1, str(pt)[:200]))
         if caps_mask & 2048:  # bit11 SCAN_VALUES
-            check("v1.3: pointers_to single values[] round trip", lambda: assert_true(
-                pt.get("scans") == 1 and pt.get("match") == "exact-u64",
-                f"scans={pt.get('scans')} match={pt.get('match')}"))
+            # values[] is exact-u64 (no PAC masking); strip_pac routes to the
+            # AOB+wildcard path (also 1 scan for a single target). Exercise the
+            # values[] path explicitly, single AND multi target.
+            ptv = call_tool("pointers_to", {"pid": pid, "addresses": [pthread_addr],
+                                            "module": "libc.so", "limit": 16,
+                                            "strip_pac": False})
+            check("v1.3: pointers_to values[] exact-u64", lambda: assert_true(
+                ptv.get("scans") == 1 and ptv.get("match") == "exact-u64",
+                f"scans={ptv.get('scans')} match={ptv.get('match')}"))
+            ptm = call_tool("pointers_to", {"pid": pid,
+                                            "addresses": [pthread_addr, "0x10", "0x20"],
+                                            "module": "libc.so", "limit": 16,
+                                            "strip_pac": False})
+            check("v1.3: pointers_to multi-target single round trip", lambda: assert_true(
+                ptm.get("scans") == 1 and len(ptm.get("targets", [])) == 3,
+                f"scans={ptm.get('scans')} targets={len(ptm.get('targets', []))}"))
         if caps_mask & 1024:  # bit10 FUZZY_FIND
             def v13_fuzzy_find():
                 out = call_tool("find_process", {"name": "surfaceflinger",

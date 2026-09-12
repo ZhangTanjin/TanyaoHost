@@ -164,8 +164,7 @@ class AnalysisFacade:
                         "(e.g. com.tencent.lolm); short names (lolm) are not matched")
                 if self.service.has_agent_cap(AGENT_CAP_FUZZY_FIND):
                     hint += " — or retry with mode='substring' for short names"
-                else:
-                    hint += " — call list_processes to enumerate pids"
+                hint += " — or call list_processes to enumerate pids"
                 return {"pid": None, "found": False, "hint": hint}
             raise
 

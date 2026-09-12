@@ -245,7 +245,8 @@ agent 层能力位与内核 `backend_info.capabilities` 分开命名空间，从
 | 1 | WRITE_TXN | cmd 60（写入事务） |
 
 host 从 hello 读 `capabilities`；未声明的 cmd 一律得到 `unsupported_cmd`
-（不断开）。v1.2 增量位（bit2 起）见 `docs/PROTOCOL_V1.2_DRAFT.md`。
+（不断开）。v1.2 增量位（bit3 起；bit2 永久弃用）见 `docs/PROTOCOL_V1.2.md`；
+**v1.3 已定版（2026-09-12）**：bit8 反汇编（capstone on device）、bit10 模糊 find（cmd 40 mode=substring）、bit11 多值扫描（cmd 50 values[]）、bit12 packed bind（24B entry）——规范正文见 `docs/PROTOCOL_V1.3.md`，联合回归 51/51。
 
 ### 7.2 cmd 50 scan_start（异步，agent 后台线程执行）
 

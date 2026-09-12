@@ -1,7 +1,13 @@
-# Tanyao Agent 线协议 v1.3 草案（模糊 find / packed bind / 多值指针扫描）
+# Tanyao Agent 线协议 v1.3（模糊 find / packed bind / 多值指针扫描，定版）
 
-> 状态：**草案**（2026-09-12 架构师起草，用户批准推进）——双端实现并真机
-> 联合回归后定版，届时并入 `PROTOCOL.md` 索引并转正为 `PROTOCOL_V1.3.md`。
+> 状态：**已定版（2026-09-12）**——双端实现完成（设备 bit8/10/11/12 四提交、
+> 主机五提交），真机联合回归 **51/51**（caps 0x1ffb 全能力位在位；v1.3 三
+> 用例：substring 模糊 find、pointers_to values[] exact-u64 单往返、多目标
+> 单往返 scans==1）。勘误：初稿两处 “cmd 44” 为笔误，process_find 实为
+> **cmd 40**（实现按 cmd 40 mode 字段落地）。与 `PROTOCOL.md`（v1/v1.1）+
+> `PROTOCOL_V1.2.md` 共同构成现行规范。
+> 遗留记账：agent hello `version` 升 "1.3.0" 随下次设备端发版；bit2
+> MODULE_STREAM 位维持永久弃用。
 > 基线：v1.2（`PROTOCOL_V1.2.md`）+ 附录 v1.2.1/2/3。全部为纯增量，v1.2
 > 语义不变；新能力位协商，旧组合行为不变。
 
@@ -17,7 +23,7 @@
 
 | bit | 名称 | 含义 |
 | --- | --- | --- |
-| 10 | FUZZY_FIND | cmd 44 支持子串匹配（§2.1） |
+| 10 | FUZZY_FIND | cmd 40 支持子串匹配（§2.1） |
 | 11 | SCAN_VALUES | cmd 50 支持 `values[]` 多值扫描（§2.3） |
 | 12 | PACKED_BIND | cmd 61 packed entry 携带 bind（§2.2） |
 
@@ -25,7 +31,7 @@ cmd 67（bit8）与本草案无关，随 capstone vendor 独立启用。
 
 ## 2. 新语义
 
-### 2.1 cmd 44 process_find 模糊匹配（bit10）
+### 2.1 cmd 40 process_find 模糊匹配（bit10）
 
 - 请求新增可选 `"mode":"exact|substring"`（默认 exact，现状语义）。
 - `substring`：agent 以 root 读 `/proc/<pid>/cmdline`（NUL 截断到首段），
