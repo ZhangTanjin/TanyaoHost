@@ -21,7 +21,7 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   `build` 构建标识）见 PROTOCOL.md §7.2
 - 设备端 agent：`ZhangTanjin/TanyaoCli` 仓库（`src/agent/`）
 
-## 能力面（29 个 MCP 工具，v3 按能力位自动分派）
+## 能力面（31 个 MCP 工具，v3 按能力位自动分派）
 
 - 侦察：`get_status`（含 `agent_capabilities`/`skipped_caps`）`find_process`
   （name 须为完整包名/cmdline，短名不匹配——O4 短期口径；模糊匹配为 V1.3 候选）
@@ -34,6 +34,9 @@ AI / MCP 客户端 ──MCP stdio──▶ tanyao.mcp_server (Python)
   `scan_clear`
   —— agent 声明 bit0 时走设备端扫描引擎（cmd 50–55，只回传命中），
   否则回退主机引擎（冻结基线）：容错分区读、PFNMAP 自动跳过、死区粒度升级
+- 观测/检索（R5 新增）：`watch_many`（多地址批量采样，MEM_READV 编排）
+  `pointers_to`（找指向给定地址的指针——u64 扫描语义化封装，strip_pac
+  默认掩顶两字节）
 - 分析：`resolve_offset_chain`（PAC 剥离）`symbol_list`/`symbol_find`
   （bit3 → cmd 61 设备端 dynsym 批量，否则活内存解析回退）
   `disassemble`（bit8 → 设备端 capstone；否则 capstone/子集 fallback）
