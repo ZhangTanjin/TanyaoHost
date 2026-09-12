@@ -437,6 +437,7 @@ class TanyaoService:
         kind: str,
         type: str | None = None,
         value=None,
+        values: list | None = None,
         pattern: str | None = None,
         epsilon: float = 0.0,
         alignment: int = 0,
@@ -463,7 +464,10 @@ class TanyaoService:
                 payload["preset"] = preset or "anon"
             if type:
                 payload["type"] = type
-            if value is not None:
+            if values:
+                # v1.3 §2.3 (bit11): multi-value scan; mutually exclusive with value
+                payload["values"] = list(values)
+            elif value is not None:
                 payload["value"] = value
             if pattern:
                 payload["pattern"] = pattern

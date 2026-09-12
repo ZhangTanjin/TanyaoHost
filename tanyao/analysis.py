@@ -20,6 +20,7 @@ from .connection import AgentError
 from .constants import (
     AGENT_CAP_APK_INFO,
     AGENT_CAP_FUZZY_FIND,
+    AGENT_CAP_SCAN_VALUES,
     b64_decode,
     AGENT_CAP_DISASSEMBLE,
     AGENT_CAP_DUMP_PIPELINE,
@@ -869,37 +870,68 @@ class AnalysisFacade:
 
         agent_route = self._scan_route(pid) == "agent"
         engine_tag = "agent-scan" if agent_route else "host-scan"
-        out_targets = []
-        for t in targets:
-            pattern_str, pattern, mask = to_pattern(t)
-            pointers: list[dict] = []
-            if agent_route:
+        # V1.3 §2.3 (bit11): single multi-value round trip when the agent
+        # declares SCAN_VALUES. Typed u64 matching is exact — PAC-tagged
+        # pointers only match on the hex-fallback path (strip_pac wildcards).
+        use_values = agent_route and self.service.has_agent_cap(AGENT_CAP_SCAN_VALUES) \
+            and not strip_pac
+        out_targets = [{"address": f"0x{t:x}", "found": 0, "pointers": []}
+                       for t in targets]
+        scans = 0
+        if use_values:
+            resp = self.service.agent_scan_start(
+                pid, kind="value", type="u64", values=targets, alignment=8,
+                preset=wire_preset, ranges=ranges_payload)
+            scans = 1
+            self._agent_wait(int(resp["job_id"]))
+            page = self.service.agent_scan_results(0, limit)
+            for h in page.get("hits", []):
+                vi = int(h.get("value_index", 0))
+                if 0 <= vi < len(out_targets):
+                    out_targets[vi]["pointers"].append(
+                        {"address": str(h["address"]), "value": h.get("value")})
+                    out_targets[vi]["found"] += 1
+            match_mode = "exact-u64"
+        elif agent_route:
+            for t in targets:
+                pattern_str, _pattern, _mask = to_pattern(t)
                 resp = self.service.agent_scan_start(
                     pid, kind="hex", pattern=pattern_str,
                     preset=wire_preset, ranges=ranges_payload)
-                dev_job = int(resp["job_id"])
-                self._agent_wait(dev_job)
+                scans += 1
+                self._agent_wait(int(resp["job_id"]))
                 page = self.service.agent_scan_results(0, limit)
                 for h in page.get("hits", []):
-                    pointers.append({"address": str(h["address"]),
-                                     "value": h.get("value_hex", h.get("value"))})
-            else:
-                backend = self.service.backend_info()
-                engine = ScanEngine(self.service.mem_read,
-                                    max_transfer=backend.max_transfer_size,
-                                    readv_fn=self.service.mem_readv,
-                                    max_iov=backend.max_iov)
-                engine.set_ranges(pid, region_ranges)
+                    out_targets[targets.index(t)]["pointers"].append(
+                        {"address": str(h["address"]),
+                         "value": h.get("value_hex", h.get("value"))})
+                out_targets[targets.index(t)]["found"] = len(
+                    out_targets[targets.index(t)]["pointers"])
+            match_mode = "pattern+pac-wildcard" if strip_pac else "pattern-exact"
+        else:
+            backend = self.service.backend_info()
+            engine = ScanEngine(self.service.mem_read,
+                                max_transfer=backend.max_transfer_size,
+                                readv_fn=self.service.mem_readv,
+                                max_iov=backend.max_iov)
+            engine.set_ranges(pid, region_ranges)
+            for t in targets:
+                pattern_str, pattern, mask = to_pattern(t)
+                scans += 1
                 engine.scan_hex(pid, pattern, mask)
                 for h in engine.results(0, limit):
-                    pointers.append({"address": h["address"], "value": h["value"]})
-            out_targets.append({"address": f"0x{t:x}", "found": len(pointers),
-                                "pointers": pointers})
+                    out_targets[targets.index(t)]["pointers"].append(
+                        {"address": h["address"], "value": h["value"]})
+                out_targets[targets.index(t)]["found"] = len(
+                    out_targets[targets.index(t)]["pointers"])
+            match_mode = "pattern+pac-wildcard" if strip_pac else "pattern-exact"
         return {
             "pid": pid,
             "targets": out_targets,
             "strip_pac": strip_pac,
             "ranges": len(region_ranges),
+            "scans": scans,
+            "match": match_mode,
             "engine": engine_tag,
         }
 

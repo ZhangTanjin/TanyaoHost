@@ -1257,11 +1257,29 @@ class MockAgent:
             vtype = payload.get("type")
             if vtype not in SCAN_TYPES:
                 raise ProtocolFail("bad_request", detail=f"unknown scan type {vtype!r}")
-            value = payload.get("value")
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise ProtocolFail("bad_request", detail="value must be a number")
             spec["type"] = vtype
-            spec["value"] = float(value) if isinstance(value, float) else int(value)
+            values_raw = payload.get("values")
+            if values_raw is not None and self.agent_caps & AGENT_CAP_SCAN_VALUES:
+                # v1.3 §2.3: multi-value scan (mutually exclusive with value)
+                if not isinstance(values_raw, list) or not values_raw:
+                    raise ProtocolFail("bad_request", detail="values must be a non-empty array")
+                if len(values_raw) > 64:
+                    raise ProtocolFail("bad_request", detail="values exceeds 64 entries")
+                spec["values"] = [
+                    float(v) if isinstance(v, float) else int(v)
+                    for v in values_raw
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ]
+                if len(spec["values"]) != len(values_raw):
+                    raise ProtocolFail("bad_request", detail="values entries must be numbers")
+            elif values_raw is not None:
+                # undeclared: old agents would reject kind=value without `value`
+                raise ProtocolFail("bad_request", detail="value required")
+            else:
+                value = payload.get("value")
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ProtocolFail("bad_request", detail="value must be a number")
+                spec["value"] = float(value) if isinstance(value, float) else int(value)
         elif kind == "hex":
             pattern = payload.get("pattern")
             if not isinstance(pattern, str) or not pattern.strip():
@@ -1364,6 +1382,7 @@ class MockAgent:
         kept: list[dict] = []
         if job.spec["kind"] == "value":
             fmt, size, is_float = SCAN_TYPES[job.spec["type"]]
+            values = job.spec.get("values")
             unpack = struct.Struct(fmt).unpack_from
             for hit in job.hits:
                 try:
@@ -1372,7 +1391,11 @@ class MockAgent:
                     continue  # unreadable now -> drop (host parity)
                 new = unpack(data)[0]
                 old = hit["value"]
-                if mode == "eq":
+                if mode == "eq" and values is not None:
+                    ok = any(_mock_match(new, v, eps) for v in values)
+                elif mode == "neq" and values is not None:
+                    ok = not any(_mock_match(new, v, eps) for v in values)
+                elif mode == "eq":
                     ok = value is not None and _mock_match(new, value, eps)
                 elif mode == "neq":
                     ok = value is not None and not _mock_match(new, value, eps)
@@ -1416,6 +1439,9 @@ class MockAgent:
         else:
             hits = [{"address": hx(h["address"]), "value": h["value"],
                      "value_hex": "0x" + h["raw"].hex()} for h in job.hits[begin:end]]
+            if job.spec.get("values") is not None:
+                for k, h in zip(range(begin, end), job.hits[begin:end]):
+                    hits[k]["value_index"] = h.get("value_index", 0)
         return {"job_id": job.id, "count": end - begin, "total": len(job.hits),
                 "truncated": job.truncated, "hits": hits}
 
@@ -1511,12 +1537,24 @@ class MockAgent:
             fmt, size, _is_float = SCAN_TYPES[job.spec["type"]]
             align = job.spec["alignment"] or size
             unpack = struct.Struct(fmt).unpack_from
-            want = job.spec["value"]
+            want = job.spec.get("value")
+            values = job.spec.get("values")
             eps = job.spec["epsilon"]
             i = (align - (pos % align)) % align
             while i + size <= len(data):
                 found = unpack(data, i)[0]
-                if _mock_match(found, want, eps):
+                if values is not None:
+                    # v1.3 §2.3: record on ANY member, with the matched index
+                    idx = next((k for k, v in enumerate(values)
+                                if _mock_match(found, v, eps)), None)
+                    if idx is not None:
+                        if len(job.hits) < SCAN_MAX_HITS:
+                            job.hits.append({"address": pos + i, "value": found,
+                                             "value_index": idx,
+                                             "raw": _raw8(found, fmt, size)})
+                        else:
+                            job.truncated = True
+                elif _mock_match(found, want, eps):
                     if len(job.hits) < SCAN_MAX_HITS:
                         job.hits.append({"address": pos + i, "value": found,
                                          "raw": _raw8(found, fmt, size)})

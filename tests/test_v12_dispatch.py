@@ -445,6 +445,87 @@ class TestV13FuzzyFind(unittest.TestCase):
         self.assertIn("FUZZY_FIND", str(ctx.exception))
 
 
+class TestV13ScanValues(unittest.TestCase):
+    """V1.3 bit11 SCAN_VALUES: values[] multi-value scan + pointers_to single
+    round trip."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 11))
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def setUp(self):
+        self.service = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        self.facade = AnalysisFacade(self.service)
+        self.service.connect()
+
+    def tearDown(self):
+        self.service.close()
+
+    def _wait(self, dev_job, timeout=10.0):
+        deadline = time.time() + timeout
+        st = {}
+        while time.time() < deadline:
+            st = self.service.agent_scan_status(dev_job)
+            if st.get("state") != "running":
+                return st
+            time.sleep(0.02)
+        raise AssertionError("job timeout")
+
+    def test_values_scan_hits_carry_value_index(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        resp = self.service.agent_scan_start(
+            DEMO_PID, kind="value", type="u32", values=[1337, 424242],
+            alignment=4, preset="anon")
+        st = self._wait(int(resp["job_id"]))
+        self.assertEqual(st["state"], "done", st.get("error"))
+        page = self.service.agent_scan_results(0, 64)
+        idx = [h.get("value_index") for h in page["hits"]]
+        self.assertEqual(len(idx), 5)
+        self.assertEqual(idx.count(0), 4)  # 1337 ×4
+        self.assertEqual(idx.count(1), 1)  # 424242 ×1
+
+    def test_pointers_to_single_roundtrip_with_bit11(self):
+        import struct as _struct
+        target = HEAP_START + 0x400
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x100, _struct.pack("<Q", target))
+        out = self.facade.pointers_to(
+            DEMO_PID, [target],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=False)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["scans"], 1)  # single values[] round trip
+        self.assertEqual(out["match"], "exact-u64")
+        self.assertEqual(out["targets"][0]["found"], 1)
+        self.assertEqual(out["targets"][0]["pointers"][0]["address"], hx(HEAP_START + 0x100))
+
+    def test_pointers_to_multi_targets_one_scan(self):
+        import struct as _struct
+        t1, t2 = HEAP_START + 0x400, HEAP_START + 0x488
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x100, _struct.pack("<Q", t1))
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x300, _struct.pack("<Q", t2))
+        out = self.facade.pointers_to(
+            DEMO_PID, [t1, t2],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=False)
+        self.assertEqual(out["scans"], 1)
+        found = {t["address"]: t["found"] for t in out["targets"]}
+        self.assertEqual(found[hex(t1)], 1)
+        self.assertEqual(found[hex(t2)], 1)
+
+    def test_strip_pac_prefers_hex_wildcard_path(self):
+        out = self.facade.pointers_to(
+            DEMO_PID, [HEAP_START + 0x400],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=True)
+        self.assertEqual(out["match"], "pattern+pac-wildcard")
+        self.assertGreaterEqual(out["scans"], 1)
+
+
 class TestCaps1FFFullPipeline(MatrixBase):
     """caps=0x1ff: dump pipeline, apk_info(pid), disassemble, write_txn all on
     the device; host keeps gate/policy and verifies integrity end to end."""
