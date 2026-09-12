@@ -391,6 +391,60 @@ class TestCaps3BSymbolsStrings(MatrixBase):
         self.assertIn("length", hits[0])
 
 
+class TestV13FuzzyFind(unittest.TestCase):
+    """V1.3 bit10 FUZZY_FIND: mode=substring consumption + host gating."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent_v13 = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 10))
+        cls.agent_v13.start()
+        cls.agent_legacy = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        cls.agent_legacy.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent_v13.stop()
+        cls.agent_legacy.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_substring_short_name_hits(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("mortal", mode="substring")
+        self.assertEqual(out["pid"], 5000)
+        self.assertEqual(out["mode"], "substring")
+
+    def test_substring_multi_match_reports_count(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("com.", mode="substring")
+        self.assertEqual(out["pid"], 4321)  # lowest matching pid
+        self.assertGreaterEqual(out.get("matches", 0), 2)
+
+    def test_substring_miss_hint_suggests_mode(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("lolm", mode="substring")
+        self.assertFalse(out["found"])
+        self.assertIn("substring", out["hint"])
+
+    def test_exact_mode_unchanged(self):
+        facade = self._facade(self.agent_v13)
+        self.assertEqual(facade.find_process("com.demo.game")["pid"], 4321)
+        miss = facade.find_process("mortal")  # exact: short name still misses
+        self.assertFalse(miss["found"])
+
+    def test_substring_without_bit10_is_structured_error(self):
+        facade = self._facade(self.agent_legacy)
+        with self.assertRaises(AgentError) as ctx:
+            facade.find_process("mortal", mode="substring")
+        self.assertEqual(ctx.exception.error, "bad_request")
+        self.assertIn("FUZZY_FIND", str(ctx.exception))
+
+
 class TestCaps1FFFullPipeline(MatrixBase):
     """caps=0x1ff: dump pipeline, apk_info(pid), disassemble, write_txn all on
     the device; host keeps gate/policy and verifies integrity end to end."""

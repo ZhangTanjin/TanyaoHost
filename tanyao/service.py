@@ -333,10 +333,22 @@ class TanyaoService:
 
     # -- process/module (legacy ops) ---------------------------------------------
 
-    def process_find(self, name: str) -> int:
+    def process_find(self, name: str, *, mode: str = "exact") -> int:
+        return self.process_find_full(name, mode=mode)["pid"]
+
+    def process_find_full(self, name: str, *, mode: str = "exact") -> dict:
+        """cmd 44. mode=substring (v1.3 §2.1, requires agent bit10 FUZZY_FIND):
+        case-sensitive substring match over the agent-walked /proc cmdlines;
+        multi-hit responses carry matches=N (first pid is authoritative)."""
         with self._lock:
-            resp = self._execute(CMD_PROCESS_FIND, {"name": name})
-            return int(resp["pid"])
+            payload: dict = {"name": name}
+            if mode != "exact":
+                payload["mode"] = mode
+            resp = self._execute(CMD_PROCESS_FIND, payload)
+            out = {"pid": int(resp["pid"])}
+            if "matches" in resp:
+                out["matches"] = int(resp["matches"])
+            return out
 
     def process_list(self, bitmap_bytes: int = 8192) -> list[int]:
         with self._lock:

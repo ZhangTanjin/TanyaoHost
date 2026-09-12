@@ -81,6 +81,9 @@ CAP_MAPS = 1 << 5
 AGENT_CAP_SCAN = 1 << 0
 AGENT_CAP_WRITE_TXN = 1 << 1
 AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # v1.2.1: cmd 50 `ranges` support
+AGENT_CAP_FUZZY_FIND = 1 << 10    # v1.3: cmd 44 mode=substring
+AGENT_CAP_SCAN_VALUES = 1 << 11   # v1.3: cmd 50 values[] multi-value scan
+AGENT_CAP_PACKED_BIND = 1 << 12   # v1.3: cmd 61 packed 24B entry with bind
 AGENT_CAP_SYMBOL_BATCH = 1 << 3
 AGENT_CAP_BINARY_FRAMES = 1 << 4
 AGENT_CAP_STRINGS = 1 << 5
@@ -684,10 +687,7 @@ class MockAgent:
                 return {"status": -14, "result_size": "0x0"}
             return {"status": 0, "result_size": hx(len(data))}
         if cmd == CMD_PROCESS_FIND:
-            name = payload.get("name", "")
-            if name == "com.demo.game":
-                return {"pid": DEMO_PID}
-            raise ProtocolFail("not_found", detail=name)
+            return self._process_find(payload)
         if cmd == CMD_PROCESS_LIST:
             pids = [DEMO_PID, 1]
             if self.mortal_alive:
@@ -962,6 +962,43 @@ class MockAgent:
                                  "mnemonic": parts[0],
                                  "op_str": parts[1] if len(parts) > 1 else ""})
         return {"engine": "capstone", "count": len(instructions), "instructions": instructions}
+
+    # -- cmd 44 process_find (v1.3 §2.1 reference implementation) -----------------
+
+    def _alive_process_names(self):
+        """(pid, cmdline) pairs visible to the agent; the mortal process only
+        while alive (process_list parity)."""
+        alive = [(1, "init"), (DEMO_PID, "com.demo.game")]
+        if self.mortal_alive:
+            alive.append((MORTAL_PID, "com.example.mortal"))
+        return alive
+
+    def _process_find(self, payload):
+        name = payload.get("name", "")
+        if not isinstance(name, str) or not name:
+            raise ProtocolFail("bad_request", detail="name required")
+        mode = payload.get("mode", "exact")
+        if mode not in ("exact", "substring"):
+            raise ProtocolFail("bad_request", detail=f"unknown mode {mode!r}")
+        if mode == "substring" and not self.agent_caps & AGENT_CAP_FUZZY_FIND:
+            # v1.2-and-older agents ignore the unknown field and fall back to
+            # exact semantics silently — the reference implementation models
+            # exactly that (host gates substring behind bit10 anyway)
+            mode = "exact"
+        alive = sorted(self._alive_process_names())
+        if mode == "substring":
+            # case-sensitive substring over /proc/<pid>/cmdline first segment
+            hits = [(pid, n) for pid, n in alive if name in n]
+            if not hits:
+                raise ProtocolFail("not_found", detail=name)
+            resp = {"pid": hits[0][0]}
+            if len(hits) > 1:
+                resp["matches"] = len(hits)  # >1: caller should narrow the term
+            return resp
+        for pid, n in alive:
+            if n == name:
+                return {"pid": pid}
+        raise ProtocolFail("not_found", detail=name)
 
     # -- device-local scan engine (PROTOCOL.md §7 reference implementation) ------
 

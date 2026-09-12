@@ -19,6 +19,7 @@ from typing import Any
 from .connection import AgentError
 from .constants import (
     AGENT_CAP_APK_INFO,
+    AGENT_CAP_FUZZY_FIND,
     b64_decode,
     AGENT_CAP_DISASSEMBLE,
     AGENT_CAP_DUMP_PIPELINE,
@@ -138,22 +139,33 @@ class AnalysisFacade:
 
     # -- process / module ----------------------------------------------------------
 
-    def find_process(self, name: str) -> dict:
+    def find_process(self, name: str, *, mode: str = "exact") -> dict:
+        if mode not in ("exact", "substring"):
+            raise AgentError("bad_request", detail=f"unknown find mode {mode!r}")
+        if mode == "substring" and not self.service.has_agent_cap(AGENT_CAP_FUZZY_FIND):
+            # no silent degrade to exact: the caller asked for fuzzy semantics
+            raise AgentError(
+                "bad_request",
+                detail="agent does not declare FUZZY_FIND (bit10); use the full "
+                       "package/process name or list_processes instead")
         try:
-            return {"pid": self.service.process_find(name)}
+            # V1.3 §2.1: multi-match carries matches=N — surfaced so the AI
+            # can narrow the term instead of guessing on the first hit
+            out = self.service.process_find_full(name, mode=mode)
+            if mode == "substring":
+                out["mode"] = "substring"
+            return out
         except AgentError as exc:
             if exc.error == "not_found":
-                # O4: the kernel legacy match needs the FULL cmdline name. Guide
-                # the caller instead of auto-retrying or enumerating — parameter
-                # choice stays with the AI (no fuzzy match host-side: cmd 41
-                # returns bare pids without names).
-                return {
-                    "pid": None,
-                    "found": False,
-                    "hint": "use the FULL package/process name as in /proc/<pid>/cmdline "
-                            "(e.g. com.tencent.lolm); short names (lolm) are not matched — "
-                            "call list_processes to enumerate pids",
-                }
+                # O4 lineage: exact match needs the FULL cmdline name; substring
+                # is available when the agent declares bit10 (V1.3 §2.1)
+                hint = ("use the FULL package/process name as in /proc/<pid>/cmdline "
+                        "(e.g. com.tencent.lolm); short names (lolm) are not matched")
+                if self.service.has_agent_cap(AGENT_CAP_FUZZY_FIND):
+                    hint += " — or retry with mode='substring' for short names"
+                else:
+                    hint += " — call list_processes to enumerate pids"
+                return {"pid": None, "found": False, "hint": hint}
             raise
 
     def list_modules(self, pid: int, name_filter: str | None = None) -> dict:

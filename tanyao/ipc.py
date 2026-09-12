@@ -78,7 +78,8 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         "get_status": get_status,
         "ping_agent": lambda p: facade.service.ping(),
         "connect": lambda p: {"backend": facade.service.connect().name},
-        "find_process": lambda p: facade.find_process(str(p["name"])),
+        "find_process": lambda p: facade.find_process(
+            str(p["name"]), mode=str(p.get("mode", "exact"))),
         "list_processes": lambda p: {"pids": facade.service.process_list(int(p.get("bytes", 8192)))},
         "process_alive": lambda p: {"alive": facade.service.process_alive(need_pid(p))},
         "list_modules": lambda p: facade.list_modules(need_pid(p), p.get("filter")),

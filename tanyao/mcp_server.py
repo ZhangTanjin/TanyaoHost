@@ -52,8 +52,14 @@ TOOLS = [
     },
     {
         "name": "find_process",
-        "description": "Find a process PID on the device. 'name' must be the FULL package/process name as shown in /proc/<pid>/cmdline (e.g. com.tencent.lolm); short names (lolm) are NOT matched. If unsure, call list_processes first.",
-        "inputSchema": _obj({"name": {"type": "string", "description": "full package/process name, e.g. com.tencent.lolm"}}, ["name"]),
+        "description": "Find a process PID on the device. Default (mode=exact): 'name' must be the FULL package/process name as shown in /proc/<pid>/cmdline (e.g. com.tencent.lolm); short names are NOT matched. mode=substring (needs agent FUZZY_FIND capability) matches case-sensitive substrings — use it for short names like 'lolm'. If unsure, call list_processes first.",
+        "inputSchema": _obj(
+            {
+                "name": {"type": "string", "description": "full package/process name (exact mode) or substring (substring mode)"},
+                "mode": {"type": "string", "description": "exact (default) | substring", "enum": ["exact", "substring"]},
+            },
+            ["name"],
+        ),
     },
     {
         "name": "list_processes",
