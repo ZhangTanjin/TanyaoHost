@@ -122,9 +122,9 @@ def main() -> int:
             "scan_hex", "scan_next", "scan_results", "scan_clear", "dump_module", "watch",
             "disassemble", "strings", "pull_apk", "apk_info",
             "decompile_start", "decompile_status",
-            "watch_many", "pointers_to",
+            "watch_many", "pointers_to", "resolve_rva",
         ])
-        check("mcp: tools/list == 31 expected", lambda: assert_true(
+        check("mcp: tools/list == 32 expected", lambda: assert_true(
             tool_names == expected, f"got {len(tool_names)}: missing="
             f"{set(expected) - set(tool_names)}, extra={set(tool_names) - set(expected)}"))
 
@@ -476,6 +476,12 @@ def main() -> int:
 
         pt = call_tool("pointers_to", {"pid": pid, "addresses": [pthread_addr],
                                        "module": "libc.so", "limit": 16})
+        rr = call_tool("resolve_rva", {"pid": pid, "module": "libc.so",
+                                       "file_offset": "0x1000"})
+        check("D20 resolve_rva: file_offset → runtime self-consistent", lambda: assert_true(
+            int(rr["runtime"], 16) == int(rr["segment"]["translation_base"], 16) + 0x1000
+            and rr["used"] == "file_offset", str(rr)[:200]))
+
         check("F2 pointers_to: shape + region scan runs", lambda: assert_true(
             pt.get("targets") and pt["targets"][0]["address"] == pthread_addr
             and isinstance(pt["targets"][0]["found"], int)

@@ -806,6 +806,79 @@ class AnalysisFacade:
             engine.clear()
         return {"cleared": True, "engine": "host-scan"}
 
+    # -- reverse rva resolution (R8/D20) --------------------------------------------
+
+    def resolve_rva(self, pid: int, module: str, *, rva: int | None = None,
+                    file_offset: int | None = None) -> dict:
+        """D20: forward file-offset → runtime resolution, plus vaddr-RVA →
+        file-offset conversion via the module's live phdrs (p_vaddr→p_offset).
+
+        Exactly one of rva/file_offset. Note the tool-face `rva` convention
+        (address_resolve/disassemble) is the FILE OFFSET — the `rva` parameter
+        here is the R4-era vaddr flavour, provided for offline-record
+        cross-checks. Mirror segments never bear translations."""
+        if (rva is None) == (file_offset is None):
+            raise AgentError("bad_request",
+                             detail="resolve_rva: give exactly one of rva= or file_offset=")
+        view = MapsView.from_maps(self.service.target_maps(pid))
+        v = view.modules.get(module)
+        if v is None:
+            raise AgentError("not_found", detail=f"module {module!r} not mapped in pid {pid}")
+        segs = [s for s in v.segments if not s.mirror] or v.segments
+
+        used = "file_offset"
+        fo = file_offset
+        if rva is not None:
+            used = "vaddr"
+            first = segs[0]
+            header = self.service.mem_read(pid, first.start, min(0x1000, first.size))
+            try:
+                info = parse_elf64(header, allow_zero_magic=True)
+            except ElfParseError as exc:
+                raise AgentError("backend_error",
+                                 detail=f"phdr parse failed for {module!r}: {exc}") from exc
+            fo = None
+            for load in info.loads:
+                span = max(load.memsz, load.filesz)
+                if load.vaddr <= rva < load.vaddr + span:
+                    fo = rva - load.vaddr + load.offset
+                    break
+            if fo is None:
+                raise AgentError(
+                    "not_found",
+                    detail=f"vaddr rva 0x{rva:x} not within any PT_LOAD of {module!r}")
+
+        bearing = None
+        for s in segs:
+            if s.file_offset <= fo < s.file_offset + s.size:
+                bearing = s
+                break
+        if bearing is None:
+            table = [{"start": f"0x{x.start:x}", "end": f"0x{x.end:x}",
+                      "file_offset": f"0x{x.file_offset:x}",
+                      "permissions": x.flags_str()} for x in segs]
+            raise AgentError(
+                "not_found",
+                detail=f"file offset 0x{fo:x} is not covered by any non-mirror segment "
+                       f"of {module!r}; non-mirror segments: {table}")
+
+        runtime = bearing.start + (fo - bearing.file_offset)
+        return {
+            "pid": pid,
+            "module": module,
+            "file_offset": f"0x{fo:x}",
+            **({"vaddr": f"0x{rva:x}"} if rva is not None else {}),
+            "used": used,
+            "runtime": f"0x{runtime:x}",
+            "segment": {
+                "start": f"0x{bearing.start:x}",
+                "end": f"0x{bearing.end:x}",
+                "file_offset": f"0x{bearing.file_offset:x}",
+                "permissions": bearing.flags_str(),
+                "translation_base": f"0x{bearing.start - bearing.file_offset:x}",
+            },
+        }
+
     # -- multi-span sampling & pointer search (R5 F1/F2) ---------------------------
 
     def watch_many(self, pid: int, spans: list[dict], *, interval_ms: int = 200,

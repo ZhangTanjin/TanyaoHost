@@ -109,6 +109,12 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             strip_pac=bool(p.get("strip_pac", True)),
             pointer_mask=int(p["pointer_mask"], 16) if isinstance(p.get("pointer_mask"), str) else p.get("pointer_mask"),
         ),
+        "resolve_rva": lambda p: facade.resolve_rva(
+            need_pid(p), str(p["module"]),
+            rva=int(p["rva"], 16) if isinstance(p.get("rva"), str) else p.get("rva"),
+            file_offset=(int(p["file_offset"], 16) if isinstance(p.get("file_offset"), str)
+                         else p.get("file_offset")),
+        ),
         "watch_many": lambda p: facade.watch_many(
             need_pid(p),
             p.get("spans", []),

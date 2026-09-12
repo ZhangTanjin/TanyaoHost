@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.mock_agent import DEMO_PID, HEAP_START, MockAgent  # noqa: E402
 from tests.test_d9_address_meta import (  # noqa: E402
+    INIT_FILE_OFFSET,
     MODULE,
     SEGMENTS,
     _MetaService,
@@ -193,7 +194,64 @@ class TestMapsViewOnSixSegmentFixture(unittest.TestCase):
         self.assertEqual(out["first_map"], mods[MODULE]["base"])
 
 
-class TestF4F6(unittest.TestCase):
+class TestResolveRva(unittest.TestCase):
+    """R8/D20: resolve_rva — vaddr vs file_offset entries over the lolm
+    six-segment multi-bias fixture; mirrors never bear translations."""
+
+    def setUp(self):
+        self.facade = AnalysisFacade(_MetaServiceWithSource())  # type: ignore[arg-type]
+
+    def test_file_offset_entry(self):
+        out = self.facade.resolve_rva(PID, MODULE, file_offset=INIT_FILE_OFFSET)
+        self.assertEqual(out["used"], "file_offset")
+        # bearing segment m4: start 0x1000_0300_0000, file_offset 0x200000
+        tb = 0x1000_0300_0000 - 0x200000
+        self.assertEqual(out["segment"]["translation_base"], hex(tb))
+        self.assertEqual(out["runtime"], hex(tb + INIT_FILE_OFFSET))
+
+    def test_vaddr_entry_converted_via_phdr(self):
+        """The 0x4000-diff scenario: segment 2 carries vaddr = F + 0x4000
+        (R4-era offline records use vaddr-RVA); live phdrs must convert."""
+        import struct as _struct
+
+        class DriftService(_MetaServiceWithSource):
+            def __init__(self):
+                super().__init__()
+                e = bytearray(64 + 2 * 56)
+                e[0:4] = b"\x7fELF"
+                e[4], e[5], e[6] = 2, 1, 1
+                _struct.pack_into("<HHIQQQIHHHHHH", e, 16,
+                                  3, 183, 1, 0, 64, 0, 0, 64, 56, 2, 0, 0, 0)
+                _struct.pack_into("<IIQQQQQQ", e, 64, 1, 5, 0x0, 0x0, 0, 0x2000, 0x2000, 0x1000)
+                _struct.pack_into("<IIQQQQQQ", e, 64 + 56, 1, 6,
+                                  0x10000, 0x14000, 0, 0x4000, 0x4000, 0x1000)
+                self.mem[SEGMENTS[0][0]][: len(e)] = bytearray(e)
+
+        facade = AnalysisFacade(DriftService())  # type: ignore[arg-type]
+        fo, vaddr = 0x10010, 0x14010
+        out = facade.resolve_rva(PID, MODULE, rva=vaddr)
+        self.assertEqual(out["used"], "vaddr")
+        self.assertEqual(out["file_offset"], hex(fo))
+        self.assertEqual(out["runtime"], hex(0x1000_0100_0000 + 0x10))
+        self.assertEqual(out["vaddr"], hex(vaddr))
+
+    def test_exactly_one_of_rva_or_file_offset(self):
+        from tanyao.connection import AgentError
+        with self.assertRaises(AgentError):
+            self.facade.resolve_rva(PID, MODULE)
+        with self.assertRaises(AgentError):
+            self.facade.resolve_rva(PID, MODULE, rva=0x10, file_offset=0x10)
+
+    def test_mirrorless_coverage_miss_lists_segments(self):
+        from tanyao.connection import AgentError
+        # beyond every segment's file window (fixture max F ≈ 0x606000)
+        with self.assertRaises(AgentError) as ctx:
+            self.facade.resolve_rva(PID, MODULE, file_offset=0x10000000)
+        self.assertIn("non-mirror segments", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
     """F4 symbol_list fields=names_only; F6 preset category summary."""
 
     @classmethod

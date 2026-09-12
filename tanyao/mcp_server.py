@@ -258,6 +258,19 @@ TOOLS = [
         ),
     },
     {
+        "name": "resolve_rva",
+        "description": "Resolve an RVA/file offset to a runtime address inside a module. Give exactly ONE of rva (vaddr flavour — converted via live phdrs, for cross-checking R4-era offline records) or file_offset (the tool-face convention: address_resolve/disassemble 'rva' fields and dump manifests are FILE OFFSETS). Mirror segments never bear translations; the response carries the bearing segment (translation_base) so the addition identity address == translation_base + rva is verifiable.",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "module": {"type": "string"},
+                "rva": {"type": "string", "description": "0x hex, vaddr flavour (live-phdr conversion)"},
+                "file_offset": {"type": "string", "description": "0x hex, file offset flavour (direct)"},
+            },
+            ["pid", "module"],
+        ),
+    },
+    {
         "name": "watch_many",
         "description": "Sample MULTIPLE memory spans on one schedule (batched via MEM_READV): per-span sample arrays shaped like watch's. Prefer this over N parallel watch calls.",
         "inputSchema": _obj(
