@@ -28,13 +28,18 @@ def _is_anonymous_path(path: str) -> bool:
 
 
 def _mark_mirrors(segments: list["Segment"]) -> None:
-    """Flag whole-file mirror mappings (R5 residual note).
+    """Flag whole-file mirror mappings — v2 (R7/D19).
 
-    A loader's PT_LOADs never share a page-aligned file offset, so when
-    several mappings of one module do, the executable member is the loader
-    layout and the non-exec duplicates are whole-file mirrors the target
-    mmapped for its own purposes (field: lolm libil2cpp's 207MB r--p
-    offset-0 image far away from the real load segments)."""
+    Within a page-aligned offset-0 group that contains an EXEC member, a
+    non-EXEC member is a whole-file mirror ONLY when it DOMINATES the rest of
+    the group in file space (size >= max other member size) — the integrity
+    self-copy signature. Real co-resident loader PT_LOADs are strictly smaller
+    than the exec image, so they must keep loader status:
+
+    - lolm R5 layout: 202MB r--p off-0 beside a 192MB r-xp off-0 → mirror ✓
+    - lolm R7 layout: ~58MB r--p off-0 beside the 192MB r-xp off-0 → REAL
+      segment (the v1 rule mislabelled it and poisoned the load anchor by
+      39.5MB — the tester's three-way base inconsistency)."""
     by_offset: dict[int, list[Segment]] = {}
     for s in segments:
         by_offset.setdefault(s.file_offset & ~0xFFF, []).append(s)
@@ -42,8 +47,10 @@ def _mark_mirrors(segments: list["Segment"]) -> None:
         if len(group) < 2 or not any(s.flags & MAP_EXEC for s in group):
             continue
         for s in group:
-            if not (s.flags & MAP_EXEC):
-                s.mirror = True
+            if s.flags & MAP_EXEC:
+                continue
+            others_max = max((o.size for o in group if o is not s), default=0)
+            s.mirror = s.size >= others_max
 
 
 @dataclass(slots=True)

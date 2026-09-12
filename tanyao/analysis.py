@@ -221,9 +221,23 @@ class AnalysisFacade:
             return {"pid": pid, "module": name, "first_map": f"0x{first.start:x}", "error": str(exc)}
         base = first.start
         mirror = any(s.mirror for s in v.segments)
-        load_bias_abs = base - info.load_bias  # ELF-arithmetic anchor (legacy field)
+        # D19: the load anchor is the COMMON translation base (start −
+        # file_offset) of the off-0 non-mirror segments. Unique on standard
+        # layouts; when several off-0 segments carry different anchors (lolm
+        # multi off-0 co-resident layout) a single load_bias is provably
+        # ambiguous → null + load_bias_ambiguous, per-segment translation_base
+        # is the truth. No off-0 anchor at all → ELF-arithmetic fallback.
+        anchors = {s.start - s.file_offset for s in v.segments
+                   if s.file_offset == 0 and not s.mirror}
+        ambiguous = len(anchors) > 1
+        if len(anchors) == 1:
+            load_bias_abs: int | None = anchors.pop()
+        elif anchors:
+            load_bias_abs = None
+        else:
+            load_bias_abs = base - info.load_bias  # legacy ELF-arithmetic anchor
         bss = None
-        if info.bss_end:
+        if info.bss_end and load_bias_abs is not None:
             bss_lo = info.bss_start + load_bias_abs
             bss_hi = info.bss_end + load_bias_abs
             # D9: arithmetic BSS bounds must never leak past THIS module's own
@@ -233,14 +247,33 @@ class AnalysisFacade:
             module_hi = max(s.end for s in segs)
             if bss_lo < module_hi:
                 bss = [f"0x{bss_lo:x}", f"0x{min(bss_hi, module_hi):x}"]
-        return {
+        out = {
             "pid": pid,
             "module": name,
             "first_map": f"0x{base:x}",
-            "load_bias": f"0x{load_bias_abs:x}",
+            "load_bias": f"0x{load_bias_abs:x}" if load_bias_abs is not None else None,
             "bss": bss,
             "mirror_detected": mirror,
+            # D19: full segment table — translation_base is each segment's own
+            # (start − file_offset) anchor; mirror flags the whole-file copies
+            "segments": [
+                {
+                    "start": f"0x{s.start:x}",
+                    "end": f"0x{s.end:x}",
+                    "file_offset": f"0x{s.file_offset:x}",
+                    "permissions": s.flags_str(),
+                    "translation_base": f"0x{s.start - s.file_offset:x}",
+                    "mirror": s.mirror,
+                }
+                for s in v.segments
+            ],
         }
+        if ambiguous:
+            out["load_bias_ambiguous"] = True
+            out["hint"] = ("load_bias is ambiguous on this multi-anchor layout — use "
+                           "per-segment translation_base or derive the base from "
+                           "disassemble self-reported rva")
+        return out
 
     def address_resolve(self, pid: int, address: int) -> dict:
         """D14: containment via the shared MapsView — an address outside the
@@ -273,15 +306,27 @@ class AnalysisFacade:
             "module_offset": f"0x{address - seg.start + seg.file_offset:x}" if path else None,
         }
         out.update(out_extra)
-        if path and seg.flags & MAP_EXEC:
+        if path:
+            # D19 self-consistency: load_bias is reported ONLY when it agrees
+            # with the containing segment — load_bias + rva == address must
+            # hold inside one response (the field case had both fields true
+            # simultaneously, pointing 39.5MB apart)
             try:
                 resolved = self.resolve_module(pid, module)
-                if isinstance(resolved.get("load_bias"), str):
-                    out["load_bias"] = resolved["load_bias"]
+                lb = resolved.get("load_bias")
+                if isinstance(lb, str):
+                    rva = address - seg.start + seg.file_offset
+                    if int(lb, 16) + rva == address:
+                        out["load_bias"] = lb
+                    else:
+                        out["load_bias_ambiguous"] = True
+                elif resolved.get("load_bias_ambiguous"):
+                    out["load_bias_ambiguous"] = True
             except AgentError:
                 pass
         if path:
-            # D9: file-layout rva straight from the per-mapping translation
+            # D9: file-layout rva straight from the per-mapping translation —
+            # the authoritative runtime↔file-offset reference (R7)
             file_offset = address - seg.start + seg.file_offset
             out["file_offset"] = f"0x{file_offset:x}"
             out["rva"] = out["file_offset"]
