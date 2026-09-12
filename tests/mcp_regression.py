@@ -343,7 +343,7 @@ def main() -> int:
         strs = call_tool("strings", {"pid": pid, "module": "libc.so",
                                      "min_length": 10, "limit": 5, "filter": "pthread"}, timeout=180)
         check("strings: libc module scan", lambda: assert_true(
-            strs["count"] >= 1 and all("offset" in s for s in strs["strings"]),
+            strs["count"] >= 1 and all("address" in s for s in strs["strings"]),
             f"{strs['count']} strings, scanned={strs['scanned_bytes']}B"))
         if caps_mask & 32:
             check("v1.2: strings engine=agent-strings", lambda: assert_true(

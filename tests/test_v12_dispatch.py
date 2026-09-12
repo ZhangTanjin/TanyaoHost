@@ -294,7 +294,8 @@ class TestCaps3BSymbolsStrings(MatrixBase):
         self.assertIn("tanyao_mock_engine", vals)
         self.assertIn("Java_icu_nullptr_test", vals)
         by_val = {s["value"]: s for s in out["strings"]}
-        self.assertEqual(by_val["tanyao_mock_engine"]["offset"], BASE + 0x900)
+        # D16: rows carry the address as a hex string (offset decimal-int removed)
+        self.assertEqual(by_val["tanyao_mock_engine"]["address"], hx(BASE + 0x900))
         self.assertEqual(by_val["tanyao_mock_engine"]["length"], 18)
         self.assertGreater(out["scanned_bytes"], 0)
 
@@ -333,7 +334,7 @@ class TestCaps3BSymbolsStrings(MatrixBase):
         self.assertEqual(summary["engine"], "agent-strings")
         vals = [r["value"] for r in summary["strings"]]
         self.assertIn("tanyao_mock_engine", vals)
-        self.assertTrue(all({"offset", "length", "value"} <= set(r) for r in summary["strings"]))
+        self.assertTrue(all({"address", "length", "value"} <= set(r) for r in summary["strings"]))
 
     def test_strings_sync_threshold_keeps_hint_no_silent_async(self):
         """D10: the device's sync-threshold rejection surfaces with the async

@@ -28,7 +28,6 @@ from .constants import (
     AGENT_CAP_SYMBOL_BATCH,
     AGENT_CAP_WRITE_TXN,
     MAP_EXEC,
-    MAP_READ,
     MAP_WRITE,
     parse_u64,
 )
@@ -36,6 +35,7 @@ from .dump import dump_module as _dump_module
 from .dump import pull_dump_with_resume
 from .dump import watch as _watch
 from .elfinfo import ElfParseError, parse_elf64
+from .mapsview import MAP_ANONYMOUS, MAP_READ, MapsView
 from .jobs import JobManager, ScanCancelled
 from .native import ApkParseError, disassemble_a64_ex, extract_strings, parse_apk_manifest
 from .pointer import PointerChainError, resolve_chain
@@ -157,35 +157,35 @@ class AnalysisFacade:
             raise
 
     def list_modules(self, pid: int, name_filter: str | None = None) -> dict:
-        maps = self.service.target_maps(pid)
-        modules: dict[str, dict] = {}
-        for m in maps:
-            if not m.path:
+        """D13: per-segment module view from the single MapsView parser — no
+        cross-segment end merging (a module's segments keep their gaps), no
+        fabricated module names for anonymous mappings. base == first_map,
+        same anchor resolve_module uses."""
+        view = MapsView.from_maps(self.service.target_maps(pid))
+        modules = []
+        for v in sorted(view.modules.values(), key=lambda m: m.first_map):
+            if name_filter and name_filter.lower() not in v.name.lower():
                 continue
-            basename = m.path.rstrip("/").split("/")[-1]
-            if name_filter and name_filter.lower() not in basename.lower():
-                continue
-            entry = modules.setdefault(
-                basename,
-                {"name": basename, "path": m.path, "ranges": 0, "start": m.start, "end": m.end},
-            )
-            entry["ranges"] += 1
-            entry["start"] = min(entry["start"], m.start)
-            entry["end"] = max(entry["end"], m.end)
+            modules.append({
+                "name": v.name,
+                "path": v.path,
+                "base": f"0x{v.first_map:x}",
+                "segments": [
+                    {
+                        "start": f"0x{s.start:x}",
+                        "end": f"0x{s.end:x}",
+                        "size": s.size,
+                        "file_offset": f"0x{s.file_offset:x}",
+                        "permissions": s.flags_str(),
+                    }
+                    for s in v.segments
+                ],
+            })
         return {
             "pid": pid,
             "count": len(modules),
             "maps_source": self.service.maps_source(),
-            "modules": [
-                {
-                    "name": v["name"],
-                    "path": v["path"],
-                    "base": f"0x{v['start']:x}",
-                    "end": f"0x{v['end']:x}",
-                    "ranges": v["ranges"],
-                }
-                for v in sorted(modules.values(), key=lambda e: e["start"])
-            ],
+            "modules": modules,
         }
 
     def resolve_module(self, pid: int, name: str) -> dict:
@@ -226,37 +226,49 @@ class AnalysisFacade:
         }
 
     def address_resolve(self, pid: int, address: int) -> dict:
-        maps = self.service.target_maps(pid)
-        for m in maps:
-            if m.start <= address < m.end:
-                module = self._module_of(m.path)
-                out: dict[str, Any] = {
-                    "pid": pid,
-                    "address": f"0x{address:x}",
-                    "start": f"0x{m.start:x}",
-                    "end": f"0x{m.end:x}",
-                    "permissions": m.flags_str(),
-                    "path": m.path,
-                    "module": module,
-                    "module_offset": f"0x{address - m.start + m.file_offset:x}" if m.path else None,
-                }
-                if m.path and m.flags & MAP_EXEC:
-                    try:
-                        resolved = self.resolve_module(pid, module)
-                        if isinstance(resolved.get("load_bias"), str):
-                            out["load_bias"] = resolved["load_bias"]
-                    except AgentError:
-                        pass
-                if m.path:
-                    # D9: file-layout rva straight from the per-mapping
-                    # translation — the old single-bias subtraction produced
-                    # out-of-file values on multi-bias modules (lolm
-                    # libil2cpp: rva 0x1888b9158 > dump size)
-                    file_offset = address - m.start + m.file_offset
-                    out["file_offset"] = f"0x{file_offset:x}"
-                    out["rva"] = out["file_offset"]
-                return out
-        raise AgentError("not_found", detail=f"address 0x{address:x} not in any mapping of pid {pid}")
+        """D14: containment via the shared MapsView — an address outside the
+        snapshot is reported as unknown; ranges are never fabricated."""
+        view = MapsView.from_maps(self.service.target_maps(pid))
+        mod, idx = view.find(address)
+        if mod is None and idx is None:
+            return {
+                "pid": pid,
+                "address": f"0x{address:x}",
+                "unknown": True,
+                "detail": "address is not inside any mapping of this pid",
+            }
+        if mod is not None:
+            seg = mod.segments[idx]
+            path, module = mod.path, mod.name
+            out_extra: dict[str, Any] = {"segment_index": idx}
+        else:
+            seg = view.anonymous[idx]
+            path, module = seg.path, None
+            out_extra = {"segment_index": idx, "anonymous": True}
+        out: dict[str, Any] = {
+            "pid": pid,
+            "address": f"0x{address:x}",
+            "start": f"0x{seg.start:x}",
+            "end": f"0x{seg.end:x}",
+            "permissions": seg.flags_str(),
+            "path": path,
+            "module": module,
+            "module_offset": f"0x{address - seg.start + seg.file_offset:x}" if path else None,
+        }
+        out.update(out_extra)
+        if path and seg.flags & MAP_EXEC:
+            try:
+                resolved = self.resolve_module(pid, module)
+                if isinstance(resolved.get("load_bias"), str):
+                    out["load_bias"] = resolved["load_bias"]
+            except AgentError:
+                pass
+        if path:
+            # D9: file-layout rva straight from the per-mapping translation
+            file_offset = address - seg.start + seg.file_offset
+            out["file_offset"] = f"0x{file_offset:x}"
+            out["rva"] = out["file_offset"]
+        return out
 
     # -- memory ----------------------------------------------------------------------
 
@@ -461,34 +473,74 @@ class AnalysisFacade:
         return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
                 "async": True, "poll": "scan_status"}
 
-    def scan_set_default_ranges(self, pid: int, *, preset: str = "anon") -> dict:
-        """preset: anon (default, readable anonymous/heap), stack, module:<name>,
-        all_readable. Host-side accounting only: the device engine derives its
-        own ranges from the same preset at scan_start time; we keep a host
-        snapshot for the est-based inline/async decision and error parity."""
-        maps = self.service.target_maps(pid)
-        engine = self._scan_for(pid)
+    def compute_preset_ranges(self, pid: int, preset: str) -> tuple[list[tuple[int, int]], dict]:
+        """Single truth for preset → range selection (D13/D14: every consumer
+        — scan_set_default_ranges, pointers_to, scan_start estimates — derives
+        from the MapsView, never from ad-hoc map filtering).
+
+        Returns (ranges, categories) with categories counting selected
+        segments by class: module / anon (heap & anonymous) / stack."""
+        view = MapsView.from_maps(self.service.target_maps(pid))
+        categories = {"module": 0, "anon": 0, "stack": 0}
+        ranges: list[tuple[int, int]] = []
+
+        def take(seg, kind: str) -> None:
+            ranges.append((seg.start, seg.end))
+            categories[kind] += 1
+
         if preset == "anon":
-            engine.set_default_ranges(pid, maps)
-        elif preset == "all_readable":
-            engine.set_ranges(pid, [(m.start, m.end) for m in maps if m.flags & MAP_READ])
+            for s in view.anonymous:
+                if (s.flags & MAP_READ) and (s.flags & MAP_ANONYMOUS or (s.flags & 2 and not s.path)):
+                    take(s, "anon")
         elif preset == "stack":
-            stack_maps = [m for m in maps if "[stack" in m.path]
-            if not stack_maps:
-                raise AgentError("bad_request", detail="no [stack] mapping found")
-            engine.set_ranges(pid, [(m.start, m.end) for m in stack_maps])
+            for s in view.anonymous:
+                if "[stack" in s.path and (s.flags & 2):
+                    take(s, "stack")
+        elif preset == "all_readable":
+            for v in view.modules.values():
+                for seg in v.segments:
+                    if seg.flags & MAP_READ:
+                        take(seg, "module")
+            for s in view.anonymous:
+                if s.flags & MAP_READ:
+                    take(s, "anon")
         elif preset.startswith("module:"):
             name = preset.split(":", 1)[1]
-            matches = [m for m in maps if m.path.rstrip("/").split("/")[-1] == name and m.flags & MAP_READ]
-            if not matches:
+            v = view.modules.get(name)
+            if v is None:
                 raise AgentError("not_found", detail=f"module {name!r} not mapped")
-            engine.set_ranges(pid, [(m.start, m.end) for m in matches])
+            for seg in v.segments:
+                if seg.flags & MAP_READ:
+                    take(seg, "module")
         else:
             raise AgentError("bad_request", detail=f"unknown preset {preset!r}")
+        return ranges, categories
+
+    def scan_set_default_ranges(self, pid: int, *, preset: str = "anon") -> dict:
+        """preset: anon (default, readable anonymous/heap), stack, module:<name>,
+        all_readable (NOTE: includes ART boot images and every other readable
+        file mapping — scope scans deliberately, F6). Host-side accounting
+        only: the device engine derives its own ranges from the same preset at
+        scan_start time; we keep a host snapshot for the est-based inline/async
+        decision and error parity."""
+        ranges, categories = self.compute_preset_ranges(pid, preset)
+        if not ranges:
+            if preset == "stack":
+                raise AgentError("bad_request", detail="no [stack] mapping found")
+            raise AgentError("not_found", detail=f"preset {preset!r} matched no readable ranges")
+        engine = self._scan_for(pid)
+        engine.set_ranges(pid, ranges)
         self._scan_presets[pid] = preset
         self._explicit_ranges.pop(pid, None)  # preset supersedes explicit ranges
         total = sum(e - s for s, e in engine.state.ranges)
-        return {"pid": pid, "preset": preset, "ranges": len(engine.state.ranges), "total_bytes": total}
+        # F6: transparent preset summary (segments / total bytes / classes)
+        return {
+            "pid": pid,
+            "preset": preset,
+            "ranges": len(engine.state.ranges),
+            "total_bytes": total,
+            "categories": categories,
+        }
 
     def scan_set_range(self, pid: int, start: int, end: int) -> dict:
         engine = self._scan_for(pid)
@@ -601,8 +653,13 @@ class AnalysisFacade:
             return engine.summary() | {"results": engine.results(limit=32), "engine": "host-scan"}
 
         job_id = self._jobs.start(pid, kind, run, cancel_event=cancel_event)
-        return {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
-                "async": True, "poll": "scan_status"}
+        out = {"job_id": job_id, "pid": pid, "kind": kind, "state": "running",
+               "async": True, "poll": "scan_status"}
+        if engine.state.ranges:
+            # D18: volume estimate — all_readable-class scans announce size up front
+            out["ranges"] = len(engine.state.ranges)
+            out["total_bytes_estimate"] = sum(e - s for s, e in engine.state.ranges)
+        return out
 
     def scan_cancel(self, pid: int, job_id: str) -> dict:
         """Request cancellation of a running scan job. The engine checks the
@@ -903,7 +960,13 @@ class AnalysisFacade:
                         data, offset=pos, min_length=min_length,
                         limit=max(0, limit - len(results)), filter=filter,
                     )
-                    results.extend(items)
+                    for item in items:
+                        # D16: address (hex) instead of the misleading decimal offset
+                        results.append({
+                            "address": f"0x{item['offset']:x}",
+                            "length": item["length"],
+                            "value": item["value"],
+                        })
                     scanned += take
                     pos += take
                     if len(results) >= limit:
@@ -921,8 +984,10 @@ class AnalysisFacade:
         data = read_fn(address, size)
         items = extract_strings(data, offset=address, min_length=min_length,
                                 limit=limit, filter=filter)
+        rows = [{"address": f"0x{item['offset']:x}", "length": item["length"],
+                 "value": item["value"]} for item in items]
         return {"pid": pid, "address": f"0x{address:x}", "size": size,
-                "count": len(items), "strings": items, "truncated": len(items) >= limit,
+                "count": len(rows), "strings": rows, "truncated": len(rows) >= limit,
                 "engine": "host-strings"}
 
     def _agent_strings(self, pid: int, *, module: str | None, address: int | None,
@@ -994,10 +1059,12 @@ class AnalysisFacade:
 
     @staticmethod
     def _agent_strings_rows(resp: dict) -> list[dict]:
+        # D16: rows carry "address" (hex string, tool-face convention) — the
+        # old "offset" was a decimal-int address and misled address math
         out = []
         for r in resp.get("results", []) + resp.get("hits", []):
             out.append({
-                "offset": int(str(r["address"]), 16),
+                "address": str(r["address"]),
                 "length": int(r.get("length", len(str(r["value"])))),
                 "value": r["value"],
             })
