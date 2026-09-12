@@ -14,3 +14,11 @@
    路径条件项。
 4. DoD：单测全绿 + 回归保持 + 与设备端联跑（其 D23 交付后）真机
    getter 链 → WORKSPACE.md §7 回填。
+
+## 附：实施前修订（工程师现场核验输入，V1.4 草案 §5.1）
+
+白名单基线 10→13（+class_from_name/image_get_name/
+class_get_field_from_name）；请求可选 `probe_ret:true`（agent 1 字节
+探测，响应 `ret_readable`）；DoD 按对方 S0–S9 分步规格执行（S0 dry-run
+强制、S8 结构判据、失败如实登记）。设备半注意：probe_ret 在 agent 侧
+用自身内存路径实现；host 半注意：工具描述与 mock 同步三新增符号。
