@@ -61,6 +61,10 @@ class Segment:
     flags: int
     path: str = ""
     mirror: bool = False
+    # D21: file-space alias annotation — same-module non-mirror segments whose
+    # file windows overlap make file-offset→runtime non-injective
+    file_overlap: bool = False
+    alias_group: int = 0
 
     @property
     def size(self) -> int:
@@ -116,11 +120,52 @@ class ModuleView:
         return addr - s.start + s.file_offset
 
     def runtime_of(self, file_offset: int) -> int | None:
-        """Per-mapping translation runtime = start + (F − file_offset) (D9)."""
-        for s in self.segments:
-            if s.file_offset <= file_offset < s.file_offset + s.size:
-                return s.start + (file_offset - s.file_offset)
-        return None
+        """Per-mapping translation runtime = start + (F − file_offset) (D9).
+        With file-space aliases (D21) returns the FIRST bearing segment —
+        prefer bearing_segments()/resolve_rva candidates on alias layouts."""
+        seg = next(iter(self.bearing_segments(file_offset)), None)
+        if seg is None:
+            return None
+        return seg.start + (file_offset - seg.file_offset)
+
+    def bearing_segments(self, file_offset: int) -> list[Segment]:
+        """All non-mirror segments whose file window covers file_offset
+        (D21: may be more than one on alias layouts)."""
+        return [s for s in self.segments if not s.mirror
+                and s.file_offset <= file_offset < s.file_offset + s.size]
+
+
+def _mark_file_overlaps(segments: list["Segment"]) -> None:
+    """D21: same-module NON-MIRROR segments whose file windows overlap get a
+    shared alias_group (1..k) and file_overlap=True — file-offset→runtime is
+    non-injective there (field: lolm tail segments both bearing off 0xc620000).
+    Mirror segments are excluded (they never bear translations)."""
+    candidates = [s for s in segments if not s.mirror]
+    parent = list(range(len(candidates)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        parent[find(i)] = find(j)
+
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            a, b = candidates[i], candidates[j]
+            if a.file_offset < b.file_offset + b.size and b.file_offset < a.file_offset + a.size:
+                union(i, j)
+    groups: dict[int, int] = {}
+    for i, s in enumerate(candidates):
+        root = find(i)
+        members = [candidates[k] for k in range(len(candidates)) if find(k) == root]
+        if len(members) < 2:
+            continue
+        group_id = groups.setdefault(root, len(groups) + 1)
+        s.file_overlap = True
+        s.alias_group = group_id
 
 
 @dataclass(slots=True)
@@ -147,6 +192,7 @@ class MapsView:
         for view in modules.values():
             view.segments.sort(key=lambda s: s.start)
             _mark_mirrors(view.segments)
+            _mark_file_overlaps(view.segments)
         anonymous.sort(key=lambda s: s.start)
         return cls(modules=modules, anonymous=anonymous)
 

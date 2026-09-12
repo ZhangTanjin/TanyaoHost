@@ -192,6 +192,8 @@ class AnalysisFacade:
                         "file_offset": f"0x{s.file_offset:x}",
                         "permissions": s.flags_str(),
                         "mirror": s.mirror,
+                        "file_overlap": s.file_overlap,
+                        "alias_group": s.alias_group,
                     }
                     for s in v.segments
                 ],
@@ -264,6 +266,8 @@ class AnalysisFacade:
                     "permissions": s.flags_str(),
                     "translation_base": f"0x{s.start - s.file_offset:x}",
                     "mirror": s.mirror,
+                    "file_overlap": s.file_overlap,
+                    "alias_group": s.alias_group,
                 }
                 for s in v.segments
             ],
@@ -848,12 +852,9 @@ class AnalysisFacade:
                     "not_found",
                     detail=f"vaddr rva 0x{rva:x} not within any PT_LOAD of {module!r}")
 
-        bearing = None
-        for s in segs:
-            if s.file_offset <= fo < s.file_offset + s.size:
-                bearing = s
-                break
-        if bearing is None:
+        bearing = [x for x in segs
+                   if x.file_offset <= fo < x.file_offset + x.size]
+        if not bearing:
             table = [{"start": f"0x{x.start:x}", "end": f"0x{x.end:x}",
                       "file_offset": f"0x{x.file_offset:x}",
                       "permissions": x.flags_str()} for x in segs]
@@ -862,7 +863,35 @@ class AnalysisFacade:
                 detail=f"file offset 0x{fo:x} is not covered by any non-mirror segment "
                        f"of {module!r}; non-mirror segments: {table}")
 
-        runtime = bearing.start + (fo - bearing.file_offset)
+        def seg_info(x):
+            return {
+                "start": f"0x{x.start:x}",
+                "end": f"0x{x.end:x}",
+                "file_offset": f"0x{x.file_offset:x}",
+                "permissions": x.flags_str(),
+                "translation_base": f"0x{x.start - x.file_offset:x}",
+                "alias_group": x.alias_group,
+            }
+
+        if len(bearing) > 1:
+            # D21: file-space alias — file-offset→runtime is non-injective,
+            # return every candidate (segment order) instead of guessing
+            return {
+                "pid": pid,
+                "module": module,
+                "file_offset": f"0x{fo:x}",
+                **({"vaddr": f"0x{rva:x}"} if rva is not None else {}),
+                "used": used,
+                "alias": True,
+                "candidates": [
+                    {"runtime": f"0x{x.start + (fo - x.file_offset):x}",
+                     "segment": seg_info(x)}
+                    for x in bearing
+                ],
+            }
+
+        bearing_seg = bearing[0]
+        runtime = bearing_seg.start + (fo - bearing_seg.file_offset)
         return {
             "pid": pid,
             "module": module,
@@ -870,13 +899,7 @@ class AnalysisFacade:
             **({"vaddr": f"0x{rva:x}"} if rva is not None else {}),
             "used": used,
             "runtime": f"0x{runtime:x}",
-            "segment": {
-                "start": f"0x{bearing.start:x}",
-                "end": f"0x{bearing.end:x}",
-                "file_offset": f"0x{bearing.file_offset:x}",
-                "permissions": bearing.flags_str(),
-                "translation_base": f"0x{bearing.start - bearing.file_offset:x}",
-            },
+            "segment": seg_info(bearing_seg),
         }
 
     # -- multi-span sampling & pointer search (R5 F1/F2) ---------------------------

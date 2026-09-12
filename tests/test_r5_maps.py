@@ -31,6 +31,10 @@ PID = 1
 TOKEN = "tanyao-dev-token"
 
 
+def hx(v: int) -> str:
+    return f"0x{v:x}"
+
+
 class _MetaServiceWithSource(_MetaService):
     def maps_source(self):
         return "target_maps"
@@ -194,6 +198,31 @@ class TestMapsViewOnSixSegmentFixture(unittest.TestCase):
         self.assertEqual(out["first_map"], mods[MODULE]["base"])
 
 
+class _AliasService(_MetaServiceWithSource):
+    """lolm R10 tail shape: two non-mirror segments sharing file offset
+    0xc620000 plus a drifted r-xp segment."""
+
+    def __init__(self):
+        super().__init__()
+        from tanyao.service import MapEntry
+
+        self.maps = [
+            MapEntry(start=0x7299_DBE000, end=0x7299_DC1000, file_offset=0xC62000,
+                     flags=1 | 2 | 8, path="/data/app/libil2cpp.so"),
+            MapEntry(start=0x7299_DC2000, end=0x7299_DC2800, file_offset=0x56F5000,
+                     flags=1 | 4 | 8, path="/data/app/libil2cpp.so"),
+            MapEntry(start=0x7299_DC3000, end=0x7299_DD5000, file_offset=0xC62000,
+                     flags=1 | 2 | 8, path="/data/app/libil2cpp.so"),
+        ]
+        self.mem = {m.start: bytearray(min(m.size, 0x1000)) for m in self.maps}
+
+    def mem_read(self, _pid, addr, size):
+        for start, buf in self.mem.items():
+            if start <= addr and addr + size <= start + len(buf):
+                return bytes(buf[addr - start: addr - start + size])
+        return b"\x00" * size
+
+
 class TestResolveRva(unittest.TestCase):
     """R8/D20: resolve_rva — vaddr vs file_offset entries over the lolm
     six-segment multi-bias fixture; mirrors never bear translations."""
@@ -248,6 +277,62 @@ class TestResolveRva(unittest.TestCase):
         with self.assertRaises(AgentError) as ctx:
             self.facade.resolve_rva(PID, MODULE, file_offset=0x10000000)
         self.assertIn("non-mirror segments", str(ctx.exception))
+
+
+class TestD21FileAliases(unittest.TestCase):
+    """D21: same-module non-mirror segments with overlapping file windows —
+    file-offset→runtime is non-injective; resolve_rva returns candidates."""
+
+    def setUp(self):
+        from tanyao.service import MapEntry
+
+        self.maps = [
+            # lolm R10 tail: two rw-p segments BOTH bearing off 0xc620000
+            MapEntry(start=0x7299_DBE000, end=0x7299_DC1000, file_offset=0xC62000,
+                     flags=1 | 2 | 8, path="/data/app/libil2cpp.so"),
+            MapEntry(start=0x7299_DC3000, end=0x7299_DD5000, file_offset=0xC62000,
+                     flags=1 | 2 | 8, path="/data/app/libil2cpp.so"),
+            # drifted r-xp between them (different file window, non-overlapping)
+            MapEntry(start=0x7299_DC2000, end=0x7299_DC2800, file_offset=0x56F5000,
+                     flags=1 | 4 | 8, path="/data/app/libil2cpp.so"),
+        ]
+        self.facade = AnalysisFacade(_AliasService())  # type: ignore[arg-type]
+
+    def test_alias_group_detected(self):
+        from tanyao.mapsview import MapsView
+
+        view = MapsView.from_maps(self.maps)
+        v = view.modules["libil2cpp.so"]
+        alias = [s for s in v.segments if s.alias_group]
+        self.assertEqual(len(alias), 2)
+        self.assertTrue(all(s.file_overlap for s in alias))
+        self.assertEqual(alias[0].alias_group, alias[1].alias_group)
+        drifted = next(s for s in v.segments if s.file_offset == 0x56F5000)
+        self.assertFalse(drifted.file_overlap)  # non-overlapping: untouched
+
+    def test_resolve_rva_returns_both_candidates(self):
+        facade = self.facade
+        out = facade.resolve_rva(PID, MODULE, file_offset=0xC62010)
+        self.assertTrue(out.get("alias"))
+        runtimes = [c["runtime"] for c in out["candidates"]]
+        self.assertEqual(runtimes, [hx(0x7299_DBE010), hx(0x7299_DC3010)])
+        groups = [c["segment"]["alias_group"] for c in out["candidates"]]
+        self.assertEqual(groups[0], groups[1])
+
+    def test_non_alias_keeps_single_value_shape(self):
+        facade = self.facade
+        out = facade.resolve_rva(PID, MODULE, file_offset=0x56F5010)
+        self.assertNotIn("candidates", out)
+        self.assertNotIn("alias", out)
+        self.assertEqual(out["runtime"], hex(0x7299_DC2010))
+        self.assertIn("segment", out)
+
+    def test_list_modules_carries_alias_flags(self):
+        mods = {m["name"]: m for m in self.facade.list_modules(PID)["modules"]}
+        segs = mods[MODULE]["segments"]
+        flagged = [x for x in segs if x.get("file_overlap")]
+        self.assertEqual(len(flagged), 2)
+        self.assertEqual(flagged[0]["alias_group"], flagged[1]["alias_group"])
 
 
 if __name__ == "__main__":
