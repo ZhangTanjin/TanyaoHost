@@ -251,6 +251,41 @@ TOOLS = [
         ),
     },
     {
+        "name": "watch_many",
+        "description": "Sample MULTIPLE memory spans on one schedule (batched via MEM_READV): per-span sample arrays shaped like watch's. Prefer this over N parallel watch calls.",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "spans": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"address": {"type": "string"}, "size": {"type": "integer"}}, "required": ["address", "size"]},
+                    "description": "spans to sample, e.g. [{address:'0x..', size:16}]",
+                },
+                "interval_ms": {"type": "integer", "description": "sampling interval (default 200)"},
+                "count": {"type": "integer", "description": "samples per span (default 10, max 256)"},
+                "changes_only": {"type": "boolean", "description": "record only samples that changed"},
+            },
+            ["pid", "spans"],
+        ),
+    },
+    {
+        "name": "pointers_to",
+        "description": "Find pointers TO an address: scans the selected region for 8-byte little-endian values equal to each target. strip_pac (default true) masks the top two bytes so PAC-tagged pointers match. Region: module=<basename> / preset / ranges[]; falls back to the pid's last scan preset (default anon). Uses the scan job slot (a running device scan is cancelled).",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "address": {"type": "string", "description": "target address, 0x hex"},
+                "addresses": {"type": "array", "items": {"type": "string"}, "description": "up to 64 target addresses (0x hex) — alternative to address"},
+                "module": {"type": "string", "description": "scan region = this module's readable mappings"},
+                "preset": {"type": "string", "description": "anon | stack | module:<name> | all_readable"},
+                "ranges": {"type": "array", "items": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}, "required": ["start", "end"]}, "description": "explicit ranges [{start,end}] (0x hex)"},
+                "strip_pac": {"type": "boolean", "description": "wildcard top two bytes of the pattern (default true)"},
+                "limit": {"type": "integer", "description": "max pointer locations per target (default 256)"},
+            },
+            ["pid"],
+        ),
+    },
+    {
         "name": "watch",
         "description": "Sample a memory range repeatedly; reports per-sample hex and changed flags.",
         "inputSchema": _obj(

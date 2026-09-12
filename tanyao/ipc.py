@@ -108,6 +108,22 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             strip_pac=bool(p.get("strip_pac", True)),
             pointer_mask=int(p["pointer_mask"], 16) if isinstance(p.get("pointer_mask"), str) else p.get("pointer_mask"),
         ),
+        "watch_many": lambda p: facade.watch_many(
+            need_pid(p),
+            p.get("spans", []),
+            interval_ms=int(p.get("interval_ms", 200)),
+            count=int(p.get("count", 10)),
+            changes_only=bool(p.get("changes_only", False)),
+        ),
+        "pointers_to": lambda p: facade.pointers_to(
+            need_pid(p),
+            p["addresses"] if p.get("addresses") is not None else p.get("address"),
+            module=str(p["module"]) if p.get("module") else None,
+            preset=str(p["preset"]) if p.get("preset") else None,
+            ranges=p.get("ranges") or None,
+            strip_pac=bool(p.get("strip_pac", True)),
+            limit=int(p.get("limit", 256)),
+        ),
         "watch": lambda p: facade.watch(
             need_pid(p),
             parse_addr(p),

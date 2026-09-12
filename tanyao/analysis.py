@@ -744,6 +744,148 @@ class AnalysisFacade:
             engine.clear()
         return {"cleared": True, "engine": "host-scan"}
 
+    # -- multi-span sampling & pointer search (R5 F1/F2) ---------------------------
+
+    def watch_many(self, pid: int, spans: list[dict], *, interval_ms: int = 200,
+                   count: int = 10, changes_only: bool = False) -> dict:
+        """F1: multi-address sampling orchestrated over MEM_READV — one batch
+        read per tick (fault isolation per span), per-span sample arrays in
+        the same shape as watch's. Zero protocol additions."""
+        parsed = []
+        for span in spans:
+            addr = span.get("address")
+            size = int(span.get("size", 0))
+            if isinstance(addr, str):
+                addr = int(addr, 16)
+            if not isinstance(addr, int) or addr < 0 or size <= 0:
+                raise AgentError("bad_request", detail=f"bad span {span!r}")
+            parsed.append((addr, size))
+        if not parsed:
+            raise AgentError("bad_request", detail="watch_many needs at least one span")
+        count = max(1, min(int(count), 256))
+        samples: list[list] = [[] for _ in parsed]
+        previous: list[bytes | None] = [None] * len(parsed)
+        for i in range(count):
+            results = self.service.mem_readv(pid, parsed)
+            tick = time.time()
+            for j, (addr, size) in enumerate(parsed):
+                data = results[j]
+                changed = None if previous[j] is None else data != previous[j]
+                sample: dict = {
+                    "index": i,
+                    "timestamp": tick,
+                    "data_hex": data.hex() if data is not None else None,
+                    "changed": changed,
+                }
+                if data is None:
+                    sample["error"] = "read_failed"
+                if not changes_only or changed is not False:
+                    samples[j].append(sample)
+                previous[j] = data
+            if i + 1 < count:
+                time.sleep(interval_ms / 1000.0)
+        return {
+            "pid": pid,
+            "count": count,
+            "spans": [
+                {"address": f"0x{addr:x}", "size": size, "samples": samples[j]}
+                for j, (addr, size) in enumerate(parsed)
+            ],
+        }
+
+    def pointers_to(self, pid: int, addresses, *, module: str | None = None,
+                    preset: str | None = None, ranges: list[dict] | None = None,
+                    strip_pac: bool = True, limit: int = 256) -> dict:
+        """F2: semantic wrapper around a hex scan — find in-region locations
+        whose 8-byte little-endian value equals a target address.
+
+        strip_pac (default) masks the top two pattern bytes so PAC-tagged
+        pointers still match. Region: explicit ranges[] / module=<basename> /
+        preset — falls back to the pid's last preset (default anon). Uses the
+        dispatched scan engine (device when bit0; the device single job slot
+        means a running scan gets cancelled_old)."""
+        if isinstance(addresses, (int, str)):
+            addresses = [addresses]
+        targets = []
+        for a in addresses:
+            t = int(a, 16) if isinstance(a, str) else int(a)
+            if not isinstance(t, int) or t < 0 or t > 0xFFFFFFFFFFFFFFFF:
+                raise AgentError("bad_request", detail=f"bad target address {a!r}")
+            targets.append(t)
+        if not targets:
+            raise AgentError("bad_request", detail="pointers_to needs at least one address")
+        if len(targets) > 64:
+            raise AgentError("bad_request", detail="at most 64 targets per call")
+
+        explicit_ranges: list[tuple[int, int]] | None = None
+        if ranges:
+            explicit_ranges = []
+            for r in ranges:
+                lo = int(r["start"], 16) if isinstance(r["start"], str) else int(r["start"])
+                hi = int(r["end"], 16) if isinstance(r["end"], str) else int(r["end"])
+                if hi <= lo:
+                    raise AgentError("bad_request", detail=f"bad range {r!r}")
+                explicit_ranges.append((lo, hi))
+            region_ranges = explicit_ranges
+        else:
+            effective = preset or (f"module:{module}" if module else None) \
+                or self._scan_presets.get(pid, "anon")
+            region_ranges, _cats = self.compute_preset_ranges(pid, effective)
+            if not region_ranges:
+                raise AgentError("not_found",
+                                 detail=f"preset {effective!r} matched no readable ranges")
+        ranges_payload = [{"addr": f"0x{lo:x}", "size": f"0x{hi - lo:x}"}
+                          for lo, hi in explicit_ranges] if explicit_ranges else None
+        wire_preset = None if explicit_ranges else (
+            preset or (f"module:{module}" if module else None)
+            or self._scan_presets.get(pid, "anon"))
+
+        def to_pattern(t: int) -> tuple[str, bytes, bytes]:
+            raw = t.to_bytes(8, "little")
+            if strip_pac:
+                mask = b"\xff" * 6 + b"\x00\x00"
+            else:
+                mask = b"\xff" * 8
+            pattern = bytes(p & m for p, m in zip(raw, mask))
+            text = " ".join(f"{b:02X}" if m else "??" for b, m in zip(pattern, mask))
+            return text, pattern, mask
+
+        agent_route = self._scan_route(pid) == "agent"
+        engine_tag = "agent-scan" if agent_route else "host-scan"
+        out_targets = []
+        for t in targets:
+            pattern_str, pattern, mask = to_pattern(t)
+            pointers: list[dict] = []
+            if agent_route:
+                resp = self.service.agent_scan_start(
+                    pid, kind="hex", pattern=pattern_str,
+                    preset=wire_preset, ranges=ranges_payload)
+                dev_job = int(resp["job_id"])
+                self._agent_wait(dev_job)
+                page = self.service.agent_scan_results(0, limit)
+                for h in page.get("hits", []):
+                    pointers.append({"address": str(h["address"]),
+                                     "value": h.get("value_hex", h.get("value"))})
+            else:
+                backend = self.service.backend_info()
+                engine = ScanEngine(self.service.mem_read,
+                                    max_transfer=backend.max_transfer_size,
+                                    readv_fn=self.service.mem_readv,
+                                    max_iov=backend.max_iov)
+                engine.set_ranges(pid, region_ranges)
+                engine.scan_hex(pid, pattern, mask)
+                for h in engine.results(0, limit):
+                    pointers.append({"address": h["address"], "value": h["value"]})
+            out_targets.append({"address": f"0x{t:x}", "found": len(pointers),
+                                "pointers": pointers})
+        return {
+            "pid": pid,
+            "targets": out_targets,
+            "strip_pac": strip_pac,
+            "ranges": len(region_ranges),
+            "engine": engine_tag,
+        }
+
     # -- batch read ------------------------------------------------------------------------
 
     def read_batch(self, pid: int, spans: list[dict]) -> dict:

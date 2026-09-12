@@ -122,8 +122,9 @@ def main() -> int:
             "scan_hex", "scan_next", "scan_results", "scan_clear", "dump_module", "watch",
             "disassemble", "strings", "pull_apk", "apk_info",
             "decompile_start", "decompile_status",
+            "watch_many", "pointers_to",
         ])
-        check("mcp: tools/list == 29 expected", lambda: assert_true(
+        check("mcp: tools/list == 31 expected", lambda: assert_true(
             tool_names == expected, f"got {len(tool_names)}: missing="
             f"{set(expected) - set(tool_names)}, extra={set(tool_names) - set(expected)}"))
 
@@ -465,6 +466,20 @@ def main() -> int:
         w = call_tool("watch", {"pid": pid, "address": base_hex, "size": 8,
                                 "interval_ms": 50, "count": 3})
         check("watch: 3 samples", lambda: assert_true(len(w["samples"]) == 3, f"{len(w['samples'])}"))
+
+        wm = call_tool("watch_many", {"pid": pid, "spans": [
+            {"address": base_hex, "size": 8}, {"address": hex(base + 8), "size": 8}],
+            "interval_ms": 50, "count": 3})
+        check("F1 watch_many: per-span samples aligned", lambda: assert_true(
+            len(wm["spans"]) == 2 and all(len(s["samples"]) == 3 for s in wm["spans"]),
+            str(wm)[:160]))
+
+        pt = call_tool("pointers_to", {"pid": pid, "addresses": [pthread_addr],
+                                       "module": "libc.so", "limit": 16})
+        check("F2 pointers_to: shape + region scan runs", lambda: assert_true(
+            pt.get("targets") and pt["targets"][0]["address"] == pthread_addr
+            and isinstance(pt["targets"][0]["found"], int)
+            and pt.get("ranges", 0) >= 1, str(pt)[:200]))
 
         check("unknown tool -> isError", lambda: assert_true(
             _expect_error(lambda: call_tool("no_such_tool", {})), ""))
