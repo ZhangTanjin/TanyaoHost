@@ -106,6 +106,8 @@ SCAN_MAX_GRAN = 64 * 1024 * 1024
 # packed symbol table (v1.2 draft §3.1), mirrors tanyao.frames
 PACKED_SYMBOL_HEADER = struct.Struct(">IIII")
 PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
+PACKED_SYMBOL_HEADER_V13 = struct.Struct(">IIIII")
+PACKED_SYMBOL_ENTRY_V13 = struct.Struct(">QIIIBBH")  # + bind u8 | rsv u8 | rsv u16
 
 APK_PATH = "/data/app/~~x/com.example.re/base.apk"
 APK_START = 0x7100000000
@@ -1083,21 +1085,36 @@ class MockAgent:
                 "types": [s.kind for _n, s in collected],
                 "binds": [s.bind for _n, s in collected],  # v1.2.2 附录 (D11)
             }
-        # packed: header + 20B entries + name_blob + module_blob (all big-endian)
+        # packed (v1.3 §2.2 when bit12): header + entries + name_blob +
+        # module_blob, all big-endian. 24B entries add bind + entry_size field;
+        # legacy 20B layout kept for agents without PACKED_BIND.
+        packed24 = bool(self.agent_caps & AGENT_CAP_PACKED_BIND)
         name_blob = bytearray()
         name_offs = []
-        for _n, s in collected:
+        for _n, sym in collected:
             name_offs.append(len(name_blob))
-            name_blob += s.name.encode("utf-8") + b"\x00"
+            name_blob += sym.name.encode("utf-8") + b"\x00"
         module_blob = bytearray()
         module_offs = {}
         for n in contributing:
             module_offs[n] = len(module_blob)
             module_blob += n.encode("utf-8") + b"\x00"
+        if packed24:
+            bind_code = {"LOCAL": 1, "GLOBAL": 2, "WEAK": 3, "GNU_UNIQUE": 4}
+            out = bytearray(PACKED_SYMBOL_HEADER_V13.pack(
+                len(collected), len(contributing), len(name_blob),
+                len(module_blob), PACKED_SYMBOL_ENTRY_V13_SIZE))
+            for (n, sym), noff in zip(collected, name_offs):
+                out += PACKED_SYMBOL_ENTRY_V13.pack(
+                    sym.address, sym.size, noff, module_offs[n],
+                    bind_code.get(sym.bind, 0), 0, 0)
+            out += name_blob
+            out += module_blob
+            return bytes(out)
         out = bytearray(PACKED_SYMBOL_HEADER.pack(
             len(collected), len(contributing), len(name_blob), len(module_blob)))
-        for (n, s), noff in zip(collected, name_offs):
-            out += PACKED_SYMBOL_ENTRY.pack(s.address, s.size, noff, module_offs[n])
+        for (n, sym), noff in zip(collected, name_offs):
+            out += PACKED_SYMBOL_ENTRY.pack(sym.address, sym.size, noff, module_offs[n])
         out += name_blob
         out += module_blob
         return bytes(out)

@@ -42,6 +42,16 @@ PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
 PACKED_SYMBOL_ENTRY_SIZE = 20
 assert PACKED_SYMBOL_ENTRY.size == PACKED_SYMBOL_ENTRY_SIZE
 
+# v1.3 draft §2.2 (PACKED_BIND, bit12): 24B entry adds bind u8 + rsv u8 + u16,
+# and a 5th header u32 `entry_size` (=24) after module_blob_size; parsers
+# dispatch 20B/24B by entry_size with old-agent 16B headers falling back to 20B.
+PACKED_SYMBOL_HEADER_V13 = struct.Struct(">IIIII")
+PACKED_SYMBOL_ENTRY_V13 = struct.Struct(">QIIIBBH")  # addr|size|name_off|module_off|bind|rsv|rsv16
+PACKED_SYMBOL_ENTRY_V13_SIZE = 24
+assert PACKED_SYMBOL_ENTRY_V13.size == PACKED_SYMBOL_ENTRY_V13_SIZE
+
+_PACKED_BIND_NAMES = {1: "LOCAL", 2: "GLOBAL", 3: "WEAK", 4: "GNU_UNIQUE"}
+
 
 @dataclass(slots=True)
 class Frame:
@@ -173,15 +183,28 @@ def decode_dump_chunk(payload: bytes) -> DumpChunk:
 def decode_packed_symbols(payload: bytes) -> dict:
     """Decode the packed symbol_batch response into column arrays.
 
-    Raises ProtocolError on any structural violation (short buffer, offsets
-    outside their blob, unterminated names) — malformed frames must never
-    surface as partially-populated results.
+    Layout dispatch (v1.3 §2.2): a 20-byte header carrying entry_size ∈ {20,24}
+    selects the entry size; legacy 16-byte headers decode as 20B entries with
+    no binds (host fills empty strings). Raises ProtocolError on any
+    structural violation — malformed frames must never surface as
+    partially-populated results.
     """
     if len(payload) < PACKED_SYMBOL_HEADER.size:
         raise ProtocolError("packed symbol table shorter than 16B header")
     count, module_count, name_blob_size, module_blob_size = PACKED_SYMBOL_HEADER.unpack_from(payload, 0)
-    entries_off = PACKED_SYMBOL_HEADER.size
-    name_blob_off = entries_off + PACKED_SYMBOL_ENTRY_SIZE * count
+
+    entry_size = PACKED_SYMBOL_ENTRY_SIZE
+    header_size = PACKED_SYMBOL_HEADER.size
+    if len(payload) >= PACKED_SYMBOL_HEADER_V13.size:
+        candidate = PACKED_SYMBOL_HEADER_V13.unpack_from(payload, 0)[4]
+        new_total = (PACKED_SYMBOL_HEADER_V13.size + candidate * count
+                     + name_blob_size + module_blob_size)
+        if candidate in (PACKED_SYMBOL_ENTRY_SIZE, PACKED_SYMBOL_ENTRY_V13_SIZE) \
+                and len(payload) == new_total:
+            entry_size, header_size = candidate, PACKED_SYMBOL_HEADER_V13.size
+
+    entries_off = header_size
+    name_blob_off = entries_off + entry_size * count
     module_blob_off = name_blob_off + name_blob_size
     expected = module_blob_off + module_blob_size
     if len(payload) != expected:
@@ -201,19 +224,30 @@ def decode_packed_symbols(payload: bytes) -> dict:
     addresses: list[str] = []
     sizes: list[int] = []
     module_indexes: list[int] = []
-    module_blob = payload[module_blob_off:module_blob_off + module_blob_size]
+    binds: list[str] | None = None
     name_blob = payload[name_blob_off:name_blob_off + name_blob_size]
+    module_blob = payload[module_blob_off:module_blob_off + module_blob_size]
     for i in range(count):
-        addr, size, name_off, module_idx = PACKED_SYMBOL_ENTRY.unpack_from(payload, entries_off + i * PACKED_SYMBOL_ENTRY_SIZE)
+        base = entries_off + i * entry_size
+        if entry_size == PACKED_SYMBOL_ENTRY_V13_SIZE:
+            addr, size, name_off, module_off, bind_code, rsv, rsv2 = \
+                PACKED_SYMBOL_ENTRY_V13.unpack_from(payload, base)
+            if rsv or rsv2:
+                raise ProtocolError(f"entry {i}: reserved fields must be zero")
+            if binds is None:
+                binds = []
+            binds.append(_PACKED_BIND_NAMES.get(bind_code, ""))
+        else:
+            addr, size, name_off, module_off = PACKED_SYMBOL_ENTRY.unpack_from(payload, base)
         names.append(cstr(name_blob, name_off))
         addresses.append(f"0x{addr:x}")
         sizes.append(size)
-        module_indexes.append(module_idx)
-    # module_idx is a BYTE OFFSET into module_blob (draft §3.1), not an index
+        module_indexes.append(module_off)
+
+    # module_off is a BYTE OFFSET into module_blob (draft §3.1), not an index
     for idx in module_indexes:
         if not 0 <= idx < len(module_blob):
-            raise ProtocolError(f"module_idx {idx} outside module_blob ({len(module_blob)}B)")
-    # rebuild the module name table by walking the concatenated blob
+            raise ProtocolError(f"module_off {idx} outside module_blob ({len(module_blob)}B)")
     modules: list[str] = []
     pos = 0
     while pos < len(module_blob):
@@ -222,6 +256,7 @@ def decode_packed_symbols(payload: bytes) -> dict:
             raise ProtocolError("unterminated module name in module_blob")
         modules.append(module_blob[pos:end].decode("utf-8", "replace"))
         pos = end + 1
+
     return {
         "count": count,
         "truncated": False,  # packed carries no truncated flag; bounded by max_symbols
@@ -230,5 +265,6 @@ def decode_packed_symbols(payload: bytes) -> dict:
         "names": names,
         "addresses": addresses,
         "sizes": sizes,
-        "types": [""] * count,  # not represented in packed layout
+        "types": [""] * count,  # not represented on the packed wire
+        **({"binds": binds} if binds is not None else {}),
     }

@@ -28,7 +28,9 @@ from tanyao.frames import (  # noqa: E402
     DUMP_CHUNK_HEADER,
     DUMP_CHUNK_HEADER_SIZE,
     PACKED_SYMBOL_ENTRY,
+    PACKED_SYMBOL_ENTRY_V13,
     PACKED_SYMBOL_HEADER,
+    PACKED_SYMBOL_HEADER_V13,
     Frame,
     FrameDecoder,
     decode_dump_chunk,
@@ -190,6 +192,65 @@ class TestPackedSymbols(unittest.TestCase):
         body = bytes(payload[:header_size]) + bytes(payload[header_size:]).replace(b"\x00", b"")
         with self.assertRaises(ProtocolError):
             decode_packed_symbols(body)
+
+
+def _build_packed_v13(rows, modules):
+    """v1.3 §2.2: 20B header (entry_size=24) + 24B entries + blobs."""
+    name_blob = bytearray()
+    name_offs = []
+    for name, _addr, _size, _bind in rows:
+        name_offs.append(len(name_blob))
+        name_blob += name.encode() + b"\x00"
+    module_blob = bytearray()
+    module_offs = {}
+    for m in modules:
+        module_offs[m] = len(module_blob)
+        module_blob += m.encode() + b"\x00"
+    bind_codes = {"OTHER": 0, "LOCAL": 1, "GLOBAL": 2, "WEAK": 3, "GNU_UNIQUE": 4}
+    out = bytearray(PACKED_SYMBOL_HEADER_V13.pack(
+        len(rows), len(modules), len(name_blob), len(module_blob), 24))
+    for (name, addr, size, bind), noff in zip(rows, name_offs):
+        out += PACKED_SYMBOL_ENTRY_V13.pack(addr, size, noff,
+                                            module_offs["libc.so"],
+                                            bind_codes[bind], 0, 0)
+    return bytes(out + name_blob + module_blob)
+
+
+class TestPackedBindV13(unittest.TestCase):
+    ROWS = [("pthread_create", 0x7DD2EF1160, 64, "GLOBAL"),
+            ("__libc_fork", 0x7DD2EF0B00, 32, "LOCAL")]
+
+    def test_decode_24b_entry_with_binds(self):
+        decoded = decode_packed_symbols(_build_packed_v13(self.ROWS, ["libc.so"]))
+        self.assertEqual(decoded["count"], 2)
+        self.assertEqual(decoded["names"], ["pthread_create", "__libc_fork"])
+        self.assertEqual(decoded["binds"], ["GLOBAL", "LOCAL"])
+
+    def test_reserved_fields_must_be_zero(self):
+        payload = bytearray(_build_packed_v13(self.ROWS, ["libc.so"]))
+        # entry layout: addr(8) size(4) name_off(4) module_off(4) bind(1) rsv(1) rsv16(2)
+        # first entry starts at byte 20; rsv sits at +21 within the entry
+        struct.pack_into("<B", payload, 20 + 21, 0x01)
+        with self.assertRaises(ProtocolError):
+            decode_packed_symbols(bytes(payload))
+
+    def test_entry_size_dispatch_on_legacy_payload(self):
+        legacy_rows = [(n, a, s) for n, a, s, _b in self.ROWS]
+        legacy = _build_packed(legacy_rows, ["libc.so"])  # 16B header, 20B entries
+        decoded = decode_packed_symbols(legacy)
+        self.assertEqual(decoded["count"], 2)
+        self.assertNotIn("binds", decoded)  # old layout carries no binds
+
+    def test_bad_entry_size_falls_back_or_rejects(self):
+        rows = [(n, a, s, "GLOBAL") for n, a, s, _b in self.ROWS]
+        payload = bytearray(_build_packed_v13(rows, ["libc.so"]))
+        # claim entry_size=28: total no longer matches either layout -> reject
+        PACKED_SYMBOL_HEADER_V13.pack_into(
+            payload, 0, len(rows), 1,
+            len(payload) - 20 - len(rows) * 24 - len("libc.so") - 1,
+            len("libc.so") + 1, 28)
+        with self.assertRaises(ProtocolError):
+            decode_packed_symbols(bytes(payload))
 
 
 if __name__ == "__main__":
