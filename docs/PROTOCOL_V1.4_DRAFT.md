@@ -90,3 +90,43 @@
 - 真机 DoD（逆向工程师执靶）：白名单 10 个 il2cpp 纯读 getter 全通过；
   坐标目标闭环（枚举 image → 定位 ActorVarFixVector3 → 字段偏移 →
   实例读取 → 多点采样）后本草案转正。
+
+## 5.2 kcall（内核态调用引擎，A 路线，2026-09-13 用户拍板）
+
+背景：lolm 场景 vendor/TP 内核静默中和 ptrace（D24 平台发现），用户态
+传输不可达。kcall = cmd 80 的内核态传输，**wire 语义零变化**（cmd 80
+不变，agent 按内核能力位选传输）。
+
+### 机制（task_work 家族，transport_anon 同源）
+
+1. 新 ioctl `TANYAO_IOC_KCALL`（agent 的 anon fd 上）：入参 target
+   handle/函数地址/args x0–x7/超时；内核侧完成三步接管：
+2. **劫持**：选目标主线程（tid==tgid，状态可停优先），`task_work_add`
+   在其返回用户态路径回调中（current==目标线程）安全改写
+   `task_pt_regs(current)`：保存全量原寄存器 → PC=函数、x0–x7=参数、
+   LR=蹦床地址。
+3. **蹦床**：在目标 mm 安装一页蹦床（task_work 上下文内可操作
+   current->mm），内容为 `brk #tanyao-magic`（或非法 svc，实现择优）；
+   函数 `ret` 落入蹦床 → 异常进内核。
+4. **收网**：kprobe/异常 hook 按（far/编号==magic && tgid==目标）过滤，
+   捕获用户态 pt_regs 的 x0（返回值），**恢复全量原寄存器**并抑制该
+   异常对目标的可见性（目标零感知），线程回到原执行流。
+5. **预算与放弃路径**：超时不硬抢（无法安全强停用户态执行）——迟到
+   仍可经蹦床捕获并恢复；白名单函数皆短时，v1 接受"不回收"残余风险
+   并如实上报（`call_timeout, recovery=pending`）。
+6. **能力位**：内核 backend caps 增 bit `TANYAO_CAP_KCALL`（0x40）；
+   agent hello 层不变（cmd 80 语义同），agent 传输选择：内核声明
+   kcall → 优先内核路径，ptrace 保留为无 kcall 内核的回退。
+
+### 风险登记（用户已知悉）
+
+内核侧 bug = panic/变砖级。缓解：probe 先行（自有靶 tanyao_probe_kcall
+导出确定性函数，全链验证后才上真目标）、CONFIG_KCALL 构建开关（默认
+关，显式开）、全或无寄存器保存、异常抑制正确性（目标永不观察 SIGSEGV）
+为验收硬项、卸载回滚 = 不加载模块。
+
+### 里程碑
+
+- **K0（内核）**：kcall 实现 + 自有靶 probe 全绿 + full probe 不回退。
+- **K1（agent）**：cmd 80 传输选择（kcall 优先/ptrace 回退）+ 自检。
+- **K2**：S0 lolm → RE 工程师 S0–S9 → V1.4 定版。
