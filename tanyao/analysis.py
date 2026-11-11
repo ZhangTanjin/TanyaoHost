@@ -755,6 +755,12 @@ class AnalysisFacade:
             "truncated": bool(st.get("truncated", False)),
             "skipped_ranges": int(st.get("skipped_ranges", 0)),
             "skipped_bytes": parse_u64(st.get("skipped_bytes", "0x0"), field="skipped_bytes"),
+            # Why bytes were skipped. Without this a large skipped total is
+            # unexplainable, which is exactly what hid a 1.6 GB protected
+            # region during a field investigation.
+            "skipped_events": int(st.get("skipped_events", 0)),
+            "skipped_errno": int(st.get("skipped_errno", 0)),
+            "skipped_reason": st.get("skipped_reason"),
             "engine": "agent-scan",
         }
 
@@ -1797,15 +1803,19 @@ class AnalysisFacade:
         count = max(1, min(int(count), 256))
         samples: list[list] = [[] for _ in parsed]
         previous: list[bytes | None] = [None] * len(parsed)
+        started_wall = time.time()
         for i in range(count):
             results = self.service.mem_readv(pid, parsed)
-            tick = time.time()
+            # monotonic for the sampling series (wall-clock jumps would fake a
+            # gap between samples); the absolute wall time is reported once, at
+            # the start, so a caller can still correlate with external logs.
+            tick = time.monotonic()
             for j, (addr, size) in enumerate(parsed):
                 data = results[j]
                 changed = None if previous[j] is None else data != previous[j]
                 sample: dict = {
                     "index": i,
-                    "timestamp": tick,
+                    "timestamp_monotonic": round(tick, 6),
                     "data_hex": data.hex() if data is not None else None,
                     "changed": changed,
                 }
@@ -1819,6 +1829,11 @@ class AnalysisFacade:
         return {
             "pid": pid,
             "count": count,
+            "interval_ms": interval_ms,
+            "started_wall": started_wall,
+            "clock": "timestamp_monotonic is time.monotonic(); add started_wall "
+                     "to convert to wall-clock, so a system clock jump cannot "
+                     "fake a gap between samples",
             "spans": [
                 {"address": f"0x{addr:x}", "size": size, "samples": samples[j]}
                 for j, (addr, size) in enumerate(parsed)
@@ -2106,7 +2121,18 @@ class AnalysisFacade:
             raise AgentError("not_found", detail=detail)
         region = next((e for e in entries if e.start <= address < e.end), None)
         if region is None:
-            raise AgentError("bad_request", detail=f"address 0x{address:x} not inside module {name}")
+            # Deliberately NOT auto-converting: silently translating a vaddr
+            # here would hide coordinate mistakes and make the tool answer
+            # about an address the caller never meant. Point at the right tool
+            # instead — resolve_vaddr handles .bss and multi-bias layouts.
+            raise AgentError(
+                "bad_request",
+                detail=(f"address 0x{address:x} is not inside any mapped segment of "
+                        f"{name!r}. If you have an ELF vaddr (IDA/readelf), call "
+                        f"resolve_vaddr(pid, {name!r}, vaddr) first and pass the "
+                        f"returned 'runtime' address here — .bss and multi-bias "
+                        f"modules need that conversion, and doing it by hand is "
+                        f"the usual source of wrong addresses."))
         count = max(1, min(int(count), 4096))
         # D9: file-layout rva via the per-mapping translation — the old
         # min(start) single-bias subtraction mislabeled multi-bias modules
