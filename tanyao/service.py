@@ -102,9 +102,18 @@ class TargetSession:
     opened_at: float = field(default_factory=time.monotonic)
 
 
+# Simultaneously-open targets. Each target is pinned to the connection that
+# opened it, so the pool MUST have at least this many slots plus headroom for
+# generic (non-target) work — otherwise every connection ends up pinned and
+# any generic checkout waits for a timeout that can never be satisfied.
 MAX_OPEN_TARGETS = 6
 # Sockets to keep open when the agent advertises MULTI_CONN (v1.5 bit14).
-POOL_SLOTS = 4
+# Pool size. Was 4, which is FEWER than MAX_OPEN_TARGETS: with 4 targets open
+# every slot was pinned, `_wait_idle` could never return a free connection, and
+# callers saw "no free agent connection (pool exhausted)". The agent supports
+# 8 slots (--max-connections), so use them: MAX_OPEN_TARGETS pinned targets plus
+# 2 slots for generic traffic.
+POOL_SLOTS = 8
 CONNECT_TIMEOUT = 15.0
 
 
@@ -186,7 +195,7 @@ class TanyaoService:
                 self._pool.close()
             slots = 1
             if self._conn.agent_capabilities & AGENT_CAP_MULTI_CONN:
-                slots = max(1, min(MAX_OPEN_TARGETS, POOL_SLOTS))
+                slots = max(1, POOL_SLOTS)
             self._pool = ConnectionPool(self._host, self._port, self._token,
                                         size=slots, connect_timeout=CONNECT_TIMEOUT)
             # Single-slot agents (no MULTI_CONN) cannot accept a second
@@ -209,7 +218,7 @@ class TanyaoService:
                 pass
         slots = 1
         if self._conn is not None and (self._conn.agent_capabilities & AGENT_CAP_MULTI_CONN):
-            slots = max(1, min(MAX_OPEN_TARGETS, POOL_SLOTS))
+            slots = max(1, POOL_SLOTS)
         self._pool = ConnectionPool(self._host, self._port, self._token,
                                     size=slots, connect_timeout=CONNECT_TIMEOUT)
 
@@ -578,10 +587,58 @@ class TanyaoService:
             capacity = 4096
             if not info.capabilities & (1 << 5):  # TANYAO_CAP_MAPS
                 raise AgentError("backend_error", detail="backend lacks MAPS capability")
-            resp = self._execute_for(
-                pid, CMD_TARGET_MAPS,
-                {"handle": hex_u64(session.handle), "capacity": capacity},
-            )
+            try:
+                resp = self._execute_for(
+                    pid, CMD_TARGET_MAPS,
+                    {"handle": hex_u64(session.handle), "capacity": capacity},
+                )
+            except AgentError as exc:
+                # A cached target handle can go stale without the process dying:
+                # the owning connection may have been recycled, or the agent
+                # restarted. The kernel then answers ESRCH for a handle it no
+                # longer knows. Re-open ONCE and retry before concluding the
+                # process is gone — reporting not_found for a live process was
+                # a real false-negative in the field.
+                detail = str(getattr(exc, "detail", ""))
+                if "pid no longer exists" in detail:
+                    with self._lock:
+                        self._targets.pop(pid, None)
+                        if self._pool is not None:
+                            self._pool.drop_affinity(pid)
+                        try:
+                            session = self._require_handle(pid, expected_cookie)
+                            resp = self._execute_for(
+                                pid, CMD_TARGET_MAPS,
+                                {"handle": hex_u64(session.handle),
+                                 "capacity": capacity},
+                            )
+                            status = int(resp.get("status", 0))
+                        except AgentError:
+                            raise AgentError(
+                                "not_found",
+                                detail=f"pid {pid} no longer exists (it died "
+                                       f"before its mappings could be read); "
+                                       f"re-run find_process") from exc
+                    if status == 0:
+                        entries = [MapEntry(
+                            start=parse_u64(e["start"], field="start"),
+                            end=parse_u64(e["end"], field="end"),
+                            file_offset=parse_u64(e["file_offset"],
+                                                  field="file_offset"),
+                            flags=int(e["flags"]),
+                            path=str(e.get("path", "")),
+                        ) for e in resp.get("entries", [])]
+                        self._last_maps_source = resp.get("maps_source", "target_maps")
+                        return entries
+                    raise AgentError(
+                        "not_found",
+                        detail=f"pid {pid} no longer exists; re-run find_process") from exc
+                if "not readable" in str(getattr(exc, "detail", "")):
+                    raise AgentError(
+                        "permission_denied",
+                        detail=f"pid {pid} mappings are not readable (protected by "
+                               f"SELinux/policy)") from exc
+                raise
             status = int(resp.get("status", 0))
             if status == -28:  # ENOSPC: snapshot exceeds capacity; ABI says retry with total_count
                 total = int(resp.get("total_count", 0))
@@ -593,6 +650,26 @@ class TanyaoService:
                     status = int(resp.get("status", 0))
             if status != 0:
                 total = int(resp.get("total_count", 0))
+                # Translate only the agent's UNAMBIGUOUS liveness verdict.
+                # The agent now labels each errno distinctly, so matching its
+                # text is safe here; keying on errno alone was not (a -3 from
+                # some other op means something else entirely, and treating it
+                # as "dead pid" produced false not_found for live processes).
+                if status == -1:                      # EPERM
+                    raise AgentError(
+                        "permission_denied",
+                        detail=f"pid {pid} mappings are not readable (the process "
+                               f"may be protected by SELinux/policy)")
+                if status in (-110, -4):              # ETIMEDOUT / EINTR
+                    raise AgentError(
+                        "timeout",
+                        detail=f"reading pid {pid} mappings timed out after "
+                               f"{capacity} entries; retry, or use a narrower query")
+                if status == -12:                     # ENOMEM (host-side alloc)
+                    raise AgentError(
+                        "backend_error", errno=status,
+                        detail=f"out of memory building the mapping table for "
+                               f"pid {pid} ({total} mappings)")
                 raise AgentError(
                     "backend_error",
                     errno=status,
@@ -832,7 +909,12 @@ class TanyaoService:
                 payload["count"] = int(count)
             if size is not None:
                 payload["size"] = hex_u64(size)
-            return self._execute(CMD_DISASSEMBLE, payload)
+            # Route through the pid's OWN connection: the agent's target handle
+            # is only valid on the connection that opened it. Using the control
+            # connection here worked until something else had already opened the
+            # target elsewhere, after which disassembly failed with EFAULT while
+            # read_memory on the SAME address succeeded — a confusing split.
+            return self._execute_for(pid, CMD_DISASSEMBLE, payload)
 
     def write_txn(self, pid: int, addr: int, data: bytes, *,
                   expected_cookie: int | None = None,

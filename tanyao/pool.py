@@ -220,6 +220,16 @@ class ConnectionPool:
                 self._total += 1
                 grew = True
             else:
+                # Waiting is pointless when EVERY connection is pinned to a
+                # target: those are not going to become free, so `_wait_idle`
+                # would block for the full timeout and then fail. Report the
+                # real condition immediately instead of a misleading timeout.
+                pinned_now = sum(1 for c in self._idle if c in self._pinned)
+                if pinned_now == len(self._idle) and pinned_now >= self._total:
+                    raise _unavailable(
+                        f"all {self._total} pooled connections are pinned to open "
+                        f"targets; close a target (or raise POOL_SLOTS / "
+                        f"--max-connections) before issuing generic calls")
                 if not self._wait_idle():
                     raise _unavailable("no free agent connection (pool exhausted)")
                 conn = self._idle.pop()

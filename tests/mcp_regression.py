@@ -349,9 +349,11 @@ def main() -> int:
             check("symbol_list: dynamic symbols", lambda: assert_true(
                 syms["total"] > 100 and len(syms["symbols"]) == 5,
                 f"total={syms['total']}"))
-        if caps_mask & 8:
+        if caps_mask & 8 and syms is not None:
             check("v1.2: symbol_list engine=agent-symbols", lambda: assert_true(
                 syms.get("engine") == "agent-symbols", f"engine={syms.get('engine')}"))
+        elif caps_mask & 8:
+            print("     NOTE: symbol engine check skipped (no dynsym on this target)")
 
         pthread_addr = None
         if syms is not None:
@@ -369,18 +371,31 @@ def main() -> int:
         else:
             # Static target: no symbols, so pick the first address that capstone
             # can actually decode (a segment start is often ELF headers/data).
+            # Probe inside an EXECUTABLE segment. `base` is the module's first
+            # mapping, which is normally r--p (ELF headers/rodata) — probing
+            # base+off there fails with EFAULT on any real library.
+            exec_starts = [int(sg["start"], 16) for sg in libc["segments"]
+                           if "x" in (sg.get("permissions") or "")]
+            probe_bases = exec_starts or [base]
             pthread_addr = None
-            for probe_off in (0x1000, 0x2000, 0x4000, 0x8000, 0x100):
-                cand = hex(base + probe_off)
+            candidates = []
+            for eb in probe_bases:
+                for probe_off in (0x100, 0x1000, 0x2000, 0x4000, 0x8000,
+                                  0x10000, 0x20000, 0x40000, 0x80000):
+                    candidates.append(hex(eb + probe_off))
+            for cand in candidates:
                 try:
                     call_tool("disassemble",
                               {"pid": pid, "address": cand, "count": 1,
                                "module": main_mod}, timeout=60)
                     pthread_addr = cand
                     break
-                except AssertionError:
+                except AssertionError as exc:
+                    last = str(exc)[:80]
                     continue
-            assert pthread_addr is not None, "no decodable address found in target"
+            assert pthread_addr is not None, (
+                f"no decodable address in {main_mod} (base={base_hex}); "
+                f"last error: {last if 'last' in dir() else 'n/a'}")
 
         # -- native analysis -----------------------------------------------------
         da = call_tool("disassemble", {"pid": pid, "address": pthread_addr, "count": 4, "module": main_mod}, timeout=180)
