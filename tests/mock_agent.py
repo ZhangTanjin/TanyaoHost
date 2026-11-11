@@ -1,0 +1,1762 @@
+"""Mock tanyao-agent: a faithful implementation of PROTOCOL.md v1 over TCP.
+
+Purposes:
+1. End-to-end tests for tanyao-host without a device.
+2. A small, readable REFERENCE IMPLEMENTATION for the TanyaoCli engineer
+   (the real agent is C++; semantics must match this exactly).
+
+Fake world:
+- backend "mock", caps = SESSION|TARGET_HANDLE|MEM_READ|MEM_READV|MEM_WRITE|MAPS
+- process "com.demo.game" pid=4321 with three mappings:
+    base+0x0000 r-x  /data/app/libdemo.so   (synthetic ELF64 header, 0x3000 bytes)
+    base+0x2000 rw-  /data/app/libdemo.so   (data: u32 array, 0x1000 bytes)
+    heap_start      rw-  [anon:libc_malloc] (0x10000 bytes)
+- token from env TANYAO_MOCK_TOKEN, default "tanyao-dev-token".
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+import socket
+import struct
+import threading
+import time
+import zlib
+
+# --- protocol constants (mirrors PROTOCOL.md; host code is the canonical copy) ---
+FRAME_MAGIC = 0x54594F31
+PROTOCOL_VERSION = 1
+FLAG_RESPONSE = 0x01
+FLAG_ERROR = 0x02
+FLAG_PAYLOAD_BINARY = 0x04
+HEADER = struct.Struct(">IBBHIII")  # magic, version, flags, reserved, seq, cmd, length = 20 bytes
+MAX_PAYLOAD = 16 * 1024 * 1024
+
+CMD_HELLO = 0
+CMD_AUTH = 1
+CMD_PING = 2
+CMD_SHUTDOWN = 3
+CMD_BACKEND_INFO = 10
+CMD_SESSION_INFO = 11
+CMD_TARGET_OPEN = 20
+CMD_TARGET_CLOSE = 21
+CMD_TARGET_MAPS = 22
+CMD_MEM_READ = 30
+CMD_MEM_READV = 31
+CMD_MEM_WRITE = 32
+CMD_PROCESS_FIND = 40
+CMD_PROCESS_LIST = 41
+CMD_PROCESS_ALIVE = 42
+CMD_MODULE_BASE = 43
+# v1.1 device-local scan engine (PROTOCOL.md §7)
+CMD_SCAN_START = 50
+CMD_SCAN_STATUS = 51
+CMD_SCAN_REFINE = 52
+CMD_SCAN_RESULTS = 53
+CMD_SCAN_CANCEL = 54
+CMD_SCAN_CLEAR = 55
+CMD_WRITE_TXN = 60
+# v1.2 compute-down ops (PROTOCOL_V1.2_DRAFT.md §3)
+CMD_SYMBOL_BATCH = 61
+CMD_STRINGS_SCAN = 62
+CMD_DUMP_START = 63
+CMD_DUMP_STATUS = 64
+CMD_DUMP_PULL = 65
+CMD_APK_INFO = 66
+CMD_DISASSEMBLE = 67
+CMD_DUMP_CLEANUP = 68
+CMD_CALL_EXPORT = 80  # v1.4: controlled in-process call
+
+CAP_SESSION = 1 << 0
+CAP_TARGET_HANDLE = 1 << 1
+CAP_MEM_READ = 1 << 2
+CAP_MEM_READV = 1 << 3
+CAP_MEM_WRITE = 1 << 4
+CAP_MAPS = 1 << 5
+
+# Agent-layer capability bits (hello.capabilities namespace) — mirrors
+# tanyao.constants; scan ops are gated on AGENT_CAP_SCAN.
+AGENT_CAP_SCAN = 1 << 0
+AGENT_CAP_WRITE_TXN = 1 << 1
+AGENT_CAP_SCAN_EXPLICIT_RANGES = 1 << 9  # v1.2.1: cmd 50 `ranges` support
+AGENT_CAP_FUZZY_FIND = 1 << 10    # v1.3: cmd 44 mode=substring
+AGENT_CAP_SCAN_VALUES = 1 << 11   # v1.3: cmd 50 values[] multi-value scan
+AGENT_CAP_PACKED_BIND = 1 << 12   # v1.3: cmd 61 packed 24B entry with bind
+AGENT_CAP_CALL_EXPORT = 1 << 13   # v1.4: cmd 80 controlled call (allowlist-gated)
+
+# v1.4 §5.1 baseline: 13 il2cpp pure-read getters (module: libil2cpp.so)
+CALL_ALLOWLIST_BASELINE = [
+    ("libil2cpp.so", "il2cpp_domain_get"),
+    ("libil2cpp.so", "il2cpp_domain_get_assemblies"),
+    ("libil2cpp.so", "il2cpp_class_get_name"),
+    ("libil2cpp.so", "il2cpp_class_get_field_from_name"),
+    ("libil2cpp.so", "il2cpp_image_get_name"),
+    ("libil2cpp.so", "il2cpp_class_from_name"),
+    ("libil2cpp.so", "il2cpp_class_get_methods"),
+    ("libil2cpp.so", "il2cpp_class_get_fields"),
+    ("libil2cpp.so", "il2cpp_class_get_method_from_name"),
+    ("libil2cpp.so", "il2cpp_assembly_get_image"),
+    ("libil2cpp.so", "il2cpp_class_num_fields"),
+    ("libil2cpp.so", "il2cpp_image_get_class_count"),
+    ("libil2cpp.so", "il2cpp_class_get_method_count"),
+]
+AGENT_CAP_SYMBOL_BATCH = 1 << 3
+AGENT_CAP_BINARY_FRAMES = 1 << 4
+AGENT_CAP_STRINGS = 1 << 5
+AGENT_CAP_DUMP_PIPELINE = 1 << 6
+AGENT_CAP_APK_INFO = 1 << 7
+AGENT_CAP_DISASSEMBLE = 1 << 8
+
+BASE = 0x7000000000
+HEAP_START = 0x7200000000
+DEMO_PID = 4321
+MORTAL_PID = 5000  # "com.demo.mortal": liveness toggles (D4 regression world)
+MODULE_PATH = "/data/app/libdemo.so"
+
+# Device scan engine constants (PROTOCOL.md §7.4 parity)
+SCAN_MAX_HITS = 200_000
+SCAN_CHUNK = 2 * 1024 * 1024
+SCAN_MIN_GRAN = 4096
+SCAN_MAX_GRAN = 64 * 1024 * 1024
+
+# packed symbol table (v1.2 draft §3.1), mirrors tanyao.frames
+PACKED_SYMBOL_HEADER = struct.Struct(">IIII")
+PACKED_SYMBOL_ENTRY = struct.Struct(">QIII")
+PACKED_SYMBOL_HEADER_V13 = struct.Struct(">IIIII")
+PACKED_SYMBOL_ENTRY_V13 = struct.Struct(">QIIIBBH")  # + bind u8 | rsv u8 | rsv u16
+PACKED_SYMBOL_ENTRY_V13_SIZE = 24
+
+APK_PATH = "/data/app/~~x/com.example.re/base.apk"
+APK_START = 0x7100000000
+DUMP_DIR_BUDGET = 512 * 1024 * 1024
+DUMP_CHUNK_HEADER = struct.Struct(">QIIB3xI")  # offset|data_len|raw_len|flags|rsvd|crc32
+DUMP_CHUNK_DEFLATE = 0x01
+DUMP_CHUNK_LAST = 0x02
+
+
+def _build_axml_manifest() -> bytes:
+    """Minimal binary AXML manifest (same construction style as the real one:
+    UTF-16 string pool + start/end tag stream)."""
+    strings = [
+        "manifest", "package", "com.example.re", "versionName", "1.2.3",
+        "versionCode", "uses-permission", "name", "android.permission.INTERNET",
+        "activity", "com.example.re.MainActivity", "intent-filter", "action",
+        "android.intent.action.MAIN", "category", "android.intent.category.LAUNCHER",
+    ]
+    S = {name: i for i, name in enumerate(strings)}
+    utf16 = b"".join(struct.pack("<H", len(x)) + x.encode("utf-16-le") + b"\x00\x00"
+                     for x in strings)
+    count = len(strings)
+    header = 28
+    offsets, cur = [], 0
+    for x in strings:
+        offsets.append(cur)
+        cur += 2 + len(x) * 2 + 2
+    strings_start = header + 4 * count
+    pool = struct.pack("<HHIIIIII", 0x0001, header, strings_start + len(utf16),
+                       count, 0, 0, strings_start, 0) \
+        + b"".join(struct.pack("<I", o) for o in offsets) + utf16
+
+    def start(name_idx, attrs):
+        attr_bytes = b""
+        for aname, avalue, atype in attrs:
+            attr_bytes += struct.pack("<iiIHBBI", -1, S[aname], 0xFFFFFFFF, 8, 0, atype, avalue)
+        csize = 36 + len(attr_bytes)
+        return (struct.pack("<HHI", 0x0102, 16, csize)
+                + struct.pack("<ii", 0, -1)
+                + struct.pack("<ii", -1, name_idx)
+                + struct.pack("<HHHHHH", 20, 20, len(attrs), 0, 0, 0)
+                + attr_bytes)
+
+    def end(name_idx):
+        return (struct.pack("<HHI", 0x0103, 16, 24)
+                + struct.pack("<ii", 0, -1)
+                + struct.pack("<ii", -1, name_idx))
+
+    chunks = [pool,
+              start(S["manifest"], [("package", S["com.example.re"], 0x03),
+                                    ("versionName", S["1.2.3"], 0x03),
+                                    ("versionCode", 123, 0x10)]),
+              start(S["uses-permission"], [("name", S["android.permission.INTERNET"], 0x03)]),
+              end(S["uses-permission"]),
+              start(S["activity"], [("name", S["com.example.re.MainActivity"], 0x03)]),
+              start(S["intent-filter"], []),
+              start(S["action"], [("name", S["android.intent.action.MAIN"], 0x03)]),
+              end(S["action"]),
+              start(S["category"], [("name", S["android.intent.category.LAUNCHER"], 0x03)]),
+              end(S["category"]),
+              end(S["intent-filter"]),
+              end(S["activity"]),
+              end(S["manifest"])]
+    body = b"".join(chunks)
+    return struct.pack("<HHI", 0x0003, 8, 8 + len(body)) + body
+
+
+def _build_apk_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("AndroidManifest.xml", _build_axml_manifest())
+        zf.writestr("classes.dex", b"dex\n")
+    return buf.getvalue()
+
+
+# name -> (little-endian struct fmt, size, is_float); mirrors host scan.TYPES
+SCAN_TYPES: dict[str, tuple[str, int, bool]] = {
+    "u8": ("<B", 1, False), "u16": ("<H", 2, False), "u32": ("<I", 4, False),
+    "u64": ("<Q", 8, False), "i8": ("<b", 1, False), "i16": ("<h", 2, False),
+    "i32": ("<i", 4, False), "i64": ("<q", 8, False),
+    "f32": ("<f", 4, True), "f64": ("<d", 8, True),
+}
+
+
+def build_elf64() -> bytes:
+    """Minimal AArch64 shared-object image: two PT_LOADs plus a PT_DYNAMIC with a
+    working dynsym/dynstr/DT_HASH trio, so host-side symbol parsing is testable.
+
+    Layout (all within PT_LOAD 1, vaddr 0..0x3000):
+      0x0000 ELF header (64B)
+      0x0040 program headers (3 x 56B = 168B, ends 0xE8)
+      0x0100 PT_DYNAMIC array (4 entries x 16B = 64B, ends 0x140)
+      0x0140 DT_HASH: nbucket=1, nchain=3, bucket[1], chain[3] (24B, ends 0x158)
+      0x0180 dynsym: 3 x 24B (null + demo_start + demo_data), ends 0x1C8
+      0x01C8 dynstr: "\\0demo_start\\0demo_data\\0" (22B)
+    Symbol values: demo_start -> vaddr 0x1B40 (FUNC), demo_data -> vaddr 0x2010 (OBJECT).
+    """
+    ehsize, phentsize, phnum = 64, 56, 3
+    phoff = ehsize
+    e = bytearray(0x2000)
+    e[0:4] = b"\x7fELF"
+    e[4], e[5], e[6] = 2, 1, 1  # ELF64, little-endian, current version
+    struct.pack_into("<HHIQQQIHHHHHH", e, 16,
+                     3,        # e_type = ET_DYN
+                     183,      # e_machine = EM_AARCH64
+                     1,        # e_version
+                     0x1B40,   # e_entry
+                     phoff,    # e_phoff
+                     0x1F00,   # e_shoff: DANGLING section table (device parity:
+                               # header copied from memory, table never captured)
+
+                     0,        # e_flags
+                     ehsize,   # e_ehsize
+                     phentsize, phnum,   # e_phentsize, e_phnum
+                     64, 2, 1)  # shentsize/shnum/shstrndx (dangling, sanitized on dump)
+    # PT_LOAD 1: file vaddr 0, exec (p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align)
+    struct.pack_into("<IIQQQQQQ", e, phoff,
+                     1, 5, 0, 0, 0x3000, 0x3000, 0, 0x1000)
+    # PT_LOAD 2: file vaddr 0x2000, rw, memsz > filesz (BSS)
+    struct.pack_into("<IIQQQQQQ", e, phoff + phentsize,
+                     1, 6, 0x2000, 0x2000, 0, 0x200, 0x400, 0x1000)
+    # PT_DYNAMIC: vaddr 0x100, 64 bytes
+    struct.pack_into("<IIQQQQQQ", e, phoff + 2 * phentsize,
+                     2, 6, 0x100, 0x100, 0, 0x40, 0x40, 8)
+
+    # dynamic array at 0x100: HASH, STRTAB, SYMTAB, STRSZ
+    SYMTAB, STRTAB, HASH = 0x180, 0x1C8, 0x140
+    strtab = b"\x00demo_start\x00demo_data\x00"
+    assert len(strtab) == 22
+    struct.pack_into("<QQ", e, 0x100, 4, HASH)        # DT_HASH
+    struct.pack_into("<QQ", e, 0x110, 5, STRTAB)      # DT_STRTAB
+    struct.pack_into("<QQ", e, 0x120, 6, SYMTAB)      # DT_SYMTAB
+    struct.pack_into("<QQ", e, 0x130, 10, len(strtab))  # DT_STRSZ
+    struct.pack_into("<QQ", e, 0x140, 0, 0)           # DT_NULL
+
+    # DT_HASH at 0x140: nbucket=1, nchain=3, bucket[0]=1, chain=[0,0,2]
+    struct.pack_into("<II", e, HASH, 1, 3)
+    struct.pack_into("<I", e, HASH + 8, 1)       # bucket[0] -> symbol 1
+    struct.pack_into("<III", e, HASH + 12, 0, 0, 2)  # chain (terminator on idx 2)
+
+    # dynsym at 0x180: [null, demo_start, demo_data]
+    struct.pack_into("<IBBHQQ", e, SYMTAB, 0, 0, 0, 0, 0, 0)
+    struct.pack_into("<IBBHQQ", e, SYMTAB + 24, 1, 0x12, 0, 1, 0x1B40, 0x40)  # FUNC GLOBAL (shndx=1: defined)
+    struct.pack_into("<IBBHQQ", e, SYMTAB + 48, 12, 0x11, 0, 1, 0x2010, 8)    # OBJECT GLOBAL (shndx=1)
+    e[STRTAB:STRTAB + len(strtab)] = strtab
+    return bytes(e)
+
+
+class FakeMemory:
+    """A set of flat regions; reads outside any region return EFAULT semantics."""
+
+    def __init__(self) -> None:
+        self.regions: list[tuple[int, bytearray]] = []
+
+    def add(self, start: int, size: int, fill: bytes | None = None) -> bytearray:
+        buf = bytearray(size)
+        if fill:
+            buf[: len(fill)] = fill
+        self.regions.append((start, buf))
+        return buf
+
+    def _find(self, addr: int, size: int) -> tuple[bytearray, int] | None:
+        for start, buf in self.regions:
+            if start <= addr and addr + size <= start + len(buf):
+                return buf, addr - start
+        return None
+
+    def read(self, addr: int, size: int) -> bytes:
+        # poisoned ranges always fault (simulates [vvar] VM_PFNMAP pages, P1)
+        for plo, phi in getattr(self, "poison", []):
+            if addr < phi and addr + size > plo:
+                raise MemoryFault()
+        found = self._find(addr, size)
+        if found is None:
+            raise MemoryFault()
+        buf, off = found
+        return bytes(buf[off : off + size])
+
+    def write(self, addr: int, data: bytes) -> None:
+        found = self._find(addr, len(data))
+        if found is None:
+            raise MemoryFault()
+        buf, off = found
+        buf[off : off + len(data)] = data
+
+
+class MemoryFault(Exception):
+    pass
+
+
+class MockScanJob:
+    """One device-local scan job (single job slot, v1.1 semantics)."""
+
+    __slots__ = ("id", "spec", "ranges", "state", "round", "scanned", "total",
+                 "skipped", "hits", "truncated", "error", "started", "finished",
+                 "cancel", "dead_gran", "hex_carry",
+                 "str_start", "str_buf", "str_total")
+
+    def __init__(self, job_id: int, spec: dict, ranges: list[tuple[int, int]]) -> None:
+        self.id = job_id
+        self.spec = spec
+        self.ranges = ranges
+        self.state = "running"  # running | done | error | cancelled
+        self.round = 1  # first scan counts as round 1 (PROTOCOL.md §7.3)
+        self.scanned = 0
+        self.total = sum(hi - lo for lo, hi in ranges)
+        self.skipped: list[tuple[int, int]] = []
+        self.hits: list[dict] = []
+        self.truncated = False
+        self.error = ""
+        self.started = time.monotonic()
+        self.finished: float | None = None
+        self.cancel = threading.Event()
+        self.dead_gran = SCAN_MIN_GRAN
+        self.hex_carry = b""
+        # strings state machine (kind == "strings")
+        self.str_start = None
+        self.str_buf = bytearray()
+        self.str_total = 0
+
+
+def _parse_aob(pattern: str) -> tuple[bytes, bytes]:
+    """Parse "7F 45 ?? 46" into (pattern, mask); 0x00 mask = wildcard."""
+    pb = bytearray()
+    mb = bytearray()
+    for tok in pattern.split():
+        if tok in ("?", "??"):
+            pb.append(0)
+            mb.append(0)
+        else:
+            pb.append(int(tok, 16))
+            mb.append(0xFF)
+    return bytes(pb), bytes(mb)
+
+
+def _mock_match(found, want, eps: float) -> bool:
+    """Float: eps>0 window else isclose(rel_tol=1e-6); ints exact (§7.4)."""
+    if isinstance(found, float) or isinstance(want, float):
+        if eps > 0:
+            return abs(found - want) <= eps
+        return math.isclose(found, want, rel_tol=1e-6)
+    return found == want
+
+
+def _raw8(value, fmt: str, size: int) -> bytes:
+    """Raw 8-byte little-endian form of a hit value (value_hex backing)."""
+    if isinstance(value, float):
+        return struct.pack(fmt, value) + b"\x00" * (8 - size)
+    return (value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+
+
+def _u64(value, field: str = "value") -> int:
+    if isinstance(value, str) and value.lower().startswith("0x"):
+        return int(value, 16)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ProtocolFail("bad_request", detail=f"bad u64 field {field}")
+
+
+def hx(v: int) -> str:
+    """u64 → lowercase 0x hex string (module-level for op helpers)."""
+    return f"0x{v:x}"
+
+
+class MockAgent:
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, token: str | None = None,
+                 agent_caps: int = 0, disasm_available: bool = True,
+                 build: str | None = None,
+                 call_allowlist: list[tuple[str, str]] | None = None,
+                 call_behavior: str = "ok") -> None:
+        self.disasm_available = disasm_available
+        self.build = build
+        # v1.4 §3: bit13 is declared only with a non-empty allowlist; empty or
+        # absent → cmd 80 answers unsupported (default-decline)
+        self.call_allowlist = set(call_allowlist if call_allowlist is not None
+                                  else CALL_ALLOWLIST_BASELINE)
+        self.call_behavior = call_behavior  # ok | timeout | fail
+        self.call_audit: list[dict] = []
+        self._call_audit_seq = 0
+        self._call_in_flight = False
+        self.token = token if token is not None else os.environ.get("TANYAO_MOCK_TOKEN", "tanyao-dev-token")
+        self.agent_caps = agent_caps
+        self.generation = 1
+        self.start_time = time.monotonic()
+        self.memory = FakeMemory()
+        self._build_world()
+        self._scan_job: "MockScanJob | None" = None
+        self._scan_seq = 0
+        self._scan_lock = threading.Lock()
+        # D4 world: a mortal process; alive_overreport simulates the kernel
+        # kOpIsAlive find_get_pid quirk (pinned dead pid still answers alive)
+        self.mortal_alive = True
+        self.alive_overreport = False
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind((host, port))
+        self._srv.listen(4)
+        self.port = self._srv.getsockname()[1]
+        self._active_conn: socket.socket | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+
+    # -- world -----------------------------------------------------------------
+
+    def _build_world(self) -> None:
+        # module exec map at BASE: real ELF64 header with PT_LOAD1 sized to 0x2000
+        exec_map = self.memory.add(BASE, 0x2000, build_elf64()[:0x2000])
+        struct.pack_into("<IIQQQQQQ", exec_map, 64, 1, 5, 0, 0, 0x2000, 0x2000, 0, 0x1000)
+        data_map = self.memory.add(BASE + 0x2000, 0x1000)
+        for i in range(0x400 // 4):
+            struct.pack_into("<I", data_map, i * 4, 1000 + i * 7)
+        heap = self.memory.add(HEAP_START, 0x10000)
+        # pointer chain for tests: HEAP_START+0x100 -> HEAP_START+0x400
+        struct.pack_into("<Q", heap, 0x100, HEAP_START + 0x400)
+        # ... -> +0x40 -> value u32 0xDEADBEEF at +0x8
+        struct.pack_into("<Q", heap, 0x440, HEAP_START + 0x480)
+        struct.pack_into("<I", heap, 0x488, 0xDEADBEEF)
+        # scattered u32 values for scan tests
+        struct.pack_into("<I", heap, 0x1000, 1337)
+        struct.pack_into("<I", heap, 0x2000, 1337)
+        struct.pack_into("<I", heap, 0x3004, 1337)  # unaligned to 4 relative to heap start
+        struct.pack_into("<I", heap, 0x4000, 424242)
+        # P1 regression world: a [vvar]-like poisoned hole INSIDE the heap range
+        # (1 page at heap+0x8000..0x9000) plus extra hits behind it — verifies
+        # bisection skip keeps scanning and preserves later hits
+        self.memory.poison = [(HEAP_START + 0x8000, HEAP_START + 0x9000)]
+        struct.pack_into("<I", heap, 0xA000, 1337)  # hit AFTER the hole
+        # P2-2 regression world: -w-p tail mapping with file-offset drift
+        # (vaddr BASE+0x3000..0x4000 = file offset 0x2000..0x3000)
+        self.memory.add(BASE + 0x3000, 0x1000, bytes(range(256)) * 16)
+        self.wtail_vaddr, self.wtail_file_off = BASE + 0x3000, 0x2000
+        # toolchain regression world: decodable A64 prologue at BASE+0x800 and
+        # ASCII strings for strings() inside the module image
+        #   stp x29, x30, [sp, #-16]!
+        #   mov x0, #1337        (movz)
+        #   bl +0x400
+        #   cbz x0, +8
+        #   ret
+        prologue = struct.pack("<5I",
+                               0xA9BF7BFD,  # stp x29, x30, [sp, #-16]!
+                               0xD280A720,  # mov x0, #0x539
+                               0x94000100,  # bl +0x400
+                               0xB4000040,  # cbz x0, +8
+                               0xD65F03C0)  # ret
+        exec_map[0x800:0x800 + len(prologue)] = prologue
+        marker = b"tanyao_mock_engine\x00"
+        exec_map[0x900:0x900 + len(marker)] = marker
+        marker2 = b"Java_icu_nullptr_test\x00"
+        exec_map[0x940:0x940 + len(marker2)] = marker2
+        # strings marker in the heap (outside module) for window-mode tests
+        hmarker = b"TANYAO_STRINGS_WINDOW_MARKER\x00"
+        heap[0xB000:0xB000 + len(hmarker)] = hmarker
+
+        # v1.2 world: a mapped base.apk (zip with AXML manifest) for the dump
+        # pipeline path-pull (cmd 65 `path`) and apk_info (cmd 66)
+        self.apk_bytes = _build_apk_bytes()
+        self.memory.add(APK_START, len(self.apk_bytes), self.apk_bytes)
+        self.pullable_paths = {APK_PATH: self.apk_bytes}
+        self.dumps: dict[str, dict] = {}
+
+        # Canonical target_maps snapshot shared by cmd 22 and the device scan
+        # engine presets (same table a real agent gets from the kernel).
+        self.target_maps = [
+            {"start": BASE, "end": BASE + 0x2000, "file_offset": 0,
+             "flags": 1 | 4 | 8, "path": MODULE_PATH},
+            {"start": BASE + 0x2000, "end": BASE + 0x3000, "file_offset": 0x2000,
+             "flags": 1 | 2 | 8, "path": MODULE_PATH},
+            {"start": BASE + 0x3000, "end": BASE + 0x4000, "file_offset": 0x2000,
+             "flags": 2 | 8, "path": MODULE_PATH},
+            {"start": HEAP_START, "end": HEAP_START + 0x10000, "file_offset": 0,
+             "flags": 1 | 2 | 8 | 32, "path": ""},
+            {"start": APK_START, "end": APK_START + len(self.apk_bytes),
+             "file_offset": 0, "flags": 1 | 8, "path": APK_PATH},
+        ]
+
+    # -- networking ----------------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._srv.accept()
+            except OSError:
+                return
+            if self._active_conn is not None:
+                # tolerate teardown races: wait briefly for a dying connection
+                deadline = time.monotonic() + 0.25
+                while self._active_conn is not None and time.monotonic() < deadline:
+                    if self._active_is_dead(self._active_conn):
+                        self._active_conn = None
+                        break
+                    time.sleep(0.01)
+            if self._active_conn is not None:
+                try:
+                    self._send(conn, 0, CMD_HELLO, {"error": "busy"},
+                               FLAG_RESPONSE | FLAG_ERROR)
+                except OSError:
+                    pass
+                conn.close()
+                continue
+            self._active_conn = conn
+            threading.Thread(target=self._serve_conn, args=(conn,), daemon=True).start()
+
+    @staticmethod
+    def _active_is_dead(conn: socket.socket) -> bool:
+        """True if the peer has closed (EOF) or the socket is broken."""
+        try:
+            conn.settimeout(0)
+            try:
+                return conn.recv(1) == b""
+            except BlockingIOError:
+                return False  # alive, nothing to read
+            except OSError:
+                return True
+        except OSError:
+            return True
+        finally:
+            try:
+                conn.settimeout(60)
+            except OSError:
+                pass
+
+    def _serve_conn(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(60)
+            challenge = os.urandom(32).hex()
+            hello = {
+                "agent": "tanyao-agent",
+                "version": "0.1.0-mock",
+                "generation": self.generation,
+                "challenge": challenge,
+            }
+            caps = self.agent_caps
+            if caps & AGENT_CAP_CALL_EXPORT and not self.call_allowlist:
+                caps &= ~AGENT_CAP_CALL_EXPORT  # default-decline (v1.4 §3.1)
+            if caps:
+                # v1.0 agents omit the field entirely; host treats absent as 0.
+                hello["capabilities"] = hex(caps)
+            if self.build:
+                hello["build"] = self.build  # v1.2.1 附录 (D2 prevention)
+            self._send(conn, 0, CMD_HELLO, hello, 0)
+            decoder_buffer = bytearray()
+            authed = False
+            expected_seq = 0
+            while not self._stop.is_set():
+                frame = self._recv(conn, decoder_buffer)
+                if frame is None:
+                    break
+                seq, cmd, _flags, payload = frame
+                if not authed:
+                    if cmd == CMD_AUTH:
+                        proof = payload.get("proof", "")
+                        want = hashlib.sha256((self.token + challenge).encode()).hexdigest()
+                        if hmac_equal(proof, want):
+                            authed = True
+                            expected_seq = seq  # auth consumes a sequence number too
+                            self._send(conn, seq, cmd, {"ok": True}, FLAG_RESPONSE)
+                            continue
+                        self._send(conn, seq, cmd, {"ok": False, "error": "auth_failed"},
+                                   FLAG_RESPONSE | FLAG_ERROR)
+                        break
+                    self._send(conn, seq, cmd, {"ok": False, "error": "auth_required"},
+                               FLAG_RESPONSE | FLAG_ERROR)
+                    break
+                if seq != expected_seq + 1:
+                    # out-of-order sequence: protocol error, drop
+                    break
+                expected_seq = seq
+                try:
+                    resp = self._dispatch(cmd, payload)
+                    self._send(conn, seq, cmd, resp, FLAG_RESPONSE)
+                except ProtocolFail as exc:
+                    body = {"ok": False, "error": exc.error, "errno": exc.errno,
+                            "detail": exc.detail}
+                    body.update(exc.extra)
+                    self._send(conn, seq, cmd, body, FLAG_RESPONSE | FLAG_ERROR)
+                    if exc.fatal:
+                        break
+                if cmd == CMD_SHUTDOWN:
+                    break
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            if self._active_conn is conn:
+                self._active_conn = None
+
+    # -- op dispatch ------------------------------------------------------------------
+
+    def _dispatch(self, cmd: int, payload: dict) -> dict:
+        def u64(value, field="value"):
+            if isinstance(value, str) and value.lower().startswith("0x"):
+                return int(value, 16)
+            if isinstance(value, int) and value >= 0:
+                return value
+            raise ProtocolFail("bad_request", detail=f"bad u64 field {field}")
+
+        def hx(v):
+            return f"0x{v:x}"
+
+        if cmd == CMD_PING:
+            return {"ok": True, "uptime_sec": int(time.monotonic() - self.start_time)}
+        if cmd == CMD_SHUTDOWN:
+            return {"ok": True}
+        if cmd == CMD_BACKEND_INFO:
+            caps = CAP_SESSION | CAP_TARGET_HANDLE | CAP_MEM_READ | CAP_MEM_READV | CAP_MEM_WRITE | CAP_MAPS
+            return {"abi_major": 1, "abi_minor": 0, "capabilities": hx(caps),
+                    "page_size": 4096, "pointer_bits": 64,
+                    "max_transfer_size": hx(1 << 20), "max_iov": 64,
+                    "backend_flags": hx(0x7), "name": "mock"}
+        if cmd == CMD_SESSION_INFO:
+            return {"session_id": hx(0xABCD), "capabilities": hx(0x3F)}
+        if cmd == CMD_TARGET_OPEN:
+            pid = payload.get("pid")
+            if pid != DEMO_PID:
+                raise ProtocolFail("backend_error", errno=-3, detail=f"no such pid {pid}")
+            return {"handle": hx(pid << 8), "start_cookie": hx(0x1234ABCD)}
+        if cmd == CMD_TARGET_CLOSE:
+            return {}
+        if cmd == CMD_TARGET_MAPS:
+            handle = u64(payload.get("handle"), "handle")
+            if handle != DEMO_PID << 8:
+                raise ProtocolFail("bad_request", detail="unknown handle")
+            entries = [
+                {"start": hx(m["start"]), "end": hx(m["end"]),
+                 "file_offset": hx(m["file_offset"]), "flags": m["flags"],
+                 "path": m["path"]}
+                for m in self.target_maps
+            ]
+            return {
+                "status": 0, "entry_count": len(entries), "total_count": len(entries),
+                "target_cookie": hx(0x1234ABCD),
+                "maps_source": "target_maps",
+                "entries": entries,
+            }
+        if cmd == CMD_MEM_READ:
+            handle = u64(payload.get("handle"), "handle")
+            addr = u64(payload.get("addr"), "addr")
+            size = u64(payload.get("size"), "size")
+            if size > (1 << 20):
+                raise ProtocolFail("bad_request", detail="size exceeds max_transfer_size")
+            import base64
+            try:
+                data = self.memory.read(addr, size)
+            except MemoryFault:
+                return {"status": -14, "result_size": "0x0", "data_b64": ""}
+            return {"status": 0, "result_size": hx(len(data)), "data_b64": base64.b64encode(data).decode()}
+        if cmd == CMD_MEM_READV:
+            handle = u64(payload.get("handle"), "handle")
+            import base64
+            spans = []
+            failed_idx = None
+            for i, span in enumerate(payload.get("iov", [])[:64]):
+                if failed_idx is not None:
+                    # kernel prefix semantics (P2-1): vectors after the first
+                    # failure are not attempted and report ECANCELED
+                    spans.append({"status": -104, "result_size": "0x0", "data_b64": ""})
+                    continue
+                try:
+                    data = self.memory.read(u64(span["addr"], "addr"), u64(span["size"], "size"))
+                    spans.append({"status": 0, "result_size": hx(len(data)),
+                                  "data_b64": base64.b64encode(data).decode()})
+                except MemoryFault:
+                    failed_idx = i
+                    spans.append({"status": -14, "result_size": "0x0", "data_b64": ""})
+            completed = failed_idx if failed_idx is not None else len(spans)
+            total = sum(int(s["result_size"], 16) for s in spans[:completed])
+            return {"status": 0, "completed_iov": completed, "total_completed": hx(total), "spans": spans}
+        if cmd == CMD_MEM_WRITE:
+            handle = u64(payload.get("handle"), "handle")
+            addr = u64(payload.get("addr"), "addr")
+            import base64
+            data = base64.b64decode(payload.get("data_b64", ""))
+            try:
+                self.memory.write(addr, data)
+            except MemoryFault:
+                return {"status": -14, "result_size": "0x0"}
+            return {"status": 0, "result_size": hx(len(data))}
+        if cmd == CMD_PROCESS_FIND:
+            return self._process_find(payload)
+        if cmd == CMD_PROCESS_LIST:
+            pids = [DEMO_PID, 1]
+            if self.mortal_alive:
+                pids.append(MORTAL_PID)
+            return {"pids": pids}
+        if cmd == CMD_PROCESS_ALIVE:
+            pid = payload.get("pid")
+            if pid == DEMO_PID:
+                return {"alive": True}
+            if pid == MORTAL_PID:
+                return {"alive": self.mortal_alive or self.alive_overreport}
+            return {"alive": False}
+        if cmd == CMD_MODULE_BASE:
+            if payload.get("name") == "libdemo.so" and payload.get("pid") == DEMO_PID:
+                return {"base": hx(BASE)}
+            raise ProtocolFail("not_found")
+        if cmd in (CMD_SCAN_START, CMD_SCAN_STATUS, CMD_SCAN_REFINE,
+                   CMD_SCAN_RESULTS, CMD_SCAN_CANCEL, CMD_SCAN_CLEAR):
+            if not self.agent_caps & AGENT_CAP_SCAN:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            if cmd == CMD_SCAN_START:
+                return self._scan_start(payload)
+            if cmd == CMD_SCAN_STATUS:
+                return self._scan_status(payload)
+            if cmd == CMD_SCAN_REFINE:
+                return self._scan_refine(payload)
+            if cmd == CMD_SCAN_RESULTS:
+                return self._scan_results(payload)
+            if cmd == CMD_SCAN_CANCEL:
+                return self._scan_cancel(payload)
+            return self._scan_clear(payload)
+        if cmd == CMD_SYMBOL_BATCH:
+            if not self.agent_caps & AGENT_CAP_SYMBOL_BATCH:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._symbol_batch(payload)
+        if cmd == CMD_STRINGS_SCAN:
+            if not self.agent_caps & AGENT_CAP_STRINGS:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._strings_scan(payload)
+        if cmd == CMD_WRITE_TXN:
+            if not self.agent_caps & AGENT_CAP_WRITE_TXN:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._write_txn(payload)
+        if cmd in (CMD_DUMP_START, CMD_DUMP_STATUS, CMD_DUMP_PULL, CMD_DUMP_CLEANUP):
+            if not self.agent_caps & AGENT_CAP_DUMP_PIPELINE:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            if cmd == CMD_DUMP_START:
+                return self._dump_start(payload)
+            if cmd == CMD_DUMP_STATUS:
+                return self._dump_status(payload)
+            if cmd == CMD_DUMP_PULL:
+                return self._dump_pull(payload)
+            return self._dump_cleanup(payload)
+        if cmd == CMD_APK_INFO:
+            if not self.agent_caps & AGENT_CAP_APK_INFO:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._apk_info(payload)
+        if cmd == CMD_CALL_EXPORT:
+            if not self.agent_caps & AGENT_CAP_CALL_EXPORT or not self.call_allowlist:
+                raise ProtocolFail("unsupported", 0, "call_export unavailable (no allowlist)")
+            return self._call_export(payload)
+        if cmd == CMD_DISASSEMBLE:
+            if not self.agent_caps & AGENT_CAP_DISASSEMBLE:
+                raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+            return self._disassemble(payload)
+        # undeclared-or-unimplemented ops behave exactly like unknown cmds
+        # (unsupported_cmd, no disconnect)
+        raise ProtocolFail("unsupported_cmd", detail=f"cmd {cmd}")
+
+    # -- cmd 60 write_txn (PROTOCOL.md §7.5) ---------------------------------------
+
+    def _write_txn(self, payload):
+        import base64
+
+        handle = _u64(payload.get("handle", "0x0"), "handle")
+        if handle != DEMO_PID << 8:
+            raise ProtocolFail("bad_request", detail="unknown handle")
+        addr = _u64(payload.get("addr"), "addr")
+        data = base64.b64decode(payload.get("data_b64", ""))
+        expect_old = payload.get("expect_old_b64")
+        expect_old = base64.b64decode(expect_old) if expect_old else None
+        verify = bool(payload.get("verify", True))
+        try:
+            old = self.memory.read(addr, len(data))
+        except MemoryFault:
+            raise ProtocolFail("backend_error", -14, "read old failed")
+        if expect_old is not None and old != expect_old:
+            raise ProtocolFail("expect_old_mismatch", 0, "expect_old mismatch",
+                               extra={"old_b64": base64.b64encode(old).decode()})
+        self.memory.write(addr, data)
+        if verify:
+            back = self.memory.read(addr, len(data))
+            if back != data:
+                try:
+                    self.memory.write(addr, old)  # best-effort rollback
+                except MemoryFault:
+                    pass
+                raise ProtocolFail("verify_failed", 0, "readback mismatch; rolled back")
+        return {"ok": True, "old_b64": base64.b64encode(old).decode(),
+                "result_size": hx(len(data)), "verified": verify, "rolled_back": False}
+
+    # -- cmd 63/64/65/68 dump pipeline (v1.2 draft §3.3-§3.5) -----------------------
+
+    def _dump_start(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        module = payload.get("module")
+        if not isinstance(module, str) or not module:
+            raise ProtocolFail("bad_request", detail="module required")
+        out_name = payload.get("out_name") or module
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", out_name) or ".." in out_name:
+            raise ProtocolFail("bad_request", detail=f"illegal out_name {out_name!r}")
+        include_anonymous = bool(payload.get("include_anonymous", False))
+        if sum(len(d["image"]) for d in self.dumps.values()) >= DUMP_DIR_BUDGET:
+            raise ProtocolFail("disk_budget", 0, "dump directory over budget; cleanup first")
+
+        from tanyao.dump import dump_module as build_dump
+        from tanyao.service import MapEntry
+
+        maps = [MapEntry(start=m["start"], end=m["end"], file_offset=m["file_offset"],
+                         flags=m["flags"], path=m["path"]) for m in self.target_maps]
+        try:
+            image, manifest = build_dump(pid, module, maps,
+                                         read_fn=self.memory.read,
+                                         include_anonymous=include_anonymous)
+        except ValueError as exc:
+            raise ProtocolFail("not_found", 0, str(exc))
+        sha = hashlib.sha256(image).hexdigest()
+        dump_id = f"{out_name}-{os.urandom(2).hex()}"
+        while dump_id in self.dumps:  # collision regenerate
+            dump_id = f"{out_name}-{os.urandom(2).hex()}"
+        self.dumps[dump_id] = {"image": image, "manifest": manifest.to_dict(),
+                               "sha256": sha, "created": time.monotonic()}
+        path = f"/data/local/tmp/tanyao-dump/{dump_id}.so"
+        return {"dump_id": dump_id, "path": path, "size": hx(len(image)), "sha256": sha,
+                "manifest_path": path + ".manifest.json",
+                "mappings": len(manifest.entries), "sanitized": bool(manifest.sanitized),
+                "maps_source": manifest.maps_source, "skipped": manifest.skipped,
+                "manifest": manifest.to_dict()}
+
+    def _dump_status(self, payload):
+        if payload.get("list"):
+            now = time.monotonic()
+            return {"dumps": [{"dump_id": k, "size": hx(len(v["image"])),
+                               "age_sec": round(now - v["created"], 1)}
+                              for k, v in self.dumps.items()]}
+        dump_id = payload.get("dump_id")
+        entry = self.dumps.get(dump_id)
+        if entry is None:
+            return {"exists": False}
+        return {"exists": True, "size": hx(len(entry["image"])),
+                "sha256": entry["sha256"],
+                "age_sec": round(time.monotonic() - entry["created"], 1)}
+
+    def _dump_pull(self, payload):
+        offset = _u64(payload.get("offset", "0x0"), "offset")
+        chunk = _u64(payload.get("chunk", "0x40000"), "chunk")
+        if chunk <= 0 or chunk > MAX_PAYLOAD - DUMP_CHUNK_HEADER.size:
+            raise ProtocolFail("bad_request", detail="chunk out of range")
+        compress = bool(payload.get("compress", True))
+        if payload.get("path"):
+            path = payload["path"]
+            if not path.startswith("/data/app/"):
+                raise ProtocolFail("bad_request", detail="path pull limited to /data/app/")
+            blob = self.pullable_paths.get(path)
+            if blob is None:
+                raise ProtocolFail("not_found", detail=f"no such device file {path!r}")
+        else:
+            dump_id = payload.get("dump_id")
+            entry = self.dumps.get(dump_id) if dump_id else None
+            if entry is None:
+                raise ProtocolFail("not_found", detail=f"no such dump_id {dump_id!r}")
+            blob = entry["image"]
+        if offset >= len(blob):
+            data, raw, flags = b"", 0, DUMP_CHUNK_LAST
+        else:
+            raw_blob = blob[offset:offset + chunk]
+            raw = len(raw_blob)
+            flags = 0
+            data = raw_blob
+            if compress:
+                data = zlib.compress(raw_blob)
+                flags |= DUMP_CHUNK_DEFLATE
+            if offset + chunk >= len(blob):
+                flags |= DUMP_CHUNK_LAST
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        return bytes(DUMP_CHUNK_HEADER.pack(offset, len(data), raw, flags, crc) + data)
+
+    def _dump_cleanup(self, payload):
+        dump_id = payload.get("dump_id")
+        if dump_id not in self.dumps:
+            raise ProtocolFail("not_found", detail=f"no such dump_id {dump_id!r}")
+        del self.dumps[dump_id]
+        return {"ok": True}
+
+    # -- cmd 66 apk_info (v1.2 draft §3.6) -------------------------------------------
+
+    def _apk_info(self, payload):
+        import io
+        import zipfile
+
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        apk_maps = [m for m in self.target_maps
+                    if m["path"].startswith("/data/app/") and m["path"].endswith("/base.apk")]
+        if not apk_maps:
+            raise ProtocolFail("not_found", 0, "no base.apk mapping in target maps")
+        path = apk_maps[0]["path"]
+        try:
+            blob = self.pullable_paths.get(path)
+            if blob is None:
+                start = apk_maps[0]["start"]
+                blob = self.memory.read(start, apk_maps[0]["end"] - start)
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                xml = zf.read("AndroidManifest.xml")
+            from tanyao.native import parse_axml
+
+            info = parse_axml(xml)
+        except Exception as exc:  # noqa: BLE001 — zip/AXML failures are internal
+            raise ProtocolFail("internal", 0, f"apk parse failed: {exc}")
+        launchers = info.get("launcher_activities", [])
+        return {"apk_path": path,
+                "package": info.get("package"),
+                "version_name": info.get("version_name"),
+                "version_code": info.get("version_code"),
+                "entry_activity": launchers[0] if launchers else None,
+                "permissions": info.get("permissions", []),
+                "activities": info.get("activities", []),
+                "launcher_activities": launchers,
+                "split_apks": [p for p in self.pullable_paths if p != path]}
+
+    # -- cmd 67 disassemble (v1.2 draft §3.7, optional capability) --------------------
+
+    def _disassemble(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        if not self.disasm_available:
+            raise ProtocolFail("unsupported", 0, "built without capstone")
+        addr = _u64(payload.get("addr"), "addr")
+        count = payload.get("count")
+        size = payload.get("size")
+        if (count is None) == (size is None):
+            raise ProtocolFail("bad_request", detail="count or size required (one)")
+        if count is not None:
+            if not isinstance(count, int) or count <= 0 or count > 4096:
+                raise ProtocolFail("bad_request", detail="count out of range")
+            read_size = count * 4
+        else:
+            read_size = _u64(size, "size")
+            if read_size > 64 * 1024:
+                raise ProtocolFail("bad_request", detail="size out of range")
+        try:
+            data = self.memory.read(addr, read_size)
+        except MemoryFault:
+            raise ProtocolFail("backend_error", -14, "mem_read failed")
+        from tanyao.native import CAPSTONE_OK, disassemble_a64_ex
+
+        if not CAPSTONE_OK:
+            raise ProtocolFail("unsupported", 0, "capstone unavailable")
+        decoded = disassemble_a64_ex(data, addr,
+                                     max_instructions=count if count else read_size // 4,
+                                     engine="capstone")
+        instructions = []
+        for ins in decoded["instructions"]:
+            parts = ins["text"].split(" ", 1)
+            instructions.append({"address": ins["addr"], "bytes_hex": ins["bytes"],
+                                 "mnemonic": parts[0],
+                                 "op_str": parts[1] if len(parts) > 1 else ""})
+        return {"engine": "capstone", "count": len(instructions), "instructions": instructions}
+
+    # -- cmd 80 call_export (v1.4 draft reference implementation) ------------------
+
+    def _call_export(self, payload: dict) -> dict:
+        if self._call_in_flight:
+            # v1.4 §3.5 single-flight (mock loop is serial; kept for shape)
+            raise ProtocolFail("already_running", 0, "another call in flight")
+        self._call_in_flight = True
+        try:
+            return self._call_export_inner(payload)
+        finally:
+            self._call_in_flight = False
+
+    def _call_export_inner(self, payload: dict) -> dict:
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        module = payload.get("module")
+        symbol = payload.get("symbol")
+        if not isinstance(module, str) or not module or not isinstance(symbol, str) or not symbol:
+            raise ProtocolFail("bad_request", detail="module and symbol required")
+        ret_type = payload.get("ret_type", "u64")
+        if ret_type not in ("u64", "f64", "void"):
+            raise ProtocolFail("bad_request", detail=f"unknown ret_type {ret_type!r}")
+        args = payload.get("args", [])
+        if not isinstance(args, list) or len(args) > 8:
+            raise ProtocolFail("bad_request", detail="args must be a list of at most 8 entries")
+        probe_ret = bool(payload.get("probe_ret", False))
+        audit_id = self._call_audit_seq + 1
+
+        def audit(result: str) -> None:
+            self._call_audit_seq += 1
+            self.call_audit.append({
+                "audit_id": self._call_audit_seq, "pid": pid, "module": module,
+                "symbol": symbol, "result": result, "args": args,
+            })
+
+        # §3.1 default-deny: (module basename, symbol) must be whitelisted
+        if (module.rsplit("/", 1)[-1], symbol) not in self.call_allowlist:
+            audit("not_in_allowlist")
+            raise ProtocolFail("not_in_allowlist", 0, f"{module}:{symbol} is not whitelisted")
+        if self.call_behavior == "timeout":
+            audit("call_timeout")
+            raise ProtocolFail("call_timeout", 0, "call exceeded the 3s wall-clock budget")
+        if self.call_behavior == "fail":
+            audit("call_failed")
+            raise ProtocolFail("call_failed", -1, "ptrace attach failed", )
+
+        # synthetic deterministic return (device executes the real function)
+        if ret_type == "void":
+            ret = None
+        else:
+            ret = hx(0x600D0000 | (len(symbol) & 0xFFFF))
+        resp = {"ret": ret, "elapsed_us": 812, "audit_id": audit_id}
+        if probe_ret:
+            resp["ret_readable"] = True
+        audit("ok")
+        return resp
+
+    # -- cmd 44 process_find (v1.3 §2.1 reference implementation) -----------------
+
+    def _alive_process_names(self):
+        """(pid, cmdline) pairs visible to the agent; the mortal process only
+        while alive (process_list parity)."""
+        alive = [(1, "init"), (DEMO_PID, "com.demo.game")]
+        if self.mortal_alive:
+            alive.append((MORTAL_PID, "com.example.mortal"))
+        return alive
+
+    def _process_find(self, payload):
+        name = payload.get("name", "")
+        if not isinstance(name, str) or not name:
+            raise ProtocolFail("bad_request", detail="name required")
+        mode = payload.get("mode", "exact")
+        if mode not in ("exact", "substring"):
+            raise ProtocolFail("bad_request", detail=f"unknown mode {mode!r}")
+        if mode == "substring" and not self.agent_caps & AGENT_CAP_FUZZY_FIND:
+            # v1.2-and-older agents ignore the unknown field and fall back to
+            # exact semantics silently — the reference implementation models
+            # exactly that (host gates substring behind bit10 anyway)
+            mode = "exact"
+        alive = sorted(self._alive_process_names())
+        if mode == "substring":
+            # case-sensitive substring over /proc/<pid>/cmdline first segment
+            hits = [(pid, n) for pid, n in alive if name in n]
+            if not hits:
+                raise ProtocolFail("not_found", detail=name)
+            resp = {"pid": hits[0][0]}
+            if len(hits) > 1:
+                resp["matches"] = len(hits)  # >1: caller should narrow the term
+            return resp
+        for pid, n in alive:
+            if n == name:
+                return {"pid": pid}
+        raise ProtocolFail("not_found", detail=name)
+
+    # -- device-local scan engine (PROTOCOL.md §7 reference implementation) ------
+
+    # -- cmd 61 symbol_batch (v1.2 draft §3.1 reference implementation) -----------
+
+    def _module_groups(self, module):
+        """Group exec file-backed maps by basename; explicit module or all
+        (ascending base). Returns [(name, first_map, mem_size)]."""
+        groups = {}
+        for m in self.target_maps:
+            if not m["path"] or not (m["flags"] & 4):  # exec only
+                continue
+            base = m["path"].rsplit("/", 1)[-1].split(" (deleted)")[0]
+            if module and base != module:
+                continue
+            groups.setdefault(base, []).append(m)
+        if module and not groups:
+            raise ProtocolFail("not_found", detail=f"module {module!r} not found")
+        out = []
+        for name, maps in sorted(groups.items(), key=lambda kv: min(m["start"] for m in kv[1])):
+            first = min(m["start"] for m in maps)
+            out.append((name, first, max(m["end"] for m in maps) - first))
+        return out
+
+    def _symbol_batch(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        fmt = payload.get("format", "json")
+        if fmt not in ("json", "packed"):
+            raise ProtocolFail("bad_request", detail=f"unknown format {fmt!r}")
+        if fmt == "packed" and not self.agent_caps & AGENT_CAP_BINARY_FRAMES:
+            raise ProtocolFail("bad_request", detail="packed requires BINARY_FRAMES capability")
+        max_symbols = payload.get("max_symbols", 65536)
+        if not isinstance(max_symbols, int) or max_symbols <= 0:
+            raise ProtocolFail("bad_request", detail="max_symbols must be a positive integer")
+        filter_re = None
+        raw_filter = payload.get("filter")
+        if raw_filter:
+            try:
+                filter_re = re.compile(raw_filter)  # ECMAScript regex_search analogue
+            except re.error as exc:
+                raise ProtocolFail("bad_request", detail=f"invalid filter regex: {exc}")
+        # NOTE: include_undef is accepted but the mock's loader (host symbols.py
+        # semantics) always excludes SHN_UNDEF; true matches false here.
+
+        from tanyao.symbols import SymbolError, load_symbols
+
+        collected = []  # (module_name, symbol)
+        modules_order = []
+        for name, first, mem_size in self._module_groups(payload.get("module")):
+            try:
+                header = self.memory.read(first, 0x1000)
+                syms = load_symbols(self.memory.read, first, mem_size, header)
+            except (SymbolError, MemoryFault):
+                if payload.get("module"):
+                    raise ProtocolFail("not_found", detail=f"no dynamic segment in {name!r}")
+                continue  # merged mode: best effort per module
+            for sym in syms:
+                if filter_re is not None and not filter_re.search(sym.name):
+                    continue  # server-side filter precedes max_symbols counting
+                if name not in modules_order:
+                    modules_order.append(name)
+                collected.append((name, sym))
+
+        truncated = len(collected) > max_symbols
+        collected = collected[:max_symbols]
+        contributing = [n for n in modules_order if any(n == c[0] for c in collected)]
+        module_index = {n: i for i, n in enumerate(contributing)}
+
+        if fmt == "json":
+            return {
+                "count": len(collected),
+                "truncated": truncated,
+                "modules": contributing,
+                "module_indexes": [module_index[n] for n, _s in collected],
+                "names": [s.name for _n, s in collected],
+                "addresses": [hx(s.address) for _n, s in collected],
+                "sizes": [s.size for _n, s in collected],
+                "types": [s.kind for _n, s in collected],
+                "binds": [s.bind for _n, s in collected],  # v1.2.2 附录 (D11)
+            }
+        # packed (v1.3 §2.2 when bit12): header + entries + name_blob +
+        # module_blob, all big-endian. 24B entries add bind + entry_size field;
+        # legacy 20B layout kept for agents without PACKED_BIND.
+        packed24 = bool(self.agent_caps & AGENT_CAP_PACKED_BIND)
+        name_blob = bytearray()
+        name_offs = []
+        for _n, sym in collected:
+            name_offs.append(len(name_blob))
+            name_blob += sym.name.encode("utf-8") + b"\x00"
+        module_blob = bytearray()
+        module_offs = {}
+        for n in contributing:
+            module_offs[n] = len(module_blob)
+            module_blob += n.encode("utf-8") + b"\x00"
+        if packed24:
+            bind_code = {"LOCAL": 1, "GLOBAL": 2, "WEAK": 3, "GNU_UNIQUE": 4}
+            out = bytearray(PACKED_SYMBOL_HEADER_V13.pack(
+                len(collected), len(contributing), len(name_blob),
+                len(module_blob), PACKED_SYMBOL_ENTRY_V13_SIZE))
+            for (n, sym), noff in zip(collected, name_offs):
+                out += PACKED_SYMBOL_ENTRY_V13.pack(
+                    sym.address, sym.size, noff, module_offs[n],
+                    bind_code.get(sym.bind, 0), 0, 0)
+            out += name_blob
+            out += module_blob
+            return bytes(out)
+        out = bytearray(PACKED_SYMBOL_HEADER.pack(
+            len(collected), len(contributing), len(name_blob), len(module_blob)))
+        for (n, sym), noff in zip(collected, name_offs):
+            out += PACKED_SYMBOL_ENTRY.pack(sym.address, sym.size, noff, module_offs[n])
+        out += name_blob
+        out += module_blob
+        return bytes(out)
+
+    # -- cmd 62 strings_scan (v1.2 draft §3.2 reference implementation) -----------
+
+    STRINGS_SYNC_LIMIT = 256 * 1024 * 1024  # documented threshold
+
+    def _strings_scan(self, payload):
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        spec = {"pid": pid, "kind": "strings", "preset": "", "module": "",
+                "epsilon": 0.0, "alignment": 0}
+        min_len = payload.get("min_len", 4)
+        max_len = payload.get("max_len", 256)
+        max_results = payload.get("max_results", 1024)
+        if not isinstance(min_len, int) or not isinstance(max_len, int) or not isinstance(max_results, int):
+            raise ProtocolFail("bad_request", detail="min_len/max_len/max_results must be ints")
+        spec["min_len"] = min_len
+        spec["max_len"] = max_len
+        spec["max_results"] = max_results
+        regex = payload.get("regex")
+        if regex:
+            try:
+                spec["regex_re"] = re.compile(regex)
+            except re.error as exc:
+                raise ProtocolFail("bad_request", detail=f"invalid regex: {exc}")
+        ranges = []
+        if payload.get("preset"):
+            spec["preset"] = str(payload["preset"])
+            ranges = self._preset_ranges(spec["preset"], "")
+        elif payload.get("addr") is not None and payload.get("size") is not None:
+            addr = _u64(payload["addr"], "addr")
+            size = _u64(payload["size"], "size")
+            ranges = [(addr, addr + size)]
+        else:
+            raise ProtocolFail("bad_request", detail="strings_scan needs preset or addr+size")
+        if not ranges:
+            raise ProtocolFail("backend_error", 0, "preset matched no readable ranges")
+        total = sum(hi - lo for lo, hi in ranges)
+        async_run = bool(payload.get("async", False))
+        if async_run:
+            with self._scan_lock:
+                cancelled_old = False
+                old = self._scan_job
+                if old is not None and old.state == "running":
+                    old.cancel.set()
+                    old.state = "cancelled"
+                    cancelled_old = True
+                self._scan_seq += 1
+                job = MockScanJob(self._scan_seq, spec, ranges)
+                self._scan_job = job
+            threading.Thread(target=self._run_scan, args=(job,), daemon=True,
+                             name=f"mock-strings-{job.id}").start()
+            resp = {"job_id": job.id, "state": "running"}
+            if cancelled_old:
+                resp["cancelled_old"] = True
+            return resp
+        if total > self.STRINGS_SYNC_LIMIT:
+            raise ProtocolFail("bad_request", 0,
+                               f"sync range {total}B exceeds threshold; limit the preset or use async")
+        job = MockScanJob(0, spec, ranges)  # transient: synchronous execution
+        started = time.monotonic()
+        for lo, hi in ranges:
+            job.hex_carry = b""
+            self._strings_reset(job)
+            self._scan_region(job, lo, hi, SCAN_CHUNK)
+        self._strings_flush(job)
+        return {
+            "count": len(job.hits),
+            "truncated": job.truncated,
+            "scanned_bytes": hx(job.scanned),
+            "skipped_bytes": hx(sum(hi - lo for lo, hi in self._merged_skipped(job))),
+            "elapsed_sec": round(time.monotonic() - started, 3),
+            "results": [{"address": hx(h["address"]), "length": h["length"],
+                         "value": h["value"]} for h in job.hits],
+        }
+
+    @staticmethod
+    def _strings_reset(job):
+        # runs never cross VMAs or skipped holes
+        job.str_start = None
+        job.str_buf = bytearray()
+        job.str_total = 0
+
+    def _strings_flush(self, job):
+        if job.str_start is None:
+            return
+        if job.str_total >= job.spec["min_len"]:
+            value = bytes(job.str_buf).decode("ascii", "replace")
+            regex_re = job.spec.get("regex_re")
+            if regex_re is None or regex_re.search(value):
+                if len(job.hits) < job.spec["max_results"]:
+                    job.hits.append({"address": job.str_start,
+                                     "length": job.str_total,  # pre-truncation length
+                                     "value": value})
+                else:
+                    job.truncated = True
+        job.str_start = None
+        job.str_buf = bytearray()
+        job.str_total = 0
+
+    def _preset_ranges(self, preset: str, module: str) -> list[tuple[int, int]]:
+        """Range selection per scan_engine.cpp prepare_ranges (device parity)."""
+        out: list[tuple[int, int]] = []
+        for m in self.target_maps:
+            path = m["path"]
+            anonymous = (not path) or path.startswith("[")
+            if preset == "anon":
+                include = anonymous or ((m["flags"] & 2) and not path)
+            elif preset == "stack":
+                # kernel labels [stack] anonymous; match by address shape
+                include = anonymous and (m["flags"] & 2) and m["start"] >= 0x7F0000000000
+            elif preset == "all_readable":
+                include = True
+            elif preset.startswith("module:") or module:
+                base = path.rsplit("/", 1)[-1] if path else ""
+                base = base.split(" (deleted)")[0]
+                include = base == (module or preset[7:])
+            else:
+                include = True  # unknown preset: all readable (device parity)
+            if include:
+                out.append((m["start"], m["end"]))
+        return out
+
+    def _scan_start(self, payload: dict) -> dict:
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProtocolFail("bad_request", detail="pid must be a positive integer")
+        if pid != DEMO_PID:
+            # agent auto-opens the target; unknown pid fails like target_open
+            raise ProtocolFail("backend_error", -3, f"no such pid {pid}")
+        kind = payload.get("kind")
+        spec: dict = {"pid": pid, "kind": kind, "preset": str(payload.get("preset", "anon")),
+                      "module": str(payload.get("module", "")), "epsilon": 0.0, "alignment": 0}
+        if kind == "value":
+            vtype = payload.get("type")
+            if vtype not in SCAN_TYPES:
+                raise ProtocolFail("bad_request", detail=f"unknown scan type {vtype!r}")
+            spec["type"] = vtype
+            values_raw = payload.get("values")
+            if values_raw is not None and self.agent_caps & AGENT_CAP_SCAN_VALUES:
+                # v1.3 §2.3: multi-value scan (mutually exclusive with value)
+                if not isinstance(values_raw, list) or not values_raw:
+                    raise ProtocolFail("bad_request", detail="values must be a non-empty array")
+                if len(values_raw) > 64:
+                    raise ProtocolFail("bad_request", detail="values exceeds 64 entries")
+                spec["values"] = [
+                    float(v) if isinstance(v, float) else int(v)
+                    for v in values_raw
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ]
+                if len(spec["values"]) != len(values_raw):
+                    raise ProtocolFail("bad_request", detail="values entries must be numbers")
+            elif values_raw is not None:
+                # undeclared: old agents would reject kind=value without `value`
+                raise ProtocolFail("bad_request", detail="value required")
+            else:
+                value = payload.get("value")
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ProtocolFail("bad_request", detail="value must be a number")
+                spec["value"] = float(value) if isinstance(value, float) else int(value)
+        elif kind == "hex":
+            pattern = payload.get("pattern")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ProtocolFail("bad_request", detail="hex scan requires 'pattern'")
+            pbytes, mask = _parse_aob(pattern)
+            spec["pattern"], spec["mask"] = pbytes, mask
+        else:
+            raise ProtocolFail("bad_request", detail=f"unknown scan kind {kind!r}")
+        eps = payload.get("epsilon", 0.0)
+        if isinstance(eps, (int, float)) and not isinstance(eps, bool):
+            spec["epsilon"] = float(eps)
+        align = payload.get("alignment", 0)
+        if isinstance(align, int) and not isinstance(align, bool) and align > 0:
+            spec["alignment"] = align
+        # v1.2.1 附录: explicit `ranges` (bit9) replaces the preset entirely;
+        # an agent WITHOUT bit9 ignores the unknown field (the D1 failure mode)
+        ranges = None
+        ranges_raw = payload.get("ranges")
+        if ranges_raw is not None:
+            if not self.agent_caps & AGENT_CAP_SCAN_EXPLICIT_RANGES:
+                ranges_raw = None  # undeclared → pretend the field does not exist
+        if ranges_raw is not None:
+            if not isinstance(ranges_raw, list) or not ranges_raw:
+                raise ProtocolFail("bad_request", detail="ranges must be a non-empty array")
+            if len(ranges_raw) > 4096:
+                raise ProtocolFail("bad_request", detail="ranges exceeds 4096 segments")
+            ranges = []
+            for seg in ranges_raw:
+                addr = _u64(seg.get("addr"), "addr")
+                size = _u64(seg.get("size"), "size")
+                if size <= 0:
+                    raise ProtocolFail("bad_request", detail="ranges segment size must be > 0")
+                ranges.append((addr, addr + size))
+        else:
+            ranges = self._preset_ranges(spec["preset"], spec["module"])
+        if not ranges:
+            raise ProtocolFail("backend_error", 0, "preset matched no readable ranges")
+
+        with self._scan_lock:
+            cancelled_old = False
+            old = self._scan_job
+            if old is not None and old.state == "running":
+                old.cancel.set()
+                old.state = "cancelled"
+                cancelled_old = True
+            self._scan_seq += 1
+            job = MockScanJob(self._scan_seq, spec, ranges)
+            self._scan_job = job
+        threading.Thread(target=self._run_scan, args=(job,), daemon=True,
+                         name=f"mock-scan-{job.id}").start()
+        resp = {"job_id": job.id, "state": "running",
+                "total_bytes": hx(job.total), "ranges": len(job.ranges)}
+        if cancelled_old:
+            resp["cancelled_old"] = True
+        return resp
+
+    def _current_job(self, payload: dict) -> "MockScanJob | None":
+        with self._scan_lock:
+            job = self._scan_job
+        if job is None:
+            raise ProtocolFail("not_found", detail="no scan job")
+        if "job_id" in payload and payload["job_id"] is not None:
+            want = _u64(payload["job_id"], "job_id")
+            if want != job.id:
+                raise ProtocolFail("not_found", detail=f"no scan job {want}")
+        return job
+
+    def _scan_status(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        elapsed = time.monotonic() - job.started
+        out = {
+            "job_id": job.id, "state": job.state, "pid": job.spec["pid"],
+            "type": job.spec.get("type", ""), "round": job.round,
+            "scanned_bytes": hx(job.scanned), "total_bytes": hx(job.total),
+            "skipped_bytes": hx(sum(hi - lo for lo, hi in self._merged_skipped(job))),
+            "matches": len(job.hits), "truncated": job.truncated,
+            "elapsed_sec": round(elapsed, 3), "error": job.error,
+        }
+        if job.state == "running" and elapsed > 0.2 and job.scanned > 0:
+            out["rate_mbps"] = round(job.scanned / elapsed / 1e6, 2)
+        if job.spec["kind"] == "strings":
+            out["kind"] = "strings"
+        return out
+
+    def _scan_refine(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        if job.state == "running":
+            raise ProtocolFail("bad_request", detail="scan job still running")
+        if job.spec["kind"] == "strings":
+            raise ProtocolFail("bad_request", detail="refine not supported for strings jobs")
+        mode = payload.get("mode")
+        modes = ("eq", "neq", "changed", "unchanged", "increased", "decreased")
+        if mode not in modes:
+            raise ProtocolFail("bad_request", detail=f"unknown refine mode {mode!r}")
+        if job.spec["kind"] == "hex" and mode not in ("changed", "unchanged"):
+            raise ProtocolFail("bad_request", detail="hex job supports changed/unchanged only")
+        eps = payload.get("epsilon", 0.0)
+        eps = float(eps) if isinstance(eps, (int, float)) and not isinstance(eps, bool) else 0.0
+        value = payload.get("value")
+        kept: list[dict] = []
+        if job.spec["kind"] == "value":
+            fmt, size, is_float = SCAN_TYPES[job.spec["type"]]
+            values = job.spec.get("values")
+            unpack = struct.Struct(fmt).unpack_from
+            for hit in job.hits:
+                try:
+                    data = self.memory.read(hit["address"], size)
+                except MemoryFault:
+                    continue  # unreadable now -> drop (host parity)
+                new = unpack(data)[0]
+                old = hit["value"]
+                if mode == "eq" and values is not None:
+                    ok = any(_mock_match(new, v, eps) for v in values)
+                elif mode == "neq" and values is not None:
+                    ok = not any(_mock_match(new, v, eps) for v in values)
+                elif mode == "eq":
+                    ok = value is not None and _mock_match(new, value, eps)
+                elif mode == "neq":
+                    ok = value is not None and not _mock_match(new, value, eps)
+                elif mode == "changed":
+                    ok = new != old
+                elif mode == "unchanged":
+                    ok = new == old
+                elif mode == "increased":
+                    ok = new > old
+                else:
+                    ok = new < old
+                if ok:
+                    kept.append({"address": hit["address"], "value": new,
+                                 "raw": _raw8(new, fmt, size)})
+        else:
+            plen = len(job.spec["pattern"])
+            for hit in job.hits:
+                try:
+                    data = self.memory.read(hit["address"], plen)
+                except MemoryFault:
+                    continue
+                same = data == hit["seg"]
+                if (mode == "unchanged" and same) or (mode == "changed" and not same):
+                    # kept hits carry the re-read bytes (host refine parity)
+                    kept.append({"address": hit["address"],
+                                 "value": int.from_bytes(data[:8], "little"),
+                                 "raw": data[:8].ljust(8, b"\0"), "seg": bytes(data)})
+        job.hits = kept
+        job.round += 1
+        return {"job_id": job.id, "matches": len(kept), "round": job.round}
+
+    def _scan_results(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        offset = int(payload.get("offset", 0))
+        limit = int(payload.get("limit", 256))
+        begin = min(max(0, offset), len(job.hits))
+        end = min(begin + max(0, limit), len(job.hits))
+        if job.spec["kind"] == "strings":
+            hits = [{"address": hx(h["address"]), "length": h["length"],
+                     "value": h["value"]} for h in job.hits[begin:end]]
+        else:
+            hits = [{"address": hx(h["address"]), "value": h["value"],
+                     "value_hex": "0x" + h["raw"].hex()} for h in job.hits[begin:end]]
+            if job.spec.get("values") is not None:
+                for k, h in zip(range(begin, end), job.hits[begin:end]):
+                    hits[k]["value_index"] = h.get("value_index", 0)
+        return {"job_id": job.id, "count": end - begin, "total": len(job.hits),
+                "truncated": job.truncated, "hits": hits}
+
+    def _scan_cancel(self, payload: dict) -> dict:
+        job = self._current_job(payload)
+        if job.state == "running":
+            job.cancel.set()
+            job.state = "cancelled"
+        return {"ok": True, "state": job.state}
+
+    def _scan_clear(self, payload: dict) -> dict:
+        with self._scan_lock:
+            job = self._scan_job
+        if job is not None:
+            if job.state == "running":
+                job.cancel.set()
+                job.state = "cancelled"
+            job.hits = []
+            job.skipped = []
+            job.round = 0
+            job.scanned = 0
+            job.truncated = False
+        return {"ok": True}
+
+    def _run_scan(self, job: "MockScanJob") -> None:
+        try:
+            for lo, hi in job.ranges:
+                if job.cancel.is_set():
+                    break
+                job.hex_carry = b""  # matches never cross VMAs
+                if job.spec["kind"] == "strings":
+                    self._strings_reset(job)
+                self._scan_region(job, lo, hi, SCAN_CHUNK)
+                if job.truncated:
+                    break
+            if job.spec["kind"] == "strings":
+                self._strings_flush(job)
+        except Exception as exc:  # noqa: BLE001
+            job.state = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if job.state == "running":
+                job.state = "done"
+        job.finished = time.monotonic()
+
+    def _scan_region(self, job: "MockScanJob", lo: int, hi: int, chunk: int) -> None:
+        """Fault-tolerant streaming read+scan (host scan.py _scan_region parity)."""
+        pos = lo
+        while pos < hi:
+            if job.cancel.is_set():
+                job.state = "cancelled"
+                return
+            take = min(chunk, hi - pos)
+            try:
+                data = self.memory.read(pos, take)
+            except MemoryFault:
+                eff = job.dead_gran
+                if take <= eff:
+                    job.skipped.append((pos, pos + take))
+                    if job.spec["kind"] == "strings":
+                        self._strings_reset(job)
+                    pos += take
+                    job.dead_gran = min(SCAN_MAX_GRAN, eff * 2)
+                    continue
+                mid = pos + max(eff, (take // 2 // eff) * eff)
+                self._scan_region(job, pos, mid, chunk)
+                pos = mid
+                job.dead_gran = min(SCAN_MAX_GRAN, eff * 2)
+                continue
+            job.dead_gran = SCAN_MIN_GRAN
+            self._on_chunk(job, pos, data)
+            if job.truncated:
+                return
+            pos += len(data)
+
+    def _on_chunk(self, job: "MockScanJob", pos: int, data: bytes) -> None:
+        job.scanned += len(data)
+        if job.spec["kind"] == "strings":
+            max_len = job.spec["max_len"]
+            for i, b in enumerate(data):
+                if 0x20 <= b <= 0x7E or b == 0x09:  # printable ASCII + TAB
+                    if job.str_start is None:
+                        job.str_start = pos + i
+                        job.str_buf = bytearray()
+                        job.str_total = 0
+                    job.str_total += 1
+                    if len(job.str_buf) < max_len:
+                        job.str_buf.append(b)  # cap the recorded value at max_len
+                else:
+                    self._strings_flush(job)
+            return
+        if job.spec["kind"] == "value":
+            fmt, size, _is_float = SCAN_TYPES[job.spec["type"]]
+            align = job.spec["alignment"] or size
+            unpack = struct.Struct(fmt).unpack_from
+            want = job.spec.get("value")
+            values = job.spec.get("values")
+            eps = job.spec["epsilon"]
+            i = (align - (pos % align)) % align
+            while i + size <= len(data):
+                found = unpack(data, i)[0]
+                if values is not None:
+                    # v1.3 §2.3: record on ANY member, with the matched index
+                    idx = next((k for k, v in enumerate(values)
+                                if _mock_match(found, v, eps)), None)
+                    if idx is not None:
+                        if len(job.hits) < SCAN_MAX_HITS:
+                            job.hits.append({"address": pos + i, "value": found,
+                                             "value_index": idx,
+                                             "raw": _raw8(found, fmt, size)})
+                        else:
+                            job.truncated = True
+                elif _mock_match(found, want, eps):
+                    if len(job.hits) < SCAN_MAX_HITS:
+                        job.hits.append({"address": pos + i, "value": found,
+                                         "raw": _raw8(found, fmt, size)})
+                    else:
+                        job.truncated = True
+                i += align
+            return
+        # hex AOB with carry; straddling matches must be caught (scan from the
+        # carry prefix, skip only matches ending within already-scanned bytes)
+        pattern, mask = job.spec["pattern"], job.spec["mask"]
+        plen = len(pattern)
+        buf = job.hex_carry + data
+        base = pos - len(job.hex_carry)
+        i = 0
+        while i + plen <= len(buf):
+            if base + i + plen <= pos:
+                i += 1
+                continue
+            seg = buf[i : i + plen]
+            if all((seg[j] & mask[j]) == (pattern[j] & mask[j]) for j in range(plen) if mask[j]):
+                if len(job.hits) < SCAN_MAX_HITS:
+                    job.hits.append({"address": base + i,
+                                     "value": int.from_bytes(seg[:8], "little"),
+                                     "raw": seg[:8].ljust(8, b"\0"), "seg": bytes(seg)})
+                else:
+                    job.truncated = True
+            i += 1
+        job.hex_carry = buf[len(buf) - (plen - 1):] if plen > 1 else b""
+
+    @staticmethod
+    def _merged_skipped(job: "MockScanJob") -> list[tuple[int, int]]:
+        if not job.skipped:
+            return []
+        merged = [job.skipped[0]]
+        for lo, hi in sorted(job.skipped)[1:]:
+            plo, phi = merged[-1]
+            if lo <= phi:
+                merged[-1] = (plo, max(phi, hi))
+            else:
+                merged.append((lo, hi))
+        return merged
+
+    # -- framing ------------------------------------------------------------------
+
+    def _send(self, conn: socket.socket, seq: int, cmd: int, payload, flags: int) -> None:
+        if isinstance(payload, (bytes, bytearray)):
+            # v1.2 draft §2: raw payload responses carry flags bit2
+            body = bytes(payload)
+            flags |= FLAG_PAYLOAD_BINARY
+        else:
+            body = json_dumps(payload)
+        conn.sendall(HEADER.pack(FRAME_MAGIC, PROTOCOL_VERSION, flags, 0, seq, cmd, len(body)) + body)
+
+    def _recv(self, conn: socket.socket, buffer: bytearray):
+        while True:
+            if len(buffer) >= HEADER.size:
+                magic, version, flags, _r, seq, cmd, length = HEADER.unpack_from(buffer, 0)
+                if magic != FRAME_MAGIC or version != PROTOCOL_VERSION:
+                    return None
+                if len(buffer) >= HEADER.size + length:
+                    body = bytes(buffer[HEADER.size : HEADER.size + length])
+                    del buffer[: HEADER.size + length]
+                    import json
+                    return seq, cmd, flags, (json.loads(body) if length else {})
+            chunk = conn.recv(65536)
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+
+
+class ProtocolFail(Exception):
+    def __init__(self, error: str, errno: int | None = None, detail: str = "", fatal: bool = False,
+                 extra: dict | None = None):
+        super().__init__(error)
+        self.error = error
+        self.errno = errno
+        self.detail = detail
+        self.fatal = fatal
+        self.extra = extra or {}
+
+
+def hmac_equal(a: str, b: str) -> bool:
+    return hashlib.compare_digest(a, b) if hasattr(hashlib, "compare_digest") else a == b
+
+
+def json_dumps(payload: dict) -> bytes:
+    import json
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Mock tanyao-agent (PROTOCOL.md v1)")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=52730)
+    args = parser.parse_args()
+    agent = MockAgent(host=args.host, port=args.port)
+    agent.start()
+    print(f"mock agent listening on {args.host}:{agent.port}", flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        agent.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

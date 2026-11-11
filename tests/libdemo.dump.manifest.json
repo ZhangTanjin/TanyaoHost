@@ -1,0 +1,48 @@
+{
+  "pid": 4321,
+  "module": "libdemo.so",
+  "total_size": 12288,
+  "maps_source": "target_maps",
+  "mappings": [
+    {
+      "start": "0x7000000000",
+      "end": "0x7000002000",
+      "file_offset": "0x0",
+      "flags": 13,
+      "flags_str": "r-xp",
+      "path": "/data/app/libdemo.so",
+      "out_offset": 0,
+      "rva": 0,
+      "rva_note": "out_offset in image == file offset (file-layout reconstruction)"
+    },
+    {
+      "start": "0x7000002000",
+      "end": "0x7000003000",
+      "file_offset": "0x2000",
+      "flags": 11,
+      "flags_str": "rw-p",
+      "path": "/data/app/libdemo.so",
+      "out_offset": 8192,
+      "rva": 8192,
+      "rva_note": "out_offset in image == file offset (file-layout reconstruction)"
+    },
+    {
+      "start": "0x7000003000",
+      "end": "0x7000004000",
+      "file_offset": "0x2000",
+      "flags": 10,
+      "flags_str": "-w-p",
+      "path": "/data/app/libdemo.so",
+      "out_offset": 8192,
+      "rva": 8192,
+      "rva_note": "out_offset in image == file offset (file-layout reconstruction)"
+    }
+  ],
+  "skipped": [],
+  "sanitized": [
+    "e_shoff",
+    "e_shentsize",
+    "e_shnum",
+    "e_shstrndx"
+  ]
+}

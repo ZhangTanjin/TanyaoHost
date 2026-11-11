@@ -1,0 +1,907 @@
+"""v1.2 engine-dispatch matrix: caps 0x0 / 0x3 / 0x1ff (DESIGN_V3_HOST §4.1).
+
+Each capability combination must route scan_* tools to the right engine
+(`engine` field) with equivalent results, and undeclared v1.2 ops must behave
+like unknown cmds (unsupported_cmd, no disconnect). Run:
+    python3 -m unittest tests.test_v12_dispatch -v
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+import sys
+import time
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tests.mock_agent import (  # noqa: E402
+    AGENT_CAP_SCAN,
+    BASE,
+    DEMO_PID,
+    HEAP_START,
+    MockAgent,
+)
+from tanyao.connection import AgentConnection, AgentError  # noqa: E402
+from tanyao.analysis import AnalysisFacade  # noqa: E402
+from tanyao.constants import CMD_SCAN_START, CMD_SCAN_STATUS  # noqa: E402
+from tanyao.service import TanyaoService  # noqa: E402
+
+TOKEN = "tanyao-dev-token"
+
+
+def hx(v: int) -> str:
+    return f"0x{v:x}"
+
+
+class MatrixBase(unittest.TestCase):
+    AGENT_CAPS = 0x0
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN, agent_caps=cls.AGENT_CAPS)
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def setUp(self):
+        os.environ["TANYAO_ALLOW_WRITE"] = "1"
+        self.service = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        self.facade = AnalysisFacade(self.service)
+        self.service.connect()
+
+    def tearDown(self):
+        self.service.close()
+
+    def wait_job(self, job_id: str, timeout: float = 10.0) -> dict:
+        deadline = time.time() + timeout
+        st: dict = {}
+        while time.time() < deadline:
+            st = self.facade.scan_status(DEMO_PID, job_id)
+            if st["state"] != "running":
+                return st
+            time.sleep(0.02)
+        raise AssertionError("job did not finish in time")
+
+
+class TestCaps0HostEngine(MatrixBase):
+    """caps=0 (v1.0 agent, no capabilities field): everything on the host engine."""
+
+    AGENT_CAPS = 0x0
+
+    def test_capabilities_plumbing(self):
+        self.assertEqual(self.service.agent_capabilities(), 0x0)
+        self.assertFalse(self.service.has_agent_cap(AGENT_CAP_SCAN))
+
+    def test_scan_tools_use_host_engine(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "host-scan")
+        self.assertEqual(out["count"], 4)
+        out = self.facade.scan_hex(DEMO_PID, "EF BE AD DE")
+        self.assertEqual(out["engine"], "host-scan")
+        self.assertEqual(out["found"], 1)
+        out = self.facade.scan_next(DEMO_PID, "unchanged")
+        self.assertEqual(out["engine"], "host-scan")
+        out = self.facade.scan_results(DEMO_PID)
+        self.assertEqual(out["engine"], "host-scan")
+        out = self.facade.scan_clear(DEMO_PID)
+        self.assertEqual(out["engine"], "host-scan")
+
+    def test_undeclared_scan_cmd_is_unsupported(self):
+        self.service.close()  # free the single-connection slot
+        conn = AgentConnection("127.0.0.1", self.agent.port, TOKEN)
+        conn.connect()
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                conn.request(CMD_SCAN_START, {"pid": DEMO_PID, "kind": "value",
+                                              "type": "u32", "value": 1})
+            self.assertEqual(ctx.exception.error, "unsupported_cmd")
+            # connection stays alive per protocol
+            self.assertTrue(conn.ping().get("ok"))
+        finally:
+            conn.close()
+
+
+class TestCaps3AgentScan(MatrixBase):
+    """caps=0x3 (v1.1 agent): scan_* on the device, everything else host."""
+
+    AGENT_CAPS = 0x3
+
+    def test_capabilities_plumbing(self):
+        self.assertEqual(self.service.agent_capabilities(), 0x3)
+        self.assertTrue(self.service.has_agent_cap(AGENT_CAP_SCAN))
+
+    def test_get_status_passes_hello_build_through(self):
+        """v1.2.1 (D2 prevention): hello build surfaces in get_status when the
+        agent sends it, and the key is omitted when it does not."""
+        from tanyao.ipc import build_method_table
+
+        st = build_method_table(self.facade)["get_status"]({})
+        self.assertNotIn("agent_build", st)  # this class's mock sends no build
+
+        built = MockAgent(port=0, token=TOKEN, agent_caps=0x3,
+                          build="agent-v1.2.1-4-gdeadbee")
+        built.start()
+        try:
+            svc = TanyaoService("127.0.0.1", built.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            st = build_method_table(facade)["get_status"]({})
+            self.assertEqual(st["agent_build"], "agent-v1.2.1-4-gdeadbee")
+        finally:
+            built.stop()
+
+    def test_get_status_exposes_caps_and_skipped(self):
+        from tanyao.ipc import build_method_table
+
+        st = build_method_table(self.facade)["get_status"]({})
+        self.assertEqual(st["agent_capabilities"], "0x3")
+        skipped = st["skipped_caps"]
+        self.assertNotIn("scan", skipped)
+        self.assertIn("dump_pipeline", skipped)
+        self.assertIn("apk_info", skipped)
+
+    def test_scan_value_agent_engine_inline(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["count"], 4)
+        self.assertEqual(out["type"], "u32")
+        self.assertGreaterEqual(out["round"], 1)
+        addrs = {int(r["address"], 16) for r in out["results"]}
+        self.assertIn(HEAP_START + 0xA000, addrs)  # hit after the poison hole
+
+    def test_agent_scan_equivalent_to_host_engine(self):
+        """Same world must yield the same hits regardless of engine."""
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        agent_out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+
+        host_agent = MockAgent(port=0, token=TOKEN, agent_caps=0x0)
+        host_agent.start()
+        try:
+            svc = TanyaoService("127.0.0.1", host_agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            facade.scan_set_default_ranges(DEMO_PID)
+            host_out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+            self.assertEqual(host_out["engine"], "host-scan")
+            self.assertEqual(
+                {int(r["address"], 16) for r in agent_out["results"]},
+                {int(r["address"], 16) for r in host_out["results"]},
+            )
+            self.assertEqual(agent_out["count"], host_out["count"])
+        finally:
+            host_agent.stop()
+
+    def test_agent_hex_and_refine_flow(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_hex(DEMO_PID, "EF BE AD DE")
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["found"], 1)
+        self.assertEqual(out["results"][0]["address"], hx(HEAP_START + 0x488))
+        out = self.facade.scan_next(DEMO_PID, "unchanged")
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["found"], 1)
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x488, struct.pack("<I", 0))
+        out = self.facade.scan_next(DEMO_PID, "changed")
+        self.assertEqual(out["found"], 1)  # only rewritten hit changed
+        paged = self.facade.scan_results(DEMO_PID)
+        self.assertEqual(paged["engine"], "agent-scan")
+        self.assertEqual(paged["results"][0]["address"], hx(HEAP_START + 0x488))
+        self.assertEqual(paged["results"][0]["value"], 0)
+        # restore the world for later tests in this class (shared mock memory)
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x488,
+                               bytes.fromhex("EFBEADDE"))
+        out = self.facade.scan_clear(DEMO_PID)
+        self.assertEqual(out["engine"], "agent-scan")
+        after = self.facade.scan_results(DEMO_PID)
+        self.assertEqual(after["count"], 0)
+
+    def test_scan_results_pagination_pointer(self):
+        """D18: a partial page must carry next_offset; the final page must not."""
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["count"], 4)
+        page1 = self.facade.scan_results(DEMO_PID, offset=0, limit=2)
+        self.assertEqual(len(page1["results"]), 2)
+        self.assertEqual(page1["next_offset"], 2)
+        page2 = self.facade.scan_results(DEMO_PID, offset=2, limit=2)
+        self.assertEqual(len(page2["results"]), 2)
+        self.assertNotIn("next_offset", page2)
+        # limit beyond the hit count: single page, no pointer
+        full = self.facade.scan_results(DEMO_PID, offset=0, limit=32)
+        self.assertNotIn("next_offset", full)
+
+    def test_agent_scan_skipped_accounting(self):
+        """P1 parity on the device engine: poison hole skipped, later hits kept."""
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["count"], 4)
+        self.assertGreaterEqual(out["skipped_bytes"], 0x1000)
+
+    def test_agent_async_scan_job_roundtrip(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        out = self.facade.scan_value(DEMO_PID, "u32", 1337, async_run=True)
+        self.assertTrue(out["async"])
+        st = self.wait_job(out["job_id"])
+        self.assertEqual(st["state"], "done", st.get("error"))
+        self.assertEqual(st["summary"]["engine"], "agent-scan")
+        self.assertEqual(st["summary"]["count"], 4)
+        # cancelling an already-finished job still errors like the host engine
+        with self.assertRaises(AgentError):
+            self.facade.scan_cancel(DEMO_PID, out["job_id"])
+
+    def test_hex_scan_job_and_wildcard(self):
+        self.facade.scan_set_range(DEMO_PID, HEAP_START, HEAP_START + 0x10000)
+        out = self.facade.scan_hex(DEMO_PID, "EF BE ?? ??", async_run=True)
+        st = self.wait_job(out["job_id"])
+        self.assertEqual(st["state"], "done", st.get("error"))
+        self.assertEqual(st["summary"]["count"], 1)
+
+    def test_agent_job_unknown_pid_not_found(self):
+        with self.assertRaises(Exception):
+            self.service.agent_scan_start(999999, kind="value", type="u32", value=1,
+                                          preset="anon")
+
+
+class TestCaps3BSymbolsStrings(MatrixBase):
+    """caps=0x3b (bits 0,1,3,4,5): symbols/strings on the device incl. binary
+    frames end-to-end (packed symbol_batch goes over a real socket)."""
+
+    AGENT_CAPS = 0x3B
+
+    def test_symbol_list_agent_engine(self):
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so")
+        self.assertEqual(out["engine"], "agent-symbols")
+        self.assertEqual(out["module"], "libdemo.so")
+        names = {s["name"]: s for s in out["symbols"]}
+        self.assertIn("demo_start", names)
+        self.assertIn("demo_data", names)
+        self.assertEqual(names["demo_start"]["address"], hx(BASE + 0x1B40))
+        self.assertEqual(names["demo_start"]["type"], "FUNC")
+        self.assertIn("bind", names["demo_start"])  # shape key preserved
+
+    def test_symbol_list_filter(self):
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so", filter="^demo_data$")
+        self.assertEqual([s["name"] for s in out["symbols"]], ["demo_data"])
+
+    def test_symbol_find_agent_engine(self):
+        out = self.facade.symbol_find(DEMO_PID, "demo_start", module="libdemo.so")
+        self.assertEqual(out["engine"], "agent-symbols")
+        self.assertEqual(out["module"], "libdemo.so")
+        self.assertEqual(out["matches"][0]["address"], hx(BASE + 0x1B40))
+        with self.assertRaises(AgentError) as ctx:
+            self.facade.symbol_find(DEMO_PID, "no_such_symbol_xyz")
+        self.assertEqual(ctx.exception.error, "not_found")
+
+    def test_symbol_binds_passthrough_and_missing_tolerance(self):
+        """D11 (v1.2.2 附录): json binds column flows into symbol rows; rows
+        from agents WITHOUT the column degrade to empty string, not errors."""
+        out = self.facade.symbol_list(DEMO_PID, "libdemo.so")
+        binds = {s["name"]: s["bind"] for s in out["symbols"]}
+        self.assertEqual(binds["demo_start"], "GLOBAL")
+        self.assertEqual(binds["demo_data"], "GLOBAL")
+        # tolerance: a pre-1.2.2 response without the column
+        row = self.facade._symbol_row(
+            {"names": ["x"], "addresses": ["0x1000"], "sizes": [4], "types": ["FUNC"]},
+            0, "libc.so")
+        self.assertEqual(row["bind"], "")
+
+    def test_packed_matches_json(self):
+        j = self.service.symbol_batch(DEMO_PID, module="libdemo.so")
+        p = self.service.symbol_batch(DEMO_PID, module="libdemo.so", format="packed")
+        self.assertEqual(p["names"], j["names"])
+        self.assertEqual(p["addresses"], j["addresses"])
+        self.assertEqual(p["sizes"], j["sizes"])
+        self.assertEqual(p["modules"], j["modules"])
+        self.assertGreater(len(p["names"]), 0)
+
+    def test_strings_module_mode_agent(self):
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6)
+        self.assertEqual(out["engine"], "agent-strings")
+        vals = [s["value"] for s in out["strings"]]
+        self.assertIn("tanyao_mock_engine", vals)
+        self.assertIn("Java_icu_nullptr_test", vals)
+        by_val = {s["value"]: s for s in out["strings"]}
+        # D16: rows carry the address as a hex string (offset decimal-int removed)
+        self.assertEqual(by_val["tanyao_mock_engine"]["address"], hx(BASE + 0x900))
+        self.assertEqual(by_val["tanyao_mock_engine"]["length"], 18)
+        self.assertGreater(out["scanned_bytes"], 0)
+
+    def test_strings_window_mode_agent(self):
+        out = self.facade.strings(DEMO_PID, address=HEAP_START + 0xAFF0, size=0x40,
+                                  min_length=8)
+        self.assertEqual(out["engine"], "agent-strings")
+        vals = [s["value"] for s in out["strings"]]
+        self.assertIn("TANYAO_STRINGS_WINDOW_MARKER", vals)
+
+    def test_strings_regex_and_bad_regex(self):
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6,
+                                  filter="^tanyao")
+        self.assertEqual([s["value"] for s in out["strings"]], ["tanyao_mock_engine"])
+        with self.assertRaises(AgentError) as ctx:
+            self.service.strings_scan(DEMO_PID, preset="module:libdemo.so", regex="([bad")
+        self.assertEqual(ctx.exception.error, "bad_request")
+
+    def test_strings_async_facade_roundtrip(self):
+        """D10: the MCP-visible async entry — strings(async=true) returns a
+        job id, the host job wraps the device job and maps the final page into
+        {offset,length,value} rows."""
+        out = self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6,
+                                  async_run=True)
+        self.assertTrue(out["async"])
+        self.assertEqual(out["kind"], "strings")
+        st = {}
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            st = self.facade.scan_status(DEMO_PID, out["job_id"])
+            if st["state"] != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(st["state"], "done", st.get("error"))
+        summary = st["summary"]
+        self.assertEqual(summary["engine"], "agent-strings")
+        vals = [r["value"] for r in summary["strings"]]
+        self.assertIn("tanyao_mock_engine", vals)
+        self.assertTrue(all({"address", "length", "value"} <= set(r) for r in summary["strings"]))
+
+    def test_strings_sync_threshold_keeps_hint_no_silent_async(self):
+        """D10: the device's sync-threshold rejection surfaces with the async
+        exit ramp appended; the facade must NOT auto-convert to async."""
+        calls = {}
+        original = self.service.strings_scan
+
+        def fake(pid, **kw):
+            calls.update(kw)
+            raise AgentError("bad_request", detail="sync range 402653184B exceeds threshold")
+
+        self.service.strings_scan = fake  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                self.facade.strings(DEMO_PID, module="libdemo.so", min_length=6)
+        finally:
+            self.service.strings_scan = original  # type: ignore[method-assign]
+        self.assertFalse(calls.get("async_run"))
+        self.assertIn("exceeds threshold", ctx.exception.detail)
+        self.assertIn("async=true", ctx.exception.detail)
+
+    def test_strings_async_job_roundtrip(self):
+        out = self.service.strings_scan(DEMO_PID, preset="module:libdemo.so",
+                                        min_len=6, async_run=True)
+        dev_job = int(out["job_id"])
+        st = {}
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            st = self.service.agent_scan_status(dev_job)
+            if st.get("state") != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(st["state"], "done", st.get("error"))
+        self.assertEqual(st.get("kind"), "strings")
+        page = self.service.agent_scan_results(0, 32)
+        hits = page["hits"]
+        self.assertTrue(any(h["value"] == "tanyao_mock_engine" for h in hits))
+        self.assertNotIn("value_hex", hits[0])  # strings hits carry length, not value_hex
+        self.assertIn("length", hits[0])
+
+
+class TestV13FuzzyFind(unittest.TestCase):
+    """V1.3 bit10 FUZZY_FIND: mode=substring consumption + host gating."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent_v13 = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 10))
+        cls.agent_v13.start()
+        cls.agent_legacy = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        cls.agent_legacy.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent_v13.stop()
+        cls.agent_legacy.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_substring_short_name_hits(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("mortal", mode="substring")
+        self.assertEqual(out["pid"], 5000)
+        self.assertEqual(out["mode"], "substring")
+
+    def test_substring_multi_match_reports_count(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("com.", mode="substring")
+        self.assertEqual(out["pid"], 4321)  # lowest matching pid
+        self.assertGreaterEqual(out.get("matches", 0), 2)
+
+    def test_substring_miss_hint_suggests_mode(self):
+        facade = self._facade(self.agent_v13)
+        out = facade.find_process("lolm", mode="substring")
+        self.assertFalse(out["found"])
+        self.assertIn("substring", out["hint"])
+
+    def test_exact_mode_unchanged(self):
+        facade = self._facade(self.agent_v13)
+        self.assertEqual(facade.find_process("com.demo.game")["pid"], 4321)
+        miss = facade.find_process("mortal")  # exact: short name still misses
+        self.assertFalse(miss["found"])
+
+    def test_substring_without_bit10_is_structured_error(self):
+        facade = self._facade(self.agent_legacy)
+        with self.assertRaises(AgentError) as ctx:
+            facade.find_process("mortal", mode="substring")
+        self.assertEqual(ctx.exception.error, "bad_request")
+        self.assertIn("FUZZY_FIND", str(ctx.exception))
+
+
+class TestV13ScanValues(unittest.TestCase):
+    """V1.3 bit11 SCAN_VALUES: values[] multi-value scan + pointers_to single
+    round trip."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 11))
+        cls.agent.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent.stop()
+
+    def setUp(self):
+        self.service = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+        self.facade = AnalysisFacade(self.service)
+        self.service.connect()
+
+    def tearDown(self):
+        self.service.close()
+
+    def _wait(self, dev_job, timeout=10.0):
+        deadline = time.time() + timeout
+        st = {}
+        while time.time() < deadline:
+            st = self.service.agent_scan_status(dev_job)
+            if st.get("state") != "running":
+                return st
+            time.sleep(0.02)
+        raise AssertionError("job timeout")
+
+    def test_values_scan_hits_carry_value_index(self):
+        self.facade.scan_set_default_ranges(DEMO_PID)
+        resp = self.service.agent_scan_start(
+            DEMO_PID, kind="value", type="u32", values=[1337, 424242],
+            alignment=4, preset="anon")
+        st = self._wait(int(resp["job_id"]))
+        self.assertEqual(st["state"], "done", st.get("error"))
+        page = self.service.agent_scan_results(0, 64)
+        idx = [h.get("value_index") for h in page["hits"]]
+        self.assertEqual(len(idx), 5)
+        self.assertEqual(idx.count(0), 4)  # 1337 ×4
+        self.assertEqual(idx.count(1), 1)  # 424242 ×1
+
+    def test_pointers_to_single_roundtrip_with_bit11(self):
+        import struct as _struct
+        target = HEAP_START + 0x400
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x100, _struct.pack("<Q", target))
+        out = self.facade.pointers_to(
+            DEMO_PID, [target],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=False)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["scans"], 1)  # single values[] round trip
+        self.assertEqual(out["match"], "exact-u64")
+        self.assertEqual(out["targets"][0]["found"], 1)
+        self.assertEqual(out["targets"][0]["pointers"][0]["address"], hx(HEAP_START + 0x100))
+
+    def test_pointers_to_multi_targets_one_scan(self):
+        import struct as _struct
+        t1, t2 = HEAP_START + 0x400, HEAP_START + 0x488
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x100, _struct.pack("<Q", t1))
+        self.service.mem_write(DEMO_PID, HEAP_START + 0x300, _struct.pack("<Q", t2))
+        out = self.facade.pointers_to(
+            DEMO_PID, [t1, t2],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=False)
+        self.assertEqual(out["scans"], 1)
+        found = {t["address"]: t["found"] for t in out["targets"]}
+        self.assertEqual(found[hex(t1)], 1)
+        self.assertEqual(found[hex(t2)], 1)
+
+    def test_strip_pac_prefers_hex_wildcard_path(self):
+        out = self.facade.pointers_to(
+            DEMO_PID, [HEAP_START + 0x400],
+            ranges=[{"start": hex(HEAP_START), "end": hex(HEAP_START + 0x8000)}],
+            strip_pac=True)
+        self.assertEqual(out["match"], "pattern+pac-wildcard")
+        self.assertGreaterEqual(out["scans"], 1)
+
+
+class TestV14CallExport(unittest.TestCase):
+    """V1.4 cmd 80: host gate, allowlist paths, audit, probe_ret."""
+
+    def setUp(self):
+        self.agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3 | (1 << 13))
+        self.agent.start()
+
+    def tearDown(self):
+        self.agent.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_gate_off_refuses_before_wire(self):
+        os.environ.pop("TANYAO_ALLOW_CALL", None)
+        facade = self._facade(self.agent)
+        with self.assertRaises(AgentError) as ctx:
+            facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+        self.assertEqual(ctx.exception.error, "call_disabled")
+        self.assertNotIn("TANYAO_ALLOW_CALL", os.environ)
+
+    def test_gate_on_whitelist_hit_synthetic_return(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            out = facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+            self.assertTrue(out["ret"].startswith("0x"))
+            self.assertGreater(out["elapsed_us"], 0)
+            self.assertIn("audit_id", out)
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_gate_on_allowlist_miss(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            with self.assertRaises(AgentError) as ctx:
+                facade.call_export(DEMO_PID, "libil2cpp.so", "system_write_everything")
+            self.assertEqual(ctx.exception.error, "not_in_allowlist")
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_device_side_failures_and_audit(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            svc = TanyaoService("127.0.0.1", self.agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            try:
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "system_write_everything")
+                self.assertEqual(ctx.exception.error, "not_in_allowlist")
+                self.agent.call_behavior = "timeout"
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                self.assertEqual(ctx.exception.error, "call_timeout")
+                self.agent.call_behavior = "fail"
+                with self.assertRaises(AgentError) as ctx:
+                    facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                self.assertEqual(ctx.exception.error, "call_failed")
+                # audit recorded every attempt, including the rejections
+                results = [a["result"] for a in self.agent.call_audit]
+                self.assertIn("not_in_allowlist", results)
+                self.assertIn("call_timeout", results)
+                self.assertIn("call_failed", results)
+                self.agent.call_behavior = "ok"
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get")
+                results = [a["result"] for a in self.agent.call_audit]
+                self.assertIn("ok", results)
+            finally:
+                self.agent.call_behavior = "ok"
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_probe_ret_and_args_validation(self):
+        os.environ["TANYAO_ALLOW_CALL"] = "1"
+        try:
+            facade = self._facade(self.agent)
+            out = facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_class_from_name",
+                                     args=["0x72990c6590", 42], probe_ret=True)
+            self.assertTrue(out.get("ret_readable"))
+            with self.assertRaises(AgentError):
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_class_from_name",
+                                   args=["0x1"] * 9)
+            with self.assertRaises(AgentError):
+                facade.call_export(DEMO_PID, "libil2cpp.so", "il2cpp_domain_get",
+                                   ret_type="ptr")
+        finally:
+            os.environ.pop("TANYAO_ALLOW_CALL", None)
+
+    def test_get_status_call_fields(self):
+        from tanyao.ipc import build_method_table
+
+        facade = self._facade(self.agent)
+        st = build_method_table(facade)["get_status"]({})
+        self.assertFalse(st["call_enabled"])
+        self.assertNotIn("call_allowlist_entries", st)  # no host list configured
+
+
+class TestCaps1FFFullPipeline(MatrixBase):
+    """caps=0x1ff: dump pipeline, apk_info(pid), disassemble, write_txn all on
+    the device; host keeps gate/policy and verifies integrity end to end."""
+
+    AGENT_CAPS = 0x1FF
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out_dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def test_dump_module_agent_pipeline(self):
+        out = os.path.join(self.out_dir, "libdemo.pipeline.dump")
+        result = self.facade.dump_module(DEMO_PID, "libdemo.so", out)
+        self.assertEqual(result["engine"], "agent-dump")
+        self.assertEqual(result["size"], 0x3000)  # same file extent as host rebuild
+        self.assertTrue(result["sha256"])
+        self.assertEqual(len(result["sha256"]), 64)
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(4), b"\x7fELF")
+        with open(out + ".manifest.json", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["module"], "libdemo.so")
+        self.assertTrue(manifest["sanitized"])
+        # explicit cleanup ran: device-side dump directory is empty again
+        self.assertEqual(self.agent.dumps, {})
+
+    def test_dump_agent_bytes_equal_host_engine(self):
+        agent_path = os.path.join(self.out_dir, "agent.dump")
+        agent_out = self.facade.dump_module(DEMO_PID, "libdemo.so", agent_path)
+        host_agent = MockAgent(port=0, token=TOKEN, agent_caps=0x0)
+        host_agent.start()
+        try:
+            svc = TanyaoService("127.0.0.1", host_agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            host_path = os.path.join(self.out_dir, "host.dump")
+            host_out = facade.dump_module(DEMO_PID, "libdemo.so", host_path)
+            self.assertEqual(host_out["engine"], "host-dump")
+            with open(agent_path, "rb") as fa, open(host_path, "rb") as fh:
+                self.assertEqual(hashlib.sha256(fa.read()).hexdigest(),
+                                 hashlib.sha256(fh.read()).hexdigest())
+        finally:
+            host_agent.stop()
+
+    def test_dump_status_and_cleanup(self):
+        start = self.service.dump_start(DEMO_PID, module="libdemo.so")
+        dump_id = start["dump_id"]
+        st = self.service.dump_status(dump_id)
+        self.assertTrue(st["exists"])
+        self.assertEqual(int(st["size"], 16), int(start["size"], 16))
+        listing = self.service.dump_status(list_all=True)
+        self.assertIn(dump_id, [d["dump_id"] for d in listing["dumps"]])
+        self.service.dump_cleanup(dump_id)
+        with self.assertRaises(AgentError) as ctx:
+            self.service.dump_cleanup(dump_id)
+        self.assertEqual(ctx.exception.error, "not_found")
+
+    def test_apk_info_pid_routing(self):
+        out = self.facade.apk_info(pid=DEMO_PID)
+        self.assertEqual(out["engine"], "agent-apk")
+        self.assertEqual(out["package"], "com.example.re")
+        self.assertEqual(out["launcher_activities"], ["com.example.re.MainActivity"])
+        self.assertTrue(out["path"].endswith("/base.apk"))
+        # exactly-one enforcement (DESIGN_V3_HOST §3.4)
+        with self.assertRaises(AgentError):
+            self.facade.apk_info(pid=DEMO_PID, apk_path="/tmp/x.apk")
+        with self.assertRaises(AgentError):
+            self.facade.apk_info()
+
+    def test_apk_info_pid_without_bit7_is_structured_error(self):
+        caps_agent = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        caps_agent.start()
+        try:
+            svc = TanyaoService("127.0.0.1", caps_agent.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            with self.assertRaises(AgentError) as ctx:
+                facade.apk_info(pid=DEMO_PID)
+            self.assertEqual(ctx.exception.error, "bad_request")
+            self.assertIn("pull_apk", str(ctx.exception))
+        finally:
+            caps_agent.stop()
+
+    def test_pull_apk_via_pipeline(self):
+        out = os.path.join(self.out_dir, "pulled.apk")
+        result = self.facade.pull_apk(DEMO_PID, out)
+        self.assertEqual(result["engine"], "agent-dump")
+        self.assertTrue(result["remote"].endswith("/base.apk"))
+        self.assertEqual(result["size"], len(self.agent.apk_bytes))
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(2), b"PK")
+
+    def test_disassemble_agent_and_unsupported_fallback(self):
+        out = self.facade.disassemble(DEMO_PID, BASE + 0x800, count=5)
+        self.assertEqual(out["engine"], "agent-capstone")
+        self.assertEqual(out["count"], 5)
+        self.assertTrue(all(i["text"] for i in out["instructions"]))
+        self.assertTrue(out["instructions"][0]["text"].startswith("stp"))
+        # declared bit8 but device built without capstone → host fallback
+        no_disasm = MockAgent(port=0, token=TOKEN, agent_caps=0x1FF,
+                              disasm_available=False)
+        no_disasm.start()
+        try:
+            svc = TanyaoService("127.0.0.1", no_disasm.port, TOKEN)
+            facade = AnalysisFacade(svc)
+            svc.connect()
+            out = facade.disassemble(DEMO_PID, BASE + 0x800, count=5)
+            self.assertIn(out["engine"], ("capstone", "subset"))
+        finally:
+            no_disasm.stop()
+
+    def test_write_txn_agent_path(self):
+        addr = HEAP_START + 0x6000  # scratch area away from other fixtures
+        self.service.mem_write(DEMO_PID, addr, b"\x11" * 4)
+        out = self.facade.write_bytes(DEMO_PID, addr, b"\x22" * 4,
+                                      expect_old=b"\x11" * 4)
+        self.assertEqual(out["engine"], "agent-write-txn")
+        self.assertTrue(out["verified"])
+        self.assertFalse(out["rolled_back"])
+        self.assertEqual(self.facade.read_memory(DEMO_PID, addr, 4)["data_hex"], "22222222")
+        with self.assertRaises(AgentError) as ctx:
+            self.facade.write_bytes(DEMO_PID, addr, b"\x33" * 4,
+                                    expect_old=b"\x11" * 4)
+        self.assertEqual(ctx.exception.error, "expect_old_mismatch")
+        self.service.mem_write(DEMO_PID, addr, b"\x00" * 4)
+
+    def test_expect_old_mismatch_surfaces_old_bytes_d5(self):
+        """D5: the device-attached old_b64 must survive to the MCP error text
+        with the correct value, and the detail carries the decoded hex."""
+        import base64 as b64mod
+        import urllib.request
+
+        from tanyao import mcp_server
+        from tanyao.ipc import IpcServer
+
+        addr = HEAP_START + 0x6100
+        self.service.mem_write(DEMO_PID, addr, b"\xaa" * 4)
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                self.facade.write_bytes(DEMO_PID, addr, b"\xbb" * 4,
+                                        expect_old=b"\x11" * 4)
+            self.assertEqual(ctx.exception.error, "expect_old_mismatch")
+            self.assertEqual(ctx.exception.payload.get("old_b64"),
+                             b64mod.b64encode(b"\xaa" * 4).decode())
+            self.assertIn("aaaaaaaa", ctx.exception.detail)
+
+            # full chain: MCP stdio -> IPC -> facade -> agent error frame
+            ipc = IpcServer(self.facade, port=0)
+            port = ipc._httpd.server_address[1]
+            ipc.start()
+            try:
+                mcp_server.IPC_URL = f"http://127.0.0.1:{port}/"
+                resp = mcp_server.handle_request({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "write_bytes", "arguments": {
+                        "pid": DEMO_PID, "address": hex(addr),
+                        "data_hex": "bbbbbbbb", "expect_old_hex": "11111111"}},
+                })
+                self.assertTrue(resp["result"]["isError"])
+                payload = json.loads(resp["result"]["content"][0]["text"])
+                self.assertEqual(payload["error"], "expect_old_mismatch")
+                self.assertEqual(payload["old_b64"],
+                                 b64mod.b64encode(b"\xaa" * 4).decode())
+            finally:
+                ipc.stop()
+        finally:
+            self.service.mem_write(DEMO_PID, addr, b"\x00" * 4)
+
+    def test_decompile_data_source_via_pipeline(self):
+        """decompile_start only swaps the dump source (Ghidra absent here, so we
+        assert the pipeline dump materialized synchronously before job start)."""
+        if not os.path.exists("/opt/ghidra/support/analyzeHeadless"):
+            self.skipTest("Ghidra not installed")
+        try:
+            out = self.facade.decompile_start(DEMO_PID, "libdemo.so",
+                                              out_dir=os.path.join(self.out_dir, "dec"))
+        except AgentError as exc:
+            self.assertIn(str(exc.error), ("unavailable",))
+            return
+        self.assertIn("job_id", out)
+
+
+class TestD1ExplicitRanges(unittest.TestCase):
+    """v1.2.1 D1: scan_set_range must survive the agent-scan dispatch.
+
+    - bit9 declared → cmd 50 carries `ranges`, device scans exactly those
+      segments (preset ignored).
+    - bit9 absent + explicit ranges → HOST engine (never send ranges to an
+      agent that would silently fall back to preset — the D1 failure mode).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent_bit9 = MockAgent(port=0, token=TOKEN, agent_caps=0x3FF)
+        cls.agent_bit9.start()
+        cls.agent_legacy = MockAgent(port=0, token=TOKEN, agent_caps=0x3)
+        cls.agent_legacy.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.agent_bit9.stop()
+        cls.agent_legacy.stop()
+
+    def _facade(self, agent):
+        svc = TanyaoService("127.0.0.1", agent.port, TOKEN)
+        facade = AnalysisFacade(svc)
+        svc.connect()
+        self.addCleanup(svc.close)
+        return facade
+
+    def test_bit9_declared_ranges_carried_to_device(self):
+        facade = self._facade(self.agent_bit9)
+        # 32-byte window around exactly one known hit (heap+0x1000 = 1337)
+        window_lo, window_hi = HEAP_START + 0x0FF0, HEAP_START + 0x1010
+        facade.scan_set_range(DEMO_PID, window_lo, window_hi)
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["ranges"], 1)
+        # preset would have found 4 hits across the whole heap — ranges found
+        # exactly the one inside the explicit window
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["results"][0]["address"], hx(HEAP_START + 0x1000))
+
+    def test_bit9_absent_falls_back_to_host_engine(self):
+        facade = self._facade(self.agent_legacy)
+        window_lo, window_hi = HEAP_START + 0x0FF0, HEAP_START + 0x1010
+        facade.scan_set_range(DEMO_PID, window_lo, window_hi)
+        out = facade.scan_hex(DEMO_PID, "EF BE AD DE")
+        self.assertEqual(out["engine"], "host-scan")  # forced fallback, no error
+        self.assertEqual(out["count"], 0)  # window excludes the 0x488 hit
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "host-scan")
+        self.assertEqual(out["count"], 1)  # exactly the in-window hit
+
+    def test_ranges_override_preset_on_wire(self):
+        """Protocol mutex: ranges present → the agent must ignore preset
+        (mock reference semantics, raw request carries both)."""
+        conn = AgentConnection("127.0.0.1", self.agent_bit9.port, TOKEN)
+        conn.connect()
+        try:
+            window_lo = HEAP_START + 0x0FF0
+            job = conn.request(CMD_SCAN_START, {
+                "pid": DEMO_PID, "kind": "hex", "pattern": "00 00 00 00",
+                "preset": "all_readable",  # would be ~84KB+; must be ignored
+                "ranges": [{"addr": hex(window_lo), "size": "0x20"}],
+            })
+            deadline = time.time() + 10
+            st = {"state": "running"}
+            while time.time() < deadline:
+                st = conn.request(CMD_SCAN_STATUS, {"job_id": job["job_id"]})
+                if st.get("state") != "running":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(st["state"], "done", st.get("error"))
+            self.assertEqual(int(st["total_bytes"], 16), 0x20)  # preset NOT used
+        finally:
+            conn.close()
+
+    def test_preset_reset_clears_explicit_ranges(self):
+        facade = self._facade(self.agent_bit9)
+        facade.scan_set_range(DEMO_PID, HEAP_START + 0x0FF0, HEAP_START + 0x1010)
+        facade.scan_set_default_ranges(DEMO_PID, preset="anon")
+        out = facade.scan_value(DEMO_PID, "u32", 1337, alignment=4)
+        self.assertEqual(out["engine"], "agent-scan")
+        self.assertEqual(out["count"], 4)  # back to the whole anon preset
+
+
+if __name__ == "__main__":
+    unittest.main()

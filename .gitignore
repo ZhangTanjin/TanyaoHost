@@ -1,0 +1,31 @@
+# Build artefacts
+build/
+out/
+*.o
+*.ko.cmd
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Dumps / test artefacts (large, regenerable)
+*.dump.so
+*.dump.so.manifest.json
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Local state
+*.log
+.cache/
