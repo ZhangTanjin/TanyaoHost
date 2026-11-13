@@ -40,6 +40,7 @@ from . import ida_backend
 from .dump import dump_module as _dump_module
 from .dump import pull_dump_with_resume
 from .dump import watch as _watch
+from .addr import AddressModel, AddressModelError
 from .elfinfo import ElfParseError, parse_elf64
 from .mapsview import MAP_ANONYMOUS, MAP_READ, MapsView
 from .jobs import JobManager, ScanCancelled
@@ -325,8 +326,9 @@ class AnalysisFacade:
             #   elf_start -> the actual first byte of .bss (p_align aligned)
             # Using the mapping start alone under-reports by up to p_align-1
             # (measured: mapping 0x272000 vs real .bss 0x274000 on a 16 KiB PIE).
-            elf_lo = info.bss_start + load_bias_abs
-            elf_hi = info.bss_end + load_bias_abs
+            # info.bss_* are ELF vaddrs; to_runtime applies the module base.
+            elf_lo = info.to_runtime(info.bss_start, load_bias_abs)
+            elf_hi = info.to_runtime(info.bss_end, load_bias_abs)
             if adj.start <= elf_lo < adj.end:
                 return ([f"0x{elf_lo:x}", f"0x{min(elf_hi, adj.end):x}"],
                         f"live anon mapping 0x{adj.start:x}-0x{adj.end:x}, "
@@ -344,8 +346,8 @@ class AnalysisFacade:
 
         if load_bias_abs is None:
             return None, "no load anchor and no adjacent bss mapping"
-        bss_lo = info.bss_start + load_bias_abs
-        bss_hi = info.bss_end + load_bias_abs
+        bss_lo = info.to_runtime(info.bss_start, load_bias_abs)
+        bss_hi = info.to_runtime(info.bss_end, load_bias_abs)
         return [f"0x{bss_lo:x}", f"0x{bss_hi:x}"], (
             "arithmetic (uncorroborated: no [anon:.bss] mapping adjacent to the "
             "module's last segment)")
@@ -360,29 +362,21 @@ class AnalysisFacade:
         # non-mirror segment when one exists.
         segs = [s for s in v.segments if not s.mirror] or v.segments
         first = segs[0]
-        header_size = 0x1000
-        data = self.service.mem_read(pid, first.start, min(header_size, first.size))
+        # The header read, the anchor derivation and the multi-anchor policy all
+        # live in AddressModel now; this method only shapes the response.
         try:
-            info = parse_elf64(data, allow_zero_magic=True)
-        except ElfParseError as exc:
-            return {"pid": pid, "module": name, "first_map": f"0x{first.start:x}", "error": str(exc)}
+            model = AddressModel.build(pid, name, self.service.target_maps(pid),
+                                       self.service.mem_read)
+        except AddressModelError as exc:
+            if exc.unavailable:
+                raise AgentError("unavailable", detail=exc.detail) from exc
+            return {"pid": pid, "module": name, "first_map": f"0x{first.start:x}",
+                    "error": exc.detail}
+        info = model.elf
         base = first.start
         mirror = any(s.mirror for s in v.segments)
-        # D19: the load anchor is the COMMON translation base (start −
-        # file_offset) of the off-0 non-mirror segments. Unique on standard
-        # layouts; when several off-0 segments carry different anchors (lolm
-        # multi off-0 co-resident layout) a single load_bias is provably
-        # ambiguous → null + load_bias_ambiguous, per-segment translation_base
-        # is the truth. No off-0 anchor at all → ELF-arithmetic fallback.
-        anchors = {s.start - s.file_offset for s in v.segments
-                   if s.file_offset == 0 and not s.mirror}
-        ambiguous = len(anchors) > 1
-        if len(anchors) == 1:
-            load_bias_abs: int | None = anchors.pop()
-        elif anchors:
-            load_bias_abs = None
-        else:
-            load_bias_abs = base - info.load_bias  # legacy ELF-arithmetic anchor
+        load_bias_abs: int | None = None if model.base_is_ambiguous else model.base
+        ambiguous = model.base_is_ambiguous
         bss, bss_note = self._resolve_bss_bounds(pid, info, v, segs, load_bias_abs)
         out = {
             "pid": pid,
@@ -1269,21 +1263,20 @@ class AnalysisFacade:
         # The .bss lives in an anonymous mapping AFTER the last segment, so the
         # plain segment range does not cover it. Widen the "this looks like a
         # runtime address" window by the module's BSS extent.
+        # One model instead of two ad-hoc anchor derivations (this block used to
+        # compute the same set twice, once inside a try and once outside).
         try:
-            header = self.service.mem_read(pid, segs[0].start,
-                                           min(0x1000, segs[0].size))
-            _info = parse_elf64(header, allow_zero_magic=True)
-            _anchors = {x.start - x.file_offset for x in v.segments
-                        if x.file_offset == 0 and not x.mirror}
-            _bias = _anchors.pop() if len(_anchors) == 1 else None
-            if _bias is not None and _info.bss_end:
-                mod_hi = max(mod_hi, _info.bss_end + _bias)
-        except (AgentError, ElfParseError):
-            pass
-        anchors = {x.start - x.file_offset for x in v.segments
-                   if x.file_offset == 0 and not x.mirror}
-        load_bias = anchors.pop() if len(anchors) == 1 else None
-        already_runtime = mod_lo <= vaddr < mod_hi
+            model = AddressModel.build(pid, module, self.service.target_maps(pid),
+                                       self.service.mem_read)
+        except AddressModelError:
+            model = None
+        if model is not None:
+            mod_hi = max(mod_hi, model.to_runtime(model.elf.bss_end))
+            already_runtime = model.is_runtime_addr(vaddr)
+        else:
+            already_runtime = mod_lo <= vaddr < mod_hi
+        load_bias = (model.base
+                     if model is not None and not model.base_is_ambiguous else None)
         if already_runtime:
             wanted = vaddr
         elif load_bias is not None:
@@ -1542,21 +1535,17 @@ class AnalysisFacade:
         Every successful result is verified by a 1-byte read; an unreadable
         result is reported as such rather than returned as if valid.
         """
-        view = MapsView.from_maps(self.service.target_maps(pid))
-        v = view.modules.get(module)
-        if v is None:
-            raise AgentError("not_found", detail=f"module {module!r} not mapped in pid {pid}")
-        segs = [s for s in v.segments if not s.mirror] or v.segments
-        first = segs[0]
-        header = self.service.mem_read(pid, first.start, min(0x1000, first.size))
         try:
-            info = parse_elf64(header, allow_zero_magic=True)
-        except ElfParseError as exc:
-            raise AgentError("backend_error", detail=f"cannot parse ELF header: {exc}") from exc
-
-        anchors = {x.start - x.file_offset for x in v.segments
-                   if x.file_offset == 0 and not x.mirror}
-        load_bias_abs = anchors.pop() if len(anchors) == 1 else None
+            model = AddressModel.build(pid, module, self.service.target_maps(pid),
+                                       self.service.mem_read)
+        except AddressModelError as exc:
+            slug = "unavailable" if exc.unavailable else "not_found"
+            raise AgentError(slug, detail=exc.detail) from exc
+        v = model.view
+        segs = model.segments
+        first = segs[0]
+        info = model.elf
+        load_bias_abs = None if model.base_is_ambiguous else model.base
 
         method = ""
         runtime: int | None = None
@@ -1581,7 +1570,8 @@ class AnalysisFacade:
                 # Correct the alignment gap: when the ELF lower bound sits a few
                 # bytes BELOW the mapping start, shift back so the first real
                 # .bss byte maps exactly onto the mapping start.
-                gap = bss_start - (info.bss_start + load_bias_abs) if load_bias_abs is not None else 0
+                gap = (bss_start - info.to_runtime(info.bss_start, load_bias_abs)
+                       if load_bias_abs is not None else 0)
                 if gap > 0 and bss_note and "snapped up" in bss_note:
                     runtime -= gap
             elif load_bias_abs is not None:
