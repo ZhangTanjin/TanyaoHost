@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -83,105 +84,113 @@ def resolve_bss(header: bytes, maps, bias_base: int, segs) -> tuple:
     return facade._resolve_bss_bounds(0, info, None, segs, bias_base)
 
 
-def main() -> int:
-    failures = 0
+# --- fixtures ---------------------------------------------------------------
 
-    def check(name: str, got, want, extra: str = "") -> None:
-        nonlocal failures
-        ok = got == want
-        if not ok:
-            failures += 1
-        print(f"[{'PASS' if ok else 'FAIL'}] {name:<46} got={got} want={want} {extra}")
+# 16 KiB-aligned static PIE: the alignment trap.
+# last LOAD: vaddr 0x270f00 filesz 0xb9c memsz 0x21828 align 0x4000
+LOADS_16K = [
+    PhdrLoad(0x200000, 0x170f4, 0x170f4, 0x0, 4, 0x4000),
+    PhdrLoad(0x21b100, 0x4d100, 0x4d100, 0x17100, 5, 0x4000),
+    PhdrLoad(0x26c200, 0xe00, 0xcf0, 0x64200, 6, 0x4000),    # padding gap
+    PhdrLoad(0x270f00, 0x21828, 0xb9c, 0x64f00, 6, 0x4000),  # real .bss tail
+]
+HDR_16K = build_elf(LOADS_16K)
+BIAS_16K = LOADS_16K[0].vaddr - LOADS_16K[0].offset            # 0x200000
+SEGS_16K = [
+    FakeMap(0x200000, 0x218000, "f"), FakeMap(0x21b000, 0x269000, "f"),
+    FakeMap(0x26c000, 0x26d000, "f"), FakeMap(0x270000, 0x272000, "f"),
+]
 
-    # ------------------------------------------------------------------ case 3
-    # 16 KiB-aligned static PIE: the alignment trap.
-    # last LOAD: vaddr 0x270f00 filesz 0xb9c memsz 0x21828 align 0x4000
-    loads16 = [
-        PhdrLoad(0x200000, 0x170f4, 0x170f4, 0x0, 4, 0x4000),
-        PhdrLoad(0x21b100, 0x4d100, 0x4d100, 0x17100, 5, 0x4000),
-        PhdrLoad(0x26c200, 0xe00, 0xcf0, 0x64200, 6, 0x4000),   # padding gap
-        PhdrLoad(0x270f00, 0x21828, 0xb9c, 0x64f00, 6, 0x4000),  # real .bss tail
-    ]
-    hdr16 = build_elf(loads16)
-    bias = loads16[0].vaddr - loads16[0].offset  # 0x200000
-    segs16 = [
-        FakeMap(0x200000, 0x218000, "f"), FakeMap(0x21b000, 0x269000, "f"),
-        FakeMap(0x26c000, 0x26d000, "f"), FakeMap(0x270000, 0x272000, "f"),
-    ]
+# 4 KiB shared library (the libGameCore shape): arithmetic path exact.
+LOADS_4K = [
+    PhdrLoad(0x0, 0x218476c, 0x218476c, 0x0, 4, 0x1000),
+    PhdrLoad(0x2185770, 0x29bcbc0, 0x29bcbc0, 0x2184770, 5, 0x1000),
+    PhdrLoad(0x4b43330, 0x4b4560, 0x4b4560, 0x4b41330, 6, 0x1000),
+    PhdrLoad(0x4ff8890, 0x454be8, 0x276308, 0x4ff5890, 6, 0x1000),
+]
+HDR_4K = build_elf(LOADS_4K)
+SEGS_4K = [
+    FakeMap(0x74b763e000, 0x74b97c3000, "f"),
+    FakeMap(0x74b97c3000, 0x74bb3a3000, "f"),
+    FakeMap(0x74bc181000, 0x74bc636000, "f"),
+    FakeMap(0x74bc636000, 0x74bc8ad000, "f"),
+]
+BIAS_4K = SEGS_4K[0].start - 0x0                                # 0x74b763e000
 
-    # case 3a: arithmetic only (no trailing anon mapping at all).
-    # bss_start is now the CONSERVATIVE lower bound p_vaddr+p_filesz (=0x271a9c),
-    # because the true section start depends on sh_addralign which the program
-    # headers do not carry. Any real .bss byte is inside [start, end).
-    bss, note = resolve_bss(hdr16, [], bias, segs16)
-    check("case3 16K PIE, no mapping -> bss lower bound",
-          bss[0] if bss else None, "0x271a9c", f"(note: {note[:40]})")
-    check("case3 lower bound <= true .bss start (0x274000)",
-          int(bss[0], 16) <= 0x274000, True)
-    check("case3 note marked arithmetic",
-          "arithmetic" in (note or ""), True)
 
-    # case 3b: mapping present but unlabelled (empty path) — the field case
-    maps16 = list(segs16) + [FakeMap(0x272000, 0x27c000, "")]
-    bss_l, note_l = resolve_bss(hdr16, maps16, bias, segs16)
-    # With a live mapping the answer snaps up to the mapping start (0x272000),
-    # which is the page the loader actually allocated for the NOBITS tail.
-    check("case3 16K PIE, unlabelled mapping -> snapped start",
-          bss_l[0] if bss_l else None, "0x272000", f"(note: {note_l[:50]})")
+class ArithmeticFallbackTest(unittest.TestCase):
+    """Case 3a: no trailing anon mapping, so arithmetic is the only route.
 
-    # ------------------------------------------------------------------ case 1
-    # Same layout, but the kernel labels the mapping.
-    maps16_labelled = list(segs16) + [FakeMap(0x272000, 0x27c000, "[anon:.bss]")]
-    bss_lab, note_lab = resolve_bss(hdr16, maps16_labelled, bias, segs16)
-    check("case1 labelled [anon:.bss] -> snapped start",
-          bss_lab[0] if bss_lab else None, "0x272000")
-    check("case1 note mentions the live mapping",
-          "live" in (note_lab or ""), True)
+    bss_start is the CONSERVATIVE lower bound (p_vaddr+p_filesz = 0x271a9c),
+    because the true section start depends on sh_addralign which the program
+    headers do not carry. Any real .bss byte is inside [start, end).
+    """
 
-    # ------------------------------------------------------------------ case 4
-    # Intermediate NOBITS padding must never become the reported .bss.
-    # If min() were used, 0x70000 (from the 0x26c200 segment) would win.
-    check("case4 padding segment not chosen",
-          (bss[0] if bss else None) != "0x70000", True)
-    check("case4 chose the LAST nobits tail (0x271a9c)",
-          bss[0] if bss else None, "0x271a9c")
+    def setUp(self) -> None:
+        self.bss, self.note = resolve_bss(HDR_16K, [], BIAS_16K, SEGS_16K)
 
-    # ------------------------------------------------------------------ case 2
-    # 4 KiB shared library (the libGameCore shape): arithmetic path exact.
-    loads4 = [
-        PhdrLoad(0x0, 0x218476c, 0x218476c, 0x0, 4, 0x1000),
-        PhdrLoad(0x2185770, 0x29bcbc0, 0x29bcbc0, 0x2184770, 5, 0x1000),
-        PhdrLoad(0x4b43330, 0x4b4560, 0x4b4560, 0x4b41330, 6, 0x1000),
-        PhdrLoad(0x4ff8890, 0x454be8, 0x276308, 0x4ff5890, 6, 0x1000),
-    ]
-    hdr4 = build_elf(loads4)
-    segs4 = [
-        FakeMap(0x74b763e000, 0x74b97c3000, "f"),
-        FakeMap(0x74b97c3000, 0x74bb3a3000, "f"),
-        FakeMap(0x74bc181000, 0x74bc636000, "f"),
-        FakeMap(0x74bc636000, 0x74bc8ad000, "f"),
-    ]
-    bias4 = segs4[0].start - 0x0          # 0x74b763e000
-    bss4, note4 = resolve_bss(hdr4, segs4, bias4, segs4)
-    # .bss vaddr = align_up(0x4ff8890+0x276308, 4K) = 0x526f000
-    # Arithmetic path: lower bound = bias + p_vaddr + p_filesz = 0x74bc8acb98.
-    check("case2 4K lib, arithmetic -> lower bound",
-          bss4[0] if bss4 else None, "0x74bc8acb98", f"(note: {note4[:40]})")
-    check("case2 lower bound <= true .bss start (0x74bc8ad000)",
-          int(bss4[0], 16) <= 0x74bc8ad000, True)
+    def test_lower_bound(self) -> None:
+        self.assertEqual(self.bss[0], "0x271a9c")
 
-    # ------------------------------------------------------------------ case 5
-    # No load anchor at all -> must refuse rather than invent numbers.
-    bss5, note5 = resolve_bss(hdr16, [], None, segs16)
-    check("case5 no anchor -> returns None", bss5, None)
+    def test_bound_is_below_true_start(self) -> None:
+        self.assertLessEqual(int(self.bss[0], 16), 0x274000)
 
-    print()
-    if failures:
-        print(f"{failures} case(s) FAILED")
-        return 1
-    print("all bss resolution cases passed")
-    return 0
+    def test_note_flags_arithmetic(self) -> None:
+        self.assertIn("arithmetic", self.note or "")
+
+
+class LiveMappingTest(unittest.TestCase):
+    """Cases 1 and 3b: a live mapping snaps the answer up to its start."""
+
+    def test_unlabelled_mapping(self) -> None:
+        maps = list(SEGS_16K) + [FakeMap(0x272000, 0x27c000, "")]
+        bss, _note = resolve_bss(HDR_16K, maps, BIAS_16K, SEGS_16K)
+        self.assertEqual(bss[0], "0x272000")
+
+    def test_labelled_mapping(self) -> None:
+        maps = list(SEGS_16K) + [FakeMap(0x272000, 0x27c000, "[anon:.bss]")]
+        bss, note = resolve_bss(HDR_16K, maps, BIAS_16K, SEGS_16K)
+        self.assertEqual(bss[0], "0x272000")
+        self.assertIn("live", note or "")
+
+
+class NobitsTailSelectionTest(unittest.TestCase):
+    """Case 4: intermediate NOBITS padding must never win.
+
+    The 0x26c200 segment also has memsz > filesz, but that gap is page padding
+    between segments; using min() would report 0x70000 here.
+    """
+
+    def setUp(self) -> None:
+        self.bss, _note = resolve_bss(HDR_16K, [], BIAS_16K, SEGS_16K)
+
+    def test_padding_segment_not_chosen(self) -> None:
+        self.assertNotEqual(self.bss[0], "0x70000")
+
+    def test_last_tail_chosen(self) -> None:
+        self.assertEqual(self.bss[0], "0x271a9c")
+
+
+class SharedLibraryTest(unittest.TestCase):
+    """Case 2: the libGameCore 4 KiB shape, arithmetic path."""
+
+    def setUp(self) -> None:
+        self.bss, _note = resolve_bss(HDR_4K, SEGS_4K, BIAS_4K, SEGS_4K)
+
+    def test_lower_bound(self) -> None:
+        self.assertEqual(self.bss[0], "0x74bc8acb98")
+
+    def test_bound_is_below_true_start(self) -> None:
+        self.assertLessEqual(int(self.bss[0], 16), 0x74bc8ad000)
+
+
+class NoAnchorTest(unittest.TestCase):
+    """Case 5: no load anchor -> refuse rather than invent numbers."""
+
+    def test_returns_none(self) -> None:
+        bss, _note = resolve_bss(HDR_16K, [], None, SEGS_16K)
+        self.assertIsNone(bss)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -30,22 +31,15 @@ CASES = [
 ]
 
 
-def main() -> int:
-    failures = 0
-    for value, want, why in CASES:
-        got = _looks_like_pointer(value)
-        ok = got == want
-        if not ok:
-            failures += 1
-        print(f"[{'PASS' if ok else 'FAIL'}] {why:<40} "
-              f"{value:#018x} -> {got} (want {want})")
-    print()
-    if failures:
-        print(f"{failures} case(s) FAILED")
-        return 1
-    print("all PAC-guard cases passed")
-    return 0
+class PacGuardTest(unittest.TestCase):
+    """One subtest per case so a failure names the offending value."""
+
+    def test_pointer_heuristic(self) -> None:
+        for value, want, why in CASES:
+            with self.subTest(case=why, value=hex(value)):
+                self.assertEqual(_looks_like_pointer(value), want,
+                                 f"{why}: {value:#018x}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main()

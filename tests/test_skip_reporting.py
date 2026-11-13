@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -41,28 +42,18 @@ CASES = [
 ]
 
 
-def main() -> int:
-    failures = 0
-    for errno_val, want in CASES:
-        got = reason_for_errno(errno_val)
-        ok = got == want
-        if not ok:
-            failures += 1
-        print(f"[{'PASS' if ok else 'FAIL'}] errno {errno_val:>3} -> "
-              f"{str(got):<22} (want {want})")
+class SkipReasonTest(unittest.TestCase):
+    def test_errno_to_reason(self) -> None:
+        for errno_val, want in CASES:
+            with self.subTest(errno=errno_val):
+                self.assertEqual(reason_for_errno(errno_val), want)
 
-    # The agent's table must contain exactly these keys.
-    print()
-    print(f"reason table covers {len(REASONS)} errnos: "
-          f"{sorted(REASONS.values())}")
-
-    print()
-    if failures:
-        print(f"{failures} case(s) FAILED")
-        return 1
-    print("all skip-reason cases passed")
-    return 0
+    def test_table_covers_the_agent_side_errnos(self) -> None:
+        # Drift guard: the agent's C++ table and this mirror must agree.
+        self.assertEqual(sorted(REASONS),
+                         [1, 3, 5, 14],
+                         "agent errno table changed; update REASONS here too")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main()
