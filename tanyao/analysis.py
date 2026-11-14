@@ -41,6 +41,11 @@ from .dump import dump_module as _dump_module
 from .dump import pull_dump_with_resume
 from .dump import watch as _watch
 from .addr import AddressModel, AddressModelError
+
+# Above this estimated range size a scan always runs as a background job, so the
+# request does not block a caller for minutes. Named once: it used to be spelled
+# out as a literal at four sites in the scan paths.
+INLINE_LIMIT = 64 * 1024 * 1024
 from .elfinfo import ElfParseError, parse_elf64
 from .mapsview import MAP_ANONYMOUS, MAP_READ, MapsView
 from .jobs import JobManager, ScanCancelled
@@ -729,6 +734,25 @@ class AnalysisFacade:
             return "host"
         return "agent"
 
+    def _run_agent_scan(self, pid: int, kind: str, *, dev_job: int, meta: dict,
+                        async_run: bool, limit: int) -> dict:
+        """Run a device-side scan job to completion, or hand it to the job manager.
+
+        Both scan entry points spelled this sequence out separately: start the
+        device job, estimate the range size, go async past 64 MiB, otherwise
+        block and shape the summary. Only `kind` and the result page size ever
+        differed.
+        """
+        engine = self._scans.get(pid)
+        est = sum(e - s for s, e in engine.state.ranges) if engine else 0
+        if async_run or est > INLINE_LIMIT:
+            return self._start_agent_scan_job(pid, kind, dev_job, meta)
+        st = self._agent_wait(dev_job)
+        summary = self._agent_summary(pid, st, meta)
+        return summary | {"found": summary["count"],
+                          "results": self._agent_results_page(dev_job, 0, limit),
+                          "async": False}
+
     def _explicit_ranges_payload(self, pid: int) -> list[dict] | None:
         ranges = self._explicit_ranges.get(pid)
         if not ranges or len(ranges) > 4096:
@@ -778,8 +802,17 @@ class AnalysisFacade:
         return dev_job, meta
 
     def _agent_wait(self, dev_job: int, progress=None, cancel_event=None,
-                    timeout: float = 600.0) -> dict:
-        """Poll device job status until done. Maps cancel/error to host semantics."""
+                    timeout: float = 600.0, *, label: str = "agent scan",
+                    poll_interval: float = 0.05) -> dict:
+        """Poll a device job until it finishes, mapping device states to host ones.
+
+        One implementation for every device-side job. There used to be two
+        (scan and strings) whose bodies differed only in three message strings
+        and a sleep interval, so a fix to the cancel path had to be made twice.
+
+        `label` names the job kind in error messages; `poll_interval` lets the
+        long-running kinds poll less often.
+        """
         deadline = time.monotonic() + timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -800,10 +833,12 @@ class AnalysisFacade:
             if state == "cancelled":
                 raise ScanCancelled()
             if state == "error":
-                raise AgentError("backend_error", detail=str(st.get("error") or "agent scan failed"))
+                raise AgentError("backend_error",
+                                 detail=str(st.get("error") or f"{label} failed"))
             if time.monotonic() > deadline:
-                raise AgentError("backend_error", detail=f"agent scan job {dev_job} timed out")
-            time.sleep(0.05)
+                raise AgentError("backend_error",
+                                 detail=f"{label} {dev_job} timed out")
+            time.sleep(poll_interval)
 
     def _agent_results_page(self, dev_job: int, offset: int, limit: int) -> list[dict]:
         resp = self.service.agent_scan_results(offset, limit)
@@ -932,19 +967,10 @@ class AnalysisFacade:
                 epsilon=epsilon, alignment=alignment or 0,
                 ranges=self._explicit_ranges_payload(pid),
             )
-            engine = self._scans.get(pid)
-            est = sum(e - s for s, e in engine.state.ranges) if engine else 0
-            INLINE_LIMIT = 64 * 1024 * 1024
-            if async_run or est > INLINE_LIMIT:
-                return self._start_agent_scan_job(pid, "value", dev_job, meta)
-            st = self._agent_wait(dev_job)
-            summary = self._agent_summary(pid, st, meta)
-            return summary | {"found": summary["count"],
-                              "results": self._agent_results_page(dev_job, 0, 32),
-                              "async": False}
+            return self._run_agent_scan(pid, "value", dev_job=dev_job, meta=meta,
+                                        async_run=async_run, limit=32)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
-        INLINE_LIMIT = 64 * 1024 * 1024  # >64MB: force async
         if async_run or est > INLINE_LIMIT:
             return self._start_scan_job(pid, "value", vtype, value, epsilon=epsilon, alignment=alignment)
         found = engine.scan_value(pid, vtype, value, epsilon=epsilon, alignment=alignment)
@@ -955,20 +981,11 @@ class AnalysisFacade:
         if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern,
                                                    ranges=self._explicit_ranges_payload(pid))
-            engine = self._scans.get(pid)
-            est = sum(e - s for s, e in engine.state.ranges) if engine else 0
-            INLINE_LIMIT = 64 * 1024 * 1024
-            if async_run or est > INLINE_LIMIT:
-                return self._start_agent_scan_job(pid, "hex", dev_job, meta)
-            st = self._agent_wait(dev_job)
-            summary = self._agent_summary(pid, st, meta)
-            return summary | {"found": summary["count"],
-                              "results": self._agent_results_page(dev_job, 0, 256),
-                              "async": False}
+            return self._run_agent_scan(pid, "hex", dev_job=dev_job, meta=meta,
+                                        async_run=async_run, limit=256)
         pattern_bytes, mask_bytes = _parse_aob(pattern)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
-        INLINE_LIMIT = 64 * 1024 * 1024
         if async_run or est > INLINE_LIMIT:
             return self._start_scan_job(pid, "hex", bytes(pattern_bytes), bytes(mask_bytes))
         found = engine.scan_hex(pid, bytes(pattern_bytes), bytes(mask_bytes))
@@ -1049,13 +1066,22 @@ class AnalysisFacade:
             return {"pid": pid, "jobs": []}
         return {"pid": pid, "jobs": [j.to_dict(include_summary=(j.state == "done")) for j in jobs[-8:]]}
 
+    def _require_idle_scan(self, pid: int) -> None:
+        """Refinement needs a completed scan: one must exist, and no job may run.
+
+        Both engine branches of scan_next repeated these two checks, so a change
+        to the ordering rule had to be made twice.
+        """
+        if any(j.state == "running" for j in self._jobs.list_for(pid)):
+            raise AgentError("bad_request",
+                             detail="a scan job is still running; poll scan_status first")
+
     def scan_next(self, pid: int, mode: str, value: float | None = None, *, epsilon: float = 0.0) -> dict:
         if self._agent_scan_enabled(pid):
             meta = self._agent_scan_meta.get(pid)
             if meta is None:
                 raise AgentError("bad_request", detail="no scan in progress for this pid")
-            if any(j.state == "running" for j in self._jobs.list_for(pid)):
-                raise AgentError("bad_request", detail="a scan job is still running; poll scan_status first")
+            self._require_idle_scan(pid)
             resp = self.service.agent_scan_refine(mode, value, epsilon=epsilon)
             st = self.service.agent_scan_status(meta["dev_job"])
             summary = self._agent_summary(pid, st, meta)
@@ -1063,8 +1089,7 @@ class AnalysisFacade:
         engine = self._scans.get(pid)
         if engine is None or engine.state.scan_round == 0:
             raise AgentError("bad_request", detail="no scan in progress for this pid")
-        if any(j.state == "running" for j in self._jobs.list_for(pid)):
-            raise AgentError("bad_request", detail="a scan job is still running; poll scan_status first")
+        self._require_idle_scan(pid)
         found = engine.refine(pid, mode, value, epsilon=epsilon)
         return engine.summary() | {"found": found, "engine": "host-scan"}
 
@@ -2319,30 +2344,10 @@ class AnalysisFacade:
 
     def _agent_strings_wait(self, dev_job: int, progress=None, cancel_event=None,
                             timeout: float = 3600.0) -> dict:
-        deadline = time.monotonic() + timeout
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                try:
-                    self.service.agent_scan_cancel(dev_job)
-                except AgentError:
-                    pass
-                raise ScanCancelled()
-            st = self.service.agent_scan_status(dev_job)
-            if progress is not None:
-                progress(
-                    parse_u64(st.get("scanned_bytes", "0x0"), field="scanned_bytes"),
-                    parse_u64(st.get("total_bytes", "0x0"), field="total_bytes"),
-                )
-            state = st.get("state")
-            if state == "done":
-                return st
-            if state == "cancelled":
-                raise ScanCancelled()
-            if state == "error":
-                raise AgentError("backend_error", detail=str(st.get("error") or "strings job failed"))
-            if time.monotonic() > deadline:
-                raise AgentError("backend_error", detail=f"strings job {dev_job} timed out")
-            time.sleep(0.1)
+        """Strings jobs share the scan poller; only the labels and cadence differ."""
+        return self._agent_wait(dev_job, progress=progress,
+                                cancel_event=cancel_event, timeout=timeout,
+                                label="strings job", poll_interval=0.1)
 
     def pull_apk(self, pid: int, out_path: str) -> dict:
         """Pull the APK backing this pid to the host. With bit6 the file comes
@@ -2440,7 +2445,7 @@ class AnalysisFacade:
         read as high-entropy. Returns a note (forced/None) or raises when the
         caller has not passed force=true."""
         total = sum(e.end - e.start for e in entries if e.flags & MAP_READ)
-        if total <= 64 * 1024 * 1024:
+        if total <= INLINE_LIMIT:
             return None
         readable = [e for e in entries if e.flags & MAP_READ]
         if not readable:
