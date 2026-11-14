@@ -46,7 +46,6 @@ from .addr import AddressModel, AddressModelError
 # request does not block a caller for minutes. Named once: it used to be spelled
 # out as a literal at four sites in the scan paths.
 INLINE_LIMIT = 64 * 1024 * 1024
-from .elfinfo import ElfParseError, parse_elf64
 from .mapsview import MAP_ANONYMOUS, MAP_READ, MapsView
 from .jobs import JobManager, ScanCancelled
 from .native import ApkParseError, disassemble_a64_ex, extract_strings, parse_apk_manifest
@@ -360,9 +359,21 @@ class AnalysisFacade:
     def _bss_owner(self, pid: int, view, anon_seg, address: int) -> tuple[str, int] | None:
         """Attribute an `[anon:.bss]`-style mapping to the module that owns it.
 
-        Evidence: the anonymous region must start exactly where some module's
-        last file-backed segment ends, and the address must fall inside that
-        module's ELF [bss_start, bss_end). Returns (module, elf_vaddr) or None.
+        This is the INVERSE of the address model: given a runtime address inside
+        an anonymous region, which module put it there, and what is its ELF
+        vaddr? Returns (module, elf_vaddr) or None.
+
+        Two pieces of evidence, in order:
+
+          1. adjacency — the anonymous region starts exactly where some module's
+             last non-mirror segment ends. The loader maps a module's NOBITS
+             immediately after its file-backed tail, so this usually narrows the
+             candidate set to one module before any ELF is read.
+          2. the module's ELF BSS window — the offset into the region must fall
+             inside [bss_start, bss_end).
+
+        Only the adjacent candidate gets an ELF read; scanning every module would
+        cost one mem_read each.
         """
         target = anon_seg.start
         for name, mod in view.modules.items():
@@ -372,18 +383,18 @@ class AnalysisFacade:
             if max(x.end for x in segs) != target:
                 continue
             try:
-                header = self.service.mem_read(pid, segs[0].start,
-                                               min(0x1000, segs[0].size))
-                info = parse_elf64(header, allow_zero_magic=True)
-            except (AgentError, ElfParseError):
+                model = AddressModel.build(pid, name,
+                                           self.service.target_maps(pid),
+                                           self.service.mem_read)
+            except AddressModelError:
                 continue
-            if info.bss_start is None or info.bss_end is None:
+            elf = model.elf
+            if not elf.bss_end or elf.bss_start is None:
                 continue
-            # Address must fall inside this module's ELF BSS window.
             offset = address - target
-            if offset < 0 or offset >= (info.bss_end - info.bss_start):
+            if offset < 0 or offset >= (elf.bss_end - elf.bss_start):
                 continue
-            return name, info.bss_start + offset
+            return name, elf.bss_start + offset
         return None
 
     def address_resolve(self, pid: int, address: int) -> dict:
