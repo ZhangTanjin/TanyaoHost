@@ -47,15 +47,39 @@ def _page_align_up(value: int) -> int:
 
 @dataclass(slots=True)
 class ElfInfo:
+    """What an ELF file says about itself. EVERY field is in ELF vaddr space
+    (the numbers `readelf -l` prints), never adjusted by any runtime mapping.
+
+    There used to be two coordinate spaces in here: `load_bias` was
+    `first.vaddr - first.offset` (an ELF-only quantity, unrelated to any
+    mapping) while `bss_start`/`bss_end` were `p_vaddr + p_filesz - load_bias`
+    (a module-base-relative quantity). Mixing them meant a caller could not tell
+    which space a value was in without reading the code that produced it, and
+    whenever the first mapping's start differed from `load_bias` — which happens
+    on prelinked PIEs — the two silently disagreed. Every consumer then had to
+    re-derive the base by hand, 39 lines of it spread over 11 functions.
+
+    Conversions to runtime addresses belong to `tanyao.addr.AddressModel`, which
+    is the only thing that knows about both spaces.
+    """
     entry: int
     phoff: int
     phentsize: int
     phnum: int
     loads: list[PhdrLoad]
-    load_bias: int  # vaddr of first PT_LOAD minus its file offset (the "load bias")
-    bss_start: int  # absolute (bias-relative) merged BSS bounds
-    bss_end: int
-    dynamic_vaddr: int | None = None  # PT_DYNAMIC segment vaddr (bias-relative), if present
+    load_bias: int          # first.vaddr - first.offset; a property of the FILE
+    bss_start: int          # merged NOBITS tail lower bound, ELF vaddr space
+    bss_end: int            # merged NOBITS tail upper bound, ELF vaddr space
+    dynamic_vaddr: int | None = None  # PT_DYNAMIC vaddr, ELF vaddr space
+
+    def to_runtime(self, vaddr: int, first_map: int) -> int:
+        """Translate an ELF vaddr to a runtime address given the module's base.
+
+        `first_map` is the runtime address of the module's first mapping, which
+        is NOT always `load_bias` (a prelinked PIE has load_bias 0x200000 while
+        its first mapping sits at 0x400000). Callers that guessed got it wrong.
+        """
+        return first_map + (vaddr - self.load_bias)
 
 
 class ElfParseError(Exception):
@@ -147,8 +171,8 @@ def parse_elf64(data: bytes, *, allow_zero_magic: bool = False) -> ElfInfo:
     for seg in loads:
         if seg.memsz <= seg.filesz:
             continue
-        start = seg.vaddr + seg.filesz - load_bias
-        end = seg.vaddr + seg.memsz - load_bias
+        start = seg.vaddr + seg.filesz      # ELF vaddr space, no bias applied
+        end = seg.vaddr + seg.memsz
         # Keep the highest start: only the final NOBITS tail is real .bss.
         if start > bss_start:
             bss_start = start
