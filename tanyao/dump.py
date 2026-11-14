@@ -221,10 +221,6 @@ def watch(
 # -- v3 dump pipeline client (cmd 63/64/65/68; DESIGN_V3_HOST §3.2) ---------------
 
 
-class PullResumeError(Exception):
-    pass
-
-
 def _pull_chunk_bytes(service, dump_id: str | None, path: str | None, offset: int,
                       chunk: int, compress: bool) -> tuple[bytes, bool]:
     """One dump_pull round trip → (plain bytes, is_last). Corruption, wrong

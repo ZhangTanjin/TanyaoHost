@@ -40,11 +40,6 @@ def _align_up(value: int, align: int) -> int:
     return (value + align - 1) & ~(align - 1)
 
 
-def _page_align_up(value: int) -> int:
-    """Round up to the next 4 KiB page (kept for callers that assume pages)."""
-    return _align_up(value, PAGE_SIZE)
-
-
 @dataclass(slots=True)
 class ElfInfo:
     """What an ELF file says about itself. EVERY field is in ELF vaddr space

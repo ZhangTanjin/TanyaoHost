@@ -325,8 +325,12 @@ class TanyaoService:
             # through the shared control socket here would let two threads
             # interleave frames on one stream (observed: "response seq/cmd
             # mismatch") because it is not mutex-protected.
-            with self._lock:
-                pass
+            #
+            # `checkout()` is what provides that exclusivity — it removes the
+            # connection from the idle list under the pool's condition variable.
+            # A `with self._lock: pass` used to sit here; it acquired and
+            # released the global lock without protecting anything, so it read
+            # as a guarantee the code did not make.
             with pool.checkout() as held:
                 return self._execute_on(held, cmd, payload)
         with pool.checkout(prefer=conn) as held:
