@@ -285,77 +285,20 @@ class AnalysisFacade:
             "anonymous_executable_count": len(anon_exec),
         }
 
-    def _resolve_bss_bounds(self, pid: int, info, view, segs,
-                            load_bias_abs: int | None) -> tuple[list[str] | None, str]:
-        """Locate the module's runtime BSS range.
+    def _resolve_bss_bounds(self, model: AddressModel) -> tuple[list[str] | None, str]:
+        """Runtime BSS range for a module, as string bounds plus its evidence.
 
-        `.bss` is NOBITS: it consumes no file space, so it is NOT covered by any
-        PT_LOAD's file extent and the loader maps it as a SEPARATE anonymous
-        region right after the module's last file-backed mapping (kernel name
-        `[anon:.bss]`). Arithmetic (`bss_end + load_bias`) therefore cannot be
-        clamped to `max(segment.end)` — that clamp truncated a 1.87 MB BSS to
-        0x468 on a real target (field report, libGameCore.so).
-
-        Order of evidence, strongest first:
-          1. the `[anon:.bss]` mapping that starts exactly at the module's last
-             mapping end, and whose size matches the ELF BSS size;
-          2. that same mapping when its size differs (still authoritative for
-             the START, which is what address math needs);
-          3. arithmetic from the ELF BSS vaddr, only as a last resort, and
-             reported as `arithmetic` so callers know it is not corroborated.
+        The search now lives on AddressModel.bss_bounds — it needs the ELF BSS
+        window, the module's segments AND the whole maps snapshot (the anonymous
+        region sits outside this module's own segments), which is exactly what
+        the model holds. This wrapper only adapts the shape for the tool layer.
         """
-        if not info.bss_end or info.bss_start is None:
-            return None, "elf has no BSS"
-        last_end = max(s.end for s in segs)
+        bounds, note = model.bss_bounds()
+        if bounds is None:
+            return None, note
+        lo, hi = bounds
+        return [f"0x{lo:x}", f"0x{hi:x}"], note
 
-        # Try the maps snapshot for the loader-created anonymous BSS region.
-        try:
-            maps = self.service.target_maps(pid)
-        except AgentError:
-            maps = []
-        # The loader-created BSS region is anonymous: the kernel may label it
-        # "[anon:.bss]", plain "[anon]", or leave the path EMPTY entirely
-        # (observed on a 16 KiB-aligned static PIE: `rw-p 00000000 00:00 0`).
-        # Requiring a "[anon" prefix therefore misses the region on some
-        # kernels — accept any mapping that starts exactly where the module's
-        # last segment ends and is not backed by a file.
-        adj = next((m for m in maps
-                    if m.start <= last_end < m.end
-                    and (not m.path or m.path.startswith("[anon"))),
-                   None)
-        if adj is not None and load_bias_abs is not None:
-            # The kernel maps ONE anonymous region covering the whole NOBITS
-            # tail, page-aligned DOWN to the last segment's end. The ELF .bss
-            # proper starts later, at the p_align boundary. Both facts matter:
-            #   mapping   -> proves the region is live and gives its extent
-            #   elf_start -> the actual first byte of .bss (p_align aligned)
-            # Using the mapping start alone under-reports by up to p_align-1
-            # (measured: mapping 0x272000 vs real .bss 0x274000 on a 16 KiB PIE).
-            # info.bss_* are ELF vaddrs; to_runtime applies the module base.
-            elf_lo = info.to_runtime(info.bss_start, load_bias_abs)
-            elf_hi = info.to_runtime(info.bss_end, load_bias_abs)
-            if adj.start <= elf_lo < adj.end:
-                return ([f"0x{elf_lo:x}", f"0x{min(elf_hi, adj.end):x}"],
-                        f"live anon mapping 0x{adj.start:x}-0x{adj.end:x}, "
-                        f"elf .bss starts 0x{elf_lo:x}")
-            # info.bss_start is a conservative LOWER bound (p_vaddr+p_filesz);
-            # the real section start sits up to sh_addralign-1 above it, which
-            # can leave it marginally below the anonymous mapping's start.
-            # Anything within one page is this module's .bss, snapped up.
-            if 0 < adj.start - elf_lo <= 0x1000:
-                return ([f"0x{adj.start:x}", f"0x{min(elf_hi, adj.end):x}"],
-                        f"live anon mapping 0x{adj.start:x}-0x{adj.end:x} "
-                        f"(elf bss lower bound 0x{elf_lo:x} snapped up)")
-            return [f"0x{adj.start:x}", f"0x{adj.end:x}"], (
-                f"live anon mapping (elf .bss 0x{elf_lo:x} outside it)")
-
-        if load_bias_abs is None:
-            return None, "no load anchor and no adjacent bss mapping"
-        bss_lo = info.to_runtime(info.bss_start, load_bias_abs)
-        bss_hi = info.to_runtime(info.bss_end, load_bias_abs)
-        return [f"0x{bss_lo:x}", f"0x{bss_hi:x}"], (
-            "arithmetic (uncorroborated: no [anon:.bss] mapping adjacent to the "
-            "module's last segment)")
 
     def resolve_module(self, pid: int, name: str) -> dict:
         view = MapsView.from_maps(self.service.target_maps(pid))
@@ -382,7 +325,7 @@ class AnalysisFacade:
         mirror = any(s.mirror for s in v.segments)
         load_bias_abs: int | None = None if model.base_is_ambiguous else model.base
         ambiguous = model.base_is_ambiguous
-        bss, bss_note = self._resolve_bss_bounds(pid, info, v, segs, load_bias_abs)
+        bss, bss_note = self._resolve_bss_bounds(model)
         out = {
             "pid": pid,
             "module": name,
@@ -1580,7 +1523,7 @@ class AnalysisFacade:
         in_bss = (info.bss_start is not None and info.bss_end is not None
                   and info.bss_start <= vaddr < info.bss_end)
         if in_bss:
-            bss, bss_note = self._resolve_bss_bounds(pid, info, v, segs, load_bias_abs)
+            bss, bss_note = self._resolve_bss_bounds(model)
             if bss is not None:
                 # Anchor on the LIVE mapping start, not on info.bss_start: the
                 # latter is a conservative lower bound (p_vaddr + p_filesz), so
@@ -1691,13 +1634,18 @@ class AnalysisFacade:
         fo = file_offset
         if rva is not None:
             used = "vaddr"
-            first = segs[0]
-            header = self.service.mem_read(pid, first.start, min(0x1000, first.size))
+            # Only the vaddr flavour needs the ELF header; build the model
+            # lazily so a plain file_offset lookup costs nothing extra.
             try:
-                info = parse_elf64(header, allow_zero_magic=True)
-            except ElfParseError as exc:
-                raise AgentError("backend_error",
-                                 detail=f"phdr parse failed for {module!r}: {exc}") from exc
+                model = AddressModel.build(pid, module,
+                                           self.service.target_maps(pid),
+                                           self.service.mem_read)
+            except AddressModelError as exc:
+                slug = "unavailable" if exc.unavailable else "backend_error"
+                raise AgentError(slug,
+                                 detail=f"phdr parse failed for {module!r}: "
+                                        f"{exc.detail}") from exc
+            info = model.elf
             # Only the FILE-BACKED part of a PT_LOAD has a file offset. Using
             # max(memsz, filesz) here (the old behaviour) invented an offset for
             # NOBITS bytes: a .bss vaddr produced a bogus file offset that then
@@ -2606,23 +2554,22 @@ class AnalysisFacade:
         # headers instead: for the segment containing a given runtime start,
         # the byte at (start + k) corresponds to file offset
         #     p_offset + (start - (load_base + p_vaddr)) + k
-        anchors = {x.start - x.file_offset for x in segs
-                   if x.file_offset == 0 and not x.mirror}
-        header = self.service.mem_read(pid, base, min(0x1000, segs[0].size))
         try:
-            info = parse_elf64(header, allow_zero_magic=True)
-        except ElfParseError as exc:
-            raise AgentError("backend_error",
-                             detail=f"cannot parse ELF header for diff: {exc}") from exc
+            model = AddressModel.build(pid, module, maps, self.service.mem_read)
+        except AddressModelError as exc:
+            slug = "unavailable" if exc.unavailable else "not_found"
+            raise AgentError(slug, detail=f"cannot build address model for diff: "
+                                          f"{exc.detail}") from exc
+        info = model.elf
         # Two layouts exist and they need different arithmetic:
         #   * ET_DYN loaded at 0 with p_vaddr already relative      (usual .so)
         #   * ET_EXEC / prelinked PIE whose p_vaddr IS the runtime   (this PIE)
         # Distinguish them by checking whether any PT_LOAD's p_vaddr already
-        # falls inside the module's mapped range.
+        # falls inside the module's mapped range; AddressModel owns the window.
         in_range = any(
             min(x.start for x in segs) <= ld.vaddr < max(x.end for x in segs)
             for ld in info.loads)
-        load_base = 0 if in_range else (anchors.pop() if len(anchors) == 1 else base)
+        load_base = 0 if in_range else model.base
 
         def disk_offset_for(rt_start: int) -> int | None:
             """Map a runtime address to a file offset via the live p_vaddrs."""

@@ -75,7 +75,8 @@ class AddressModel:
     pid: int
     module: str
     elf: ElfInfo
-    view: ModuleView
+    view: ModuleView            # this module's mappings
+    maps_view: MapsView         # the whole snapshot (BSS lives outside `view`)
     base: int                   # runtime address of ELF vaddr 0
     base_is_ambiguous: bool     # several off-0 anchors disagreed
     segments: list[Segment] = field(default_factory=list)
@@ -136,8 +137,8 @@ class AddressModel:
             # callers see the ambiguity rather than hide it.
             base = first.start
 
-        return cls(pid=pid, module=module, elf=elf, view=mod, base=base,
-                   base_is_ambiguous=ambiguous, segments=segs)
+        return cls(pid=pid, module=module, elf=elf, view=mod, maps_view=view,
+                   base=base, base_is_ambiguous=ambiguous, segments=segs)
 
     # -- classification -----------------------------------------------------
 
@@ -157,6 +158,61 @@ class AddressModel:
         hi = max(s.end for s in self.view.segments)
         hi = max(hi, self.to_runtime(self.elf.bss_end))
         return lo <= value < hi
+
+    # -- BSS ----------------------------------------------------------------
+
+    def bss_bounds(self) -> tuple[tuple[int, int] | None, str]:
+        """Locate this module's runtime BSS range, with the evidence stated.
+
+        `.bss` is NOBITS: it consumes no file space, so no PT_LOAD's file extent
+        covers it. The loader maps an anonymous region immediately after the
+        module's last file-backed segment. Arithmetic alone cannot pin it down
+        (`bss_end + base` over-reported by 1730x on a real target before the
+        clamp, and the clamp then truncated a 1.87 MB BSS to 0x468), so the
+        live mapping is the primary evidence and arithmetic is the fallback.
+
+        Returns `(bounds_or_None, note)` where the note names the evidence.
+        The note is part of the interface, not decoration: callers surface it so
+        a reader can tell a measured answer from an uncorroborated one.
+        """
+        elf = self.elf
+        if not elf.bss_end or elf.bss_start is None:
+            return None, "elf has no BSS"
+        last_end = max(s.end for s in self.segments)
+
+        # The loader-created region is anonymous, but the kernel is not obliged
+        # to label it: "[anon:.bss]", plain "[anon]", or an EMPTY path have all
+        # been observed. Requiring a "[anon" prefix missed it on some kernels.
+        adj = next((m for m in self.maps_view.anonymous
+                    if m.start <= last_end < m.end
+                    and (not m.path or m.path.startswith("[anon"))),
+                   None)
+
+        if adj is not None and not self.base_is_ambiguous:
+            elf_lo = self.to_runtime(elf.bss_start)
+            elf_hi = self.to_runtime(elf.bss_end)
+            if adj.start <= elf_lo < adj.end:
+                return ((elf_lo, min(elf_hi, adj.end)),
+                        f"live anon mapping 0x{adj.start:x}-0x{adj.end:x}, "
+                        f"elf .bss starts 0x{elf_lo:x}")
+            # bss_start is a conservative lower bound (p_vaddr + p_filesz); the
+            # real section start sits up to sh_addralign-1 above it, so it can
+            # fall marginally below the mapping's start. Anything within one
+            # page is this module's .bss, snapped up.
+            if 0 < adj.start - elf_lo <= 0x1000:
+                return ((adj.start, min(elf_hi, adj.end)),
+                        f"live anon mapping 0x{adj.start:x}-0x{adj.end:x} "
+                        f"(elf bss lower bound 0x{elf_lo:x} snapped up)")
+            return ((adj.start, adj.end),
+                    f"live anon mapping (elf .bss 0x{elf_lo:x} outside it)")
+
+        if self.base_is_ambiguous:
+            return None, "no load anchor and no adjacent bss mapping"
+        bss_lo = self.to_runtime(elf.bss_start)
+        bss_hi = self.to_runtime(elf.bss_end)
+        return ((bss_lo, bss_hi),
+                "arithmetic (uncorroborated: no [anon:.bss] mapping adjacent to "
+                "the module's last segment)")
 
     # -- conversions --------------------------------------------------------
 

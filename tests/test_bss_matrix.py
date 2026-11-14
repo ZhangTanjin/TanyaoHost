@@ -51,9 +51,17 @@ def build_elf(loads: list[PhdrLoad], *, e_entry: int = 0) -> bytes:
     return bytes(buf)
 
 
-class FakeMap:
-    def __init__(self, start: int, end: int, path: str):
-        self.start, self.end, self.path = start, end, path
+# Real MapEntry, so the fixtures exercise the same shape the service produces.
+from tanyao.service import MapEntry
+
+
+class FakeMap(MapEntry):
+    """A MapEntry with a zero file_offset, convenient for anonymous regions."""
+
+    def __init__(self, start: int, end: int, path: str, file_offset: int = 0,
+                 flags: int = 6) -> None:
+        super().__init__(start=start, end=end, file_offset=file_offset,
+                         flags=flags, path=path)
 
 
 class FakeService:
@@ -72,16 +80,33 @@ class FakeService:
         return self._header[:size]
 
 
-def resolve_bss(header: bytes, maps, bias_base: int, segs) -> tuple:
-    """Drive the real AnalysisFacade helper with fakes."""
-    from tanyao.analysis import AnalysisFacade
+def resolve_bss(header: bytes, maps, bias_base: int, segs,
+                module: str | None = None) -> tuple:
+    """Build a real AddressModel and ask it for the BSS range.
 
-    svc = FakeService(maps, header, bias_base)
-    facade = AnalysisFacade.__new__(AnalysisFacade)   # no __init__ side effects
-    facade.service = svc  # type: ignore[attr-defined]
-    from tanyao.elfinfo import parse_elf64
-    info = parse_elf64(header, allow_zero_magic=True)
-    return facade._resolve_bss_bounds(0, info, None, segs, bias_base)
+    This used to poke a private AnalysisFacade method with five hand-assembled
+    arguments (and `__new__` to skip its constructor). The model is constructible
+    directly from a maps list plus a header reader, which is the whole point of
+    having it.
+    """
+    from tanyao.addr import AddressModel
+
+    # MapsView keys modules by BASENAME, so take the name from the segments
+    # rather than making the caller pass it correctly.
+    if module is None:
+        module = next((m.path.rstrip("/").split("/")[-1]
+                       for m in segs if m.path), "libsample.so")
+    all_maps = list(maps) if maps else []
+    if not any(m.path and m.path.rstrip("/").split("/")[-1] == module
+               for m in all_maps):
+        all_maps.extend(segs)
+    reader = FakeService(all_maps, header, bias_base)
+    model = AddressModel.build(0, module, all_maps, reader.mem_read)
+    bounds, note = model.bss_bounds()
+    if bounds is None:
+        return None, note
+    lo, hi = bounds
+    return [f"0x{lo:x}", f"0x{hi:x}"], note
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -96,9 +121,15 @@ LOADS_16K = [
 ]
 HDR_16K = build_elf(LOADS_16K)
 BIAS_16K = LOADS_16K[0].vaddr - LOADS_16K[0].offset            # 0x200000
+# Only the FIRST segment is file-offset-0; the rest carry real offsets, as a
+# normal loader layout does. Giving them all offset 0 would look like the
+# multi-anchor (lolm) layout and make the base ambiguous by construction.
+MOD_16K = "/x/libsixteen.so"
 SEGS_16K = [
-    FakeMap(0x200000, 0x218000, "f"), FakeMap(0x21b000, 0x269000, "f"),
-    FakeMap(0x26c000, 0x26d000, "f"), FakeMap(0x270000, 0x272000, "f"),
+    FakeMap(0x200000, 0x218000, MOD_16K, 0x0),
+    FakeMap(0x21b000, 0x269000, MOD_16K, 0x17100),
+    FakeMap(0x26c000, 0x26d000, MOD_16K, 0x64200),
+    FakeMap(0x270000, 0x272000, MOD_16K, 0x64f00),
 ]
 
 # 4 KiB shared library (the libGameCore shape): arithmetic path exact.
@@ -109,11 +140,12 @@ LOADS_4K = [
     PhdrLoad(0x4ff8890, 0x454be8, 0x276308, 0x4ff5890, 6, 0x1000),
 ]
 HDR_4K = build_elf(LOADS_4K)
+MOD_4K = "/x/libfourk.so"
 SEGS_4K = [
-    FakeMap(0x74b763e000, 0x74b97c3000, "f"),
-    FakeMap(0x74b97c3000, 0x74bb3a3000, "f"),
-    FakeMap(0x74bc181000, 0x74bc636000, "f"),
-    FakeMap(0x74bc636000, 0x74bc8ad000, "f"),
+    FakeMap(0x74b763e000, 0x74b97c3000, MOD_4K, 0x0),
+    FakeMap(0x74b97c3000, 0x74bb3a3000, MOD_4K, 0x2184000),
+    FakeMap(0x74bc181000, 0x74bc636000, MOD_4K, 0x4b41000),
+    FakeMap(0x74bc636000, 0x74bc8ad000, MOD_4K, 0x4ff5000),
 ]
 BIAS_4K = SEGS_4K[0].start - 0x0                                # 0x74b763e000
 
@@ -184,12 +216,26 @@ class SharedLibraryTest(unittest.TestCase):
         self.assertLessEqual(int(self.bss[0], 16), 0x74bc8ad000)
 
 
-class NoAnchorTest(unittest.TestCase):
-    """Case 5: no load anchor -> refuse rather than invent numbers."""
+class AmbiguousAnchorTest(unittest.TestCase):
+    """Case 5: several CONFLICTING off-0 anchors -> refuse rather than pick one.
 
-    def test_returns_none(self) -> None:
-        bss, _note = resolve_bss(HDR_16K, [], None, SEGS_16K)
+    Note the two cases are different, and the model treats them differently:
+
+      * NO off-0 segment at all  -> derive the base from ELF arithmetic
+        (`first_map - load_bias`); solvable, so it is the fallback path.
+      * SEVERAL off-0 segments with DIFFERENT `start - file_offset` -> no single
+        base is provable (the lolm co-resident layout). Refuse.
+    """
+
+    def test_ambiguous_anchors_return_none(self) -> None:
+        # Two file-offset-0 segments placed so their anchors disagree.
+        conflict = [
+            FakeMap(0x200000, 0x218000, MOD_16K, 0x0),
+            FakeMap(0x300000, 0x301000, MOD_16K, 0x0),
+        ]
+        bss, note = resolve_bss(HDR_16K, [], None, conflict)
         self.assertIsNone(bss)
+        self.assertIn("anchor", note)
 
 
 if __name__ == "__main__":
