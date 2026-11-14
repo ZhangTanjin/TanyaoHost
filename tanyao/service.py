@@ -476,9 +476,17 @@ class TanyaoService:
         if not info.capabilities & (1 << 1):  # TANYAO_CAP_TARGET_HANDLE
             raise AgentError("backend_error", detail="backend lacks TARGET_HANDLE capability")
 
-        # Bound concurrently held targets: each pins a kernel fd plus a pooled
-        # connection. Evict the oldest (insertion order).
-        while len(self._targets) >= MAX_OPEN_TARGETS:
+        # Bound concurrently held targets by what the agent can ACTUALLY keep
+        # open, not by a fixed number. In single-connection mode the agent shares
+        # one connection for every target, so the kernel reuses one target slot
+        # and two pids end up reporting the SAME handle — the second open
+        # silently takes over the first, and reads then address the wrong
+        # process. MAX_OPEN_TARGETS only applies when multi-conn is available.
+        limit = 1
+        pool = self._pool
+        if pool is not None and pool.size > 1:
+            limit = min(MAX_OPEN_TARGETS, pool.size)
+        while len(self._targets) >= limit:
             self.close_target(next(iter(self._targets)))
 
         open_payload: dict = {"pid": pid}
