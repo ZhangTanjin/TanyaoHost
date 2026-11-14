@@ -407,7 +407,7 @@ TOOLS = [
     },
     {
         "name": "disassemble",
-        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method; address == bearing_segment.translation_base + rva) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile/Ghidra for full-fidelity analysis.",
+        "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method; address == bearing_segment.translation_base + rva) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile_start (IDA) for full-fidelity analysis.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
@@ -460,7 +460,7 @@ TOOLS = [
     },
     {
         "name": "decompile_start",
-        "description": "Dump a module, import into headless Ghidra, auto-analyze and decompile all functions to C sources (+ index.json). Long-running: returns job_id; poll decompile_status (progress = elapsed seconds of the 3600s budget). Modules >64MB get an entropy pre-flight — mostly-encrypted images are rejected unless force=true. Requires Ghidra at /opt/ghidra.",
+        "description": "Dump a module and decompile it with IDA Pro (idalib + Hex-Rays): dumps the live image, loads it in-process and emits one .c per function plus index.json. Long-running: returns job_id; poll decompile_status. Modules >64MB get an entropy pre-flight — mostly-encrypted images are rejected unless force=true. Requires IDA Pro with idalib (TANYAO_IDA_DIR, default /home/ufo/ida-pro-9.4); if absent the call returns a structured 'unavailable', so still usable targets are never blocked by a missing decompiler.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},

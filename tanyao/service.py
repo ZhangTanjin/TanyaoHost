@@ -281,8 +281,47 @@ class TanyaoService:
             return self._conn.agent_build
 
     def is_connected(self) -> bool:
+        """Cheap socket-level liveness: is the control connection present?
+
+        This is a STATE READ, not a probe: it answers "does the socket look
+        usable right now". During startup — or immediately after a reconnect —
+        that answer is legitimately False for a fraction of a second even though
+        the link comes up a moment later, so a caller that acts on a single
+        sample can report a false "disconnected". Use `probe_alive()` when the
+        question is "is it actually dead".
+        """
         with self._lock:
             return self._conn is not None and self._conn.is_connected
+
+    def probe_alive(self, *, attempts: int = 2, delay: float = 0.15) -> tuple[bool, bool]:
+        """Is the agent actually reachable? Returns (alive, transient).
+
+        Unlike `is_connected`, this sends a real round trip. A single failed
+        socket check is not evidence of a dead link — a connection established a
+        moment ago, or one recovering from a pool teardown, reads as
+        disconnected while being perfectly healthy. Retrying briefly separates
+        "still coming up" from "really gone", and the `transient` flag tells the
+        caller which of the two it saw.
+
+        Cheap enough to run on demand (one tiny request), too slow to run on
+        every status read, which is why it is a separate method.
+        """
+        for i in range(max(1, attempts)):
+            with self._lock:
+                conn = self._conn
+            if conn is not None and conn.is_connected:
+                try:
+                    conn.ping()
+                    return True, False
+                except (ConnectionError, TimeoutError, OSError, ProtocolError):
+                    pass
+            if i + 1 < attempts:
+                time.sleep(delay)
+        # One last state read: a link that came up during the retries counts as
+        # alive, and the fact that it needed the retries is the transient signal.
+        with self._lock:
+            now_connected = self._conn is not None and self._conn.is_connected
+        return now_connected, now_connected
 
     def generation(self) -> int | None:
         with self._lock:

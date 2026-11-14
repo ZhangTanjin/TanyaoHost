@@ -68,9 +68,16 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         raise AgentError("bad_request", detail=f"'{key}' must be 0x hex string or int")
 
     def get_status(_payload: dict) -> dict:
+        # `connected` answers "can I actually talk to it", not "does the socket
+        # look right this instant". A single socket read reports False for a
+        # fraction of a second while a link is still being established, and a
+        # caller acting on that sample wrongly concludes the chain is down.
+        # probe_alive does one tiny round trip with a brief retry and tells us
+        # whether the answer was transient.
+        alive, transient = facade.service.probe_alive()
         caps = facade.service.agent_capabilities()
         out = {
-            "connected": facade.service.is_connected(),
+            "connected": alive,
             "generation": facade.service.generation(),
             "backend": _backend_dict(facade.service),
             "write_enabled": facade._write_enabled,
@@ -87,6 +94,11 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         transport = os.environ.get("TANYAO_TRANSPORT")
         if transport:
             out["transport"] = transport  # "adb-forward" | "direct-tcp" (D12)
+        if transient:
+            # The link needed a retry: usable now, but it was not a moment ago.
+            # Surfaced so a caller can distinguish "healthy" from "recovering"
+            # without having to guess from timing.
+            out["recovering"] = True
         return out
 
     methods = {
