@@ -47,7 +47,7 @@ def _obj(properties: dict, required: list[str] | None = None) -> dict:
 TOOLS = [
     {
         "name": "get_status",
-        "description": "Get backend/connection status: connected, agent generation, backend capabilities, whether memory write is enabled.",
+        "description": "Get backend/connection status: connected, agent generation, backend capabilities, whether memory write is enabled. `connected` is a PROBE (one small round trip with a brief retry), not a socket-state snapshot, so a link that is a moment away from being usable does not read as down; when the retry is what made it succeed the response carries `recovering: true`. Always check `skipped_caps`: if it contains `multi_conn` the agent is in single-connection mode, where every target shares one connection and two pids can end up with the same kernel handle — a wrong-answer failure, not an error.",
         "inputSchema": _obj({}),
     },
     {
