@@ -15,7 +15,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .analysis import AnalysisFacade
+from .analysis import WriteDisabled, AnalysisFacade
 from .connection import AgentError
 from .constants import undeclared_agent_caps
 from .service import AgentUnavailable
@@ -347,6 +347,12 @@ class IpcRequestHandler(BaseHTTPRequestHandler):
                 self._reply(200, {"ok": False, "error": "bad_request", "detail": str(exc)})
             except AgentUnavailable as exc:
                 self._reply(200, {"ok": False, "error": "agent_unavailable", "detail": str(exc)})
+            except WriteDisabled as exc:
+                # A policy refusal, not a fault. Falling through to the generic
+                # handler answered `internal` + HTTP 500, which reads as "the
+                # service is broken" and invites a retry that will never work.
+                self._reply(200, {"ok": False, "error": "write_disabled",
+                                  "detail": str(exc)})
         except Exception as exc:  # noqa: BLE001
             try:
                 self._reply(500, {"ok": False, "error": "internal", "detail": str(exc)})
