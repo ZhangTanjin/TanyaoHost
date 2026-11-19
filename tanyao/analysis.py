@@ -2474,6 +2474,102 @@ class AnalysisFacade:
             "source": "live_memory",
         }
 
+    def disassemble_range(self, pid: int, start: int, end: int, *,
+                          module: str | None = None,
+                          filter: dict | None = None,
+                          known_ranges: list[tuple[int, int]] | None = None,
+                          engine: str = "auto") -> dict:
+        """Disassemble a whole vaddr range in one call, with optional filtering.
+
+        Field report #13: scanning 11 functions totalling 121,440 B (or a whole
+        29 MB library) one `disassemble` call at a time was impossible, so the
+        caller wrote their own A64 decoder. This is the supported replacement.
+
+        filter keys:
+          mnemonic   only instructions whose mnemonic matches (case-insensitive)
+          imm        only instructions whose text contains this immediate value
+
+        ADRP instructions get their page-relative target resolved to an absolute
+        address, annotated with whether it falls inside `known_ranges`.
+
+        Every instruction carries file_offset, so the caller can map back to the
+        on-disk file without redoing address arithmetic.
+        """
+        if end <= start:
+            raise AgentError("bad_request", detail=f"end 0x{end:x} <= start 0x{start:x}")
+        maps = self.service.target_maps(pid)
+        name, entries = self._resolve_module_maps(maps, module, start)
+        if not entries:
+            raise AgentError("not_found", detail=f"address 0x{start:x} not in any module")
+        region = next((e for e in entries if e.start <= start < e.end), None)
+        if region is None:
+            raise AgentError("bad_request",
+                             detail=f"start 0x{start:x} not inside a mapped segment of {name!r}; "
+                                    f"if this is an ELF vaddr, resolve_vaddr first")
+
+        # Read the whole range once. A range can cross a mapping boundary, so
+        # clamp to what is actually mapped rather than failing halfway.
+        read_end = min(end, region.end)
+        read_fn = self._read_for(pid)
+        data = read_fn(start, read_end - start)
+        decoded = disassemble_a64_ex(data, start, max_instructions=(read_end - start) // 4,
+                                     engine=engine)
+
+        instructions = decoded["instructions"]
+        total = len(instructions)
+        if filter:
+            mnem = filter.get("mnemonic")
+            imm = filter.get("imm")
+            out = []
+            for ins in instructions:
+                text = ins.get("text", "")
+                if mnem and mnem.lower() not in text.lower():
+                    continue
+                if imm is not None:
+                    # Match the immediate as a hex or decimal value in the text.
+                    imm_hex = f"0x{imm:x}"
+                    if imm_hex not in text.lower() and str(imm) not in text:
+                        continue
+                out.append(ins)
+            instructions = out
+
+        # Resolve ADRP targets and annotate known-range membership.
+        if known_ranges is None:
+            known_ranges = [(e.start, e.end) for e in entries]
+        for ins in instructions:
+            text = ins.get("text", "")
+            if "adrp" in text.lower():
+                # ADRP computes PC-page + imm*0x1000. Extract the immediate from
+                # the disassembly text: capstone formats it as "#0x...".
+                addr = int(ins["addr"], 16)
+                import re as _re
+                m = _re.search(r"#0x([0-9a-f]+)", text.lower())
+                if m:
+                    # Capstone already prints the ABSOLUTE target for ADRP
+                    # (e.g. "#0x201000"), not the page count. Do not multiply
+                    # by 0x1000 again.
+                    resolved = int(m.group(1), 16)
+                    ins["resolved_address"] = f"0x{resolved:x}"
+                    ins["in_known_range"] = any(lo <= resolved < hi for lo, hi in known_ranges)
+
+        # Stamp file_offset on every instruction so the caller never has to
+        # redo runtime-to-file arithmetic.
+        for ins in instructions:
+            a = int(ins["addr"], 16)
+            ins["file_offset"] = f"0x{a - region.start + region.file_offset:x}"
+
+        return {
+            "pid": pid,
+            "module": name,
+            "start": f"0x{start:x}",
+            "end": f"0x{read_end:x}",
+            "engine": decoded["engine"],
+            "scanned": total,
+            "count": len(instructions),
+            "instructions": instructions,
+            "source": "live_memory",
+        }
+
     def strings(self, pid: int, *, module: str | None = None, address: int | None = None,
                 size: int | None = None, min_length: int = 4, limit: int = 200,
                 filter: str | None = None, async_run: bool = False) -> dict:

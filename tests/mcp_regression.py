@@ -120,7 +120,7 @@ def main() -> int:
             "scan_cancel", "symbol_list", "symbol_find",
             "scan_set_default_ranges", "scan_value",
             "scan_hex", "scan_next", "scan_results", "scan_clear", "dump_module", "watch",
-            "disassemble", "strings", "pull_apk", "apk_info",
+            "disassemble", "disassemble_range", "strings", "pull_apk", "apk_info",
             "decompile_start", "decompile_status",
             "watch_many", "pointers_to", "resolve_rva", "call_export",
             "resolve_vaddr",

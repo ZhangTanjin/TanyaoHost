@@ -264,6 +264,14 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             need_pid(p), str(p["name"]),
             module=str(p["module"]) if p.get("module") else None,
         ),
+        "disassemble_range": lambda p: facade.disassemble_range(
+            need_pid(p),
+            parse_addr(p, "start"),
+            parse_addr(p, "end"),
+            module=p.get("module"),
+            filter=p.get("filter"),
+            known_ranges=p.get("known_ranges"),
+        ),
         "disassemble": lambda p: facade.disassemble(
             need_pid(p),
             parse_addr(p),

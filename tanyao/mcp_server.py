@@ -417,6 +417,21 @@ TOOLS = [
         ),
     },
     {
+        "name": "disassemble_range",
+        "description": "Disassemble a whole vaddr range in one call, with optional filtering (mnemonic, immediate) and ADRP target resolution. Use this instead of N disassemble calls when scanning multiple functions or a whole library. Every instruction carries file_offset. filter keys: mnemonic (case-insensitive substring), imm (immediate value). ADRP results are resolved to absolute addresses and annotated with in_known_range.",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "start": {"type": "string", "description": "start address (0x hex)"},
+                "end": {"type": "string", "description": "end address (0x hex)"},
+                "module": {"type": "string"},
+                "filter": {"type": "object", "properties": {"mnemonic": {"type": "string"}, "imm": {"type": "integer"}}},
+                "known_ranges": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
+            },
+            ["pid", "start", "end"],
+        ),
+    },
+    {
         "name": "disassemble",
         "description": "Disassemble live A64 instructions at an address. Engine: capstone (full ISA, default when installed) or built-in subset fallback. The self-reported 'rva' is the AUTHORITATIVE runtime↔file-offset reference (mapping-table method; address == bearing_segment.translation_base + rva) — prefer it over resolve_module.load_bias arithmetic, which can be null/ambiguous on mirror or multi-bias modules. Use dump_module + decompile_start (IDA) for full-fidelity analysis.",
         "inputSchema": _obj(
