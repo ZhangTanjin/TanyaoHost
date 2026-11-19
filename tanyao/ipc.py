@@ -203,9 +203,12 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             epsilon=float(p.get("epsilon", 0.0)),
             alignment=int(p["alignment"]) if p.get("alignment") else None,
             async_run=bool(p.get("async", False)),
+            allow_large=bool(p.get("allow_large", False)),
         ),
         "scan_hex": lambda p: facade.scan_hex(
-            need_pid(p), str(p["pattern"]), async_run=bool(p.get("async", False))
+            need_pid(p), str(p["pattern"]),
+            async_run=bool(p.get("async", False)),
+            allow_large=bool(p.get("allow_large", False)),
         ),
         "scan_start": lambda p: facade.scan_start(
             need_pid(p),

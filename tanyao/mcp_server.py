@@ -228,7 +228,7 @@ TOOLS = [
     },
     {
         "name": "scan_value",
-        "description": "First scan: find all occurrences of a typed value in the scan ranges.",
+        "description": "First scan: find all occurrences of a typed value in the scan ranges. ALWAYS reports what it scanned: range_source (explicit/preset/inherited/default), scan_bytes, scan_segments, effective_ranges. `inherited` means this call did not choose the scope — it merely failed to change one set earlier, which is the shape of a real incident where a stale all_readable preset made a scan read 5.88 GB and killed the target. A scope above 256 MB is refused unless allow_large=true.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},
@@ -236,14 +236,22 @@ TOOLS = [
                 "value": {"type": "number"},
                 "epsilon": {"type": "number", "description": "float tolerance"},
                 "alignment": {"type": "integer"},
+                "allow_large": {"type": "boolean", "description": "proceed even when the scope exceeds the 256 MB confirmation limit (default false)"},
             },
             ["pid", "type", "value"],
         ),
     },
     {
         "name": "scan_hex",
-        "description": "First scan: AOB pattern like '7F 45 4C 46 ??'.",
-        "inputSchema": _obj({"pid": {"type": "integer"}, "pattern": {"type": "string"}}, ["pid", "pattern"]),
+        "description": "First scan: AOB pattern like '7F 45 4C 46 ??'. ALWAYS reports what it scanned: range_source (explicit/preset/inherited/default), scan_bytes, scan_segments, effective_ranges. `inherited` means this call did not choose the scope — it merely failed to change one set earlier, which is the shape of a real incident where a stale all_readable preset made a scan read 5.88 GB and killed the target. A scope above 256 MB is refused unless allow_large=true.",
+        "inputSchema": _obj(
+            {
+                "pid": {"type": "integer"},
+                "pattern": {"type": "string"},
+                "allow_large": {"type": "boolean", "description": "proceed even when the scope exceeds the 256 MB confirmation limit (default false)"},
+            },
+            ["pid", "pattern"],
+        ),
     },
     {
         "name": "scan_next",

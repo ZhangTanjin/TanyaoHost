@@ -46,6 +46,19 @@ from .addr import AddressModel, AddressModelError
 # request does not block a caller for minutes. Named once: it used to be spelled
 # out as a literal at four sites in the scan paths.
 INLINE_LIMIT = 64 * 1024 * 1024
+
+# Above this, a scan must be confirmed explicitly.
+#
+# The number is not about performance — it is about blast radius. A field report
+# describes a preset left at `all_readable` (11.7 GB) being silently reused by a
+# later `scan_hex`: the scan read 5.88 GB and the target process died. Nothing in
+# the response had said what was about to be read.
+#
+# Deliberately ABOVE INLINE_LIMIT: crossing INLINE_LIMIT only forces a scan to
+# run as a background job, which is a scheduling decision and still automatic.
+# Crossing this one means "this will touch gigabytes of someone else's memory",
+# which deserves a human saying yes.
+SCAN_CONFIRM_LIMIT = 256 * 1024 * 1024
 from .mapsview import MAP_ANONYMOUS, MAP_READ, MapsView
 from .jobs import JobManager, ScanCancelled
 from .native import ApkParseError, disassemble_a64_ex, extract_strings, parse_apk_manifest
@@ -123,6 +136,9 @@ class AnalysisFacade:
         # cmd 50 passthrough, per-pid device-job metadata, and a map of host
         # job ids to device job ids so scan_cancel reaches the agent.
         self._scan_presets: dict[int, str] = {}
+        # Which presets were set for the scan about to run, vs left over from an
+        # earlier one. See _scan_scope: the difference is the accident shape.
+        self._preset_fresh: dict[int, bool] = {}
         self._agent_scan_meta: dict[int, dict] = {}
         self._agent_job_map: dict[str, int] = {}
         # user-set explicit ranges (scan_set_range); carried onto cmd 50
@@ -688,6 +704,57 @@ class AnalysisFacade:
             return "host"
         return "agent"
 
+    def _scan_scope(self, pid: int, *, allow_large: bool = False) -> dict:
+        """Describe the scope the NEXT scan will use, and gate the dangerous sizes.
+
+        This exists because of a real accident: a preset left at `all_readable`
+        (11.7 GB) was silently reused by a later scan, which read 5.88 GB and
+        killed the target. The caller had no way to see what was coming.
+
+        Returns the fields every scan response now carries:
+
+          range_source      "explicit" | "preset" | "inherited" | "default"
+          scan_bytes        total bytes about to be read
+          scan_segments     how many ranges that is
+          effective_ranges  the actual [start, end] pairs
+
+        `inherited` is the accident shape and is called out separately: it means
+        this call did not choose the scope, it merely failed to change it.
+        """
+        engine = self._scan_for(pid)
+        ranges = list(engine.state.ranges)
+        total = sum(e - s for s, e in ranges)
+
+        if self._explicit_ranges.get(pid):
+            source = "explicit"
+        elif pid in self._scan_presets:
+            # Fresh means the caller set it for this scan; stale means it is a
+            # leftover. Reporting them the same would hide exactly the case that
+            # caused the incident.
+            source = "preset" if self._preset_fresh.pop(pid, False) else "inherited"
+        else:
+            source = "default"
+
+        if total > SCAN_CONFIRM_LIMIT and not allow_large:
+            raise AgentError(
+                "bad_request",
+                detail=(f"this scan would read {total:,} bytes across "
+                        f"{len(ranges)} range(s) (source: {source}), above the "
+                        f"{SCAN_CONFIRM_LIMIT:,}-byte confirmation limit. Pass "
+                        f"allow_large=true to proceed, or narrow the scope with "
+                        f"scan_set_default_ranges first."),
+            )
+
+        out = {
+            "range_source": source,
+            "scan_bytes": total,
+            "scan_segments": len(ranges),
+            "effective_ranges": [[f"0x{s:x}", f"0x{e:x}"] for s, e in ranges],
+        }
+        if total > SCAN_CONFIRM_LIMIT:
+            out["large_scope"] = True
+        return out
+
     def _run_agent_scan(self, pid: int, kind: str, *, dev_job: int, meta: dict,
                         async_run: bool, limit: int) -> dict:
         """Run a device-side scan job to completion, or hand it to the job manager.
@@ -884,6 +951,7 @@ class AnalysisFacade:
         engine = self._scan_for(pid)
         engine.set_ranges(pid, ranges)
         self._scan_presets[pid] = preset
+        self._preset_fresh[pid] = True
         self._explicit_ranges.pop(pid, None)  # preset supersedes explicit ranges
         total = sum(e - s for s, e in engine.state.ranges)
         # F6: transparent preset summary (segments / total bytes / classes)
@@ -901,6 +969,8 @@ class AnalysisFacade:
         # D1: explicit ranges must survive the engine dispatch — carried onto
         # cmd 50 `ranges` under bit9, host engine otherwise
         self._explicit_ranges[pid] = [(start, end)]
+        self._scan_presets.pop(pid, None)
+        self._preset_fresh.pop(pid, None)
         return {"pid": pid, "ranges": 1, "span": end - start}
 
     def scan_value(
@@ -912,39 +982,54 @@ class AnalysisFacade:
         epsilon: float = 0.0,
         alignment: int | None = None,
         async_run: bool = False,
+        allow_large: bool = False,
     ) -> dict:
         """First scan. With async_run=True (or estimated bytes > threshold) this runs
-        as a background job: returns {'job_id','state':'running'} — poll scan_status."""
+        as a background job: returns {'job_id','state':'running'} — poll scan_status.
+
+        Every response states what was scanned and where that scope came from;
+        see `_scan_scope`. A scope above SCAN_CONFIRM_LIMIT is refused unless
+        `allow_large` is set.
+        """
+        scope = self._scan_scope(pid, allow_large=allow_large)
         if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(
                 pid, kind="value", vtype=vtype, value=value,
                 epsilon=epsilon, alignment=alignment or 0,
                 ranges=self._explicit_ranges_payload(pid),
             )
-            return self._run_agent_scan(pid, "value", dev_job=dev_job, meta=meta,
-                                        async_run=async_run, limit=32)
+            return scope | self._run_agent_scan(pid, "value", dev_job=dev_job,
+                                                meta=meta, async_run=async_run,
+                                                limit=32)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
         if async_run or est > INLINE_LIMIT:
-            return self._start_scan_job(pid, "value", vtype, value, epsilon=epsilon, alignment=alignment)
+            return scope | self._start_scan_job(pid, "value", vtype, value,
+                                                epsilon=epsilon, alignment=alignment)
         found = engine.scan_value(pid, vtype, value, epsilon=epsilon, alignment=alignment)
-        return engine.summary() | {"found": found, "results": engine.results(limit=32), "async": False,
-                                   "engine": "host-scan"}
+        return scope | engine.summary() | {"found": found,
+                                           "results": engine.results(limit=32),
+                                           "async": False, "engine": "host-scan"}
 
-    def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False) -> dict:
+    def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False,
+                 allow_large: bool = False) -> dict:
+        scope = self._scan_scope(pid, allow_large=allow_large)
         if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern,
                                                    ranges=self._explicit_ranges_payload(pid))
-            return self._run_agent_scan(pid, "hex", dev_job=dev_job, meta=meta,
-                                        async_run=async_run, limit=256)
+            return scope | self._run_agent_scan(pid, "hex", dev_job=dev_job,
+                                                meta=meta, async_run=async_run,
+                                                limit=256)
         pattern_bytes, mask_bytes = _parse_aob(pattern)
         engine = self._scan_for(pid)
         est = sum(e - s for s, e in engine.state.ranges)
         if async_run or est > INLINE_LIMIT:
-            return self._start_scan_job(pid, "hex", bytes(pattern_bytes), bytes(mask_bytes))
+            return scope | self._start_scan_job(pid, "hex", bytes(pattern_bytes),
+                                                bytes(mask_bytes))
         found = engine.scan_hex(pid, bytes(pattern_bytes), bytes(mask_bytes))
-        return engine.summary() | {"found": found, "results": engine.results(), "async": False,
-                                   "engine": "host-scan"}
+        return scope | engine.summary() | {"found": found,
+                                           "results": engine.results(),
+                                           "async": False, "engine": "host-scan"}
 
     def scan_start(self, pid: int, kind: str, *, type: str | None = None, value=None,
                    pattern: str | None = None, epsilon: float = 0.0,
