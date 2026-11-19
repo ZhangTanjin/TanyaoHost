@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -374,8 +375,28 @@ class IpcRequestHandler(BaseHTTPRequestHandler):
                 self._reply(200, {"ok": False, "error": "write_disabled",
                                   "detail": str(exc)})
         except Exception as exc:  # noqa: BLE001
+            # An unexpected exception is a bug in this host, not an answer for
+            # the caller — but leaking the raw message gives them nothing to act
+            # on. "'NoneType' object has no attribute 'handle'" says where the
+            # host fell over, not what the caller should do; the natural reading
+            # is "try again", and a retry will fail identically. Name the
+            # exception type, include the location, and say it is a host bug.
+            import traceback
+            tb = traceback.extract_tb(exc.__traceback__)
+            where = f"{tb[-1].filename.rsplit('/', 1)[-1]}:{tb[-1].lineno}" if tb else "?"
             try:
-                self._reply(500, {"ok": False, "error": "internal", "detail": str(exc)})
+                self._reply(500, {
+                    "ok": False,
+                    "error": "internal",
+                    "exception": type(exc).__name__,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "at": where,
+                    "hint": ("this is a HOST bug, not something your request did "
+                             "wrong — retrying will fail the same way. Report the "
+                             "'at' location with the method name you called."),
+                })
+                print(f"[tanyao.serve] internal error in {method}: {where}: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
             except Exception:
                 pass
 

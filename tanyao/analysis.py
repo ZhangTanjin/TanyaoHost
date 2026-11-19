@@ -372,20 +372,63 @@ class AnalysisFacade:
         }
         # Attach each mapping's ELF vaddr window.
         #
-        # Match by file_offset, not by index: a mirror or multi-anchor module has
-        # more mappings than PT_LOADs, and positional pairing would then assign
-        # every window one slot off. The file offset is what actually identifies
-        # which LOAD a mapping was made from.
+        # Two facts make this subtle, and getting either wrong produces windows
+        # that look plausible while being shifted by a page:
+        #
+        #   1. A mapping's file_offset is PAGE-ALIGNED, but p_offset need not be.
+        #      When p_offset is not aligned, the mapping starts a few bytes
+        #      BEFORE the segment's vaddr, so the mapping's first byte corresponds
+        #      to `p_vaddr - (p_offset - map.file_offset)`, not to p_vaddr.
+        #   2. Match on the page-aligned p_offset, not raw p_offset. Using the
+        #      raw value fails to match at all and silently drops the window.
+        #
+        # A wrong window is worse than a missing one: the caller computes a
+        # runtime address that is off by a page and everything downstream follows.
         _loads = sorted(model.elf.loads, key=lambda l: l.offset)
-        for i, seg_out in enumerate(out["segments"]):
+        for seg_out in out["segments"]:
             seg_off = int(seg_out["file_offset"], 16)
-            match = next((l for l in _loads
-                          if l.offset <= seg_off < l.offset + max(l.filesz, 1)), None)
-            if match is None and i < len(_loads):
-                match = _loads[i]          # last resort: positional
-            if match is not None:
-                seg_out["vaddr_start"] = f"0x{match.vaddr:x}"
-                seg_out["vaddr_end"] = f"0x{match.vaddr + match.memsz:x}"
+            seg_len = int(seg_out["end"], 16) - int(seg_out["start"], 16)
+            file_end = seg_off + seg_len
+
+            # A single mapping can span TWO PT_LOADs: the loader aligns the start
+            # down to a page, so the tail of one segment and the head of the next
+            # share a page and therefore a mapping. libc++.so is the textbook
+            # case — its p_offsets are not page-aligned at all, so every mapping
+            # after the first straddles a boundary.
+            #
+            # So the window is the union of the overlap with EACH LOAD, not the
+            # range of whichever LOAD matched first.
+            lo_v, hi_v = None, None
+            spanned = []
+            for load in _loads:
+                ov_lo = max(load.offset, seg_off)
+                ov_hi = min(load.offset + load.filesz, file_end)
+                if ov_hi <= ov_lo:
+                    continue
+                v_lo = load.vaddr + (ov_lo - load.offset)
+                v_hi = load.vaddr + (ov_hi - load.offset)
+                lo_v = v_lo if lo_v is None else min(lo_v, v_lo)
+                hi_v = v_hi if hi_v is None else max(hi_v, v_hi)
+                spanned.append(load.vaddr)
+            if lo_v is None:
+                # This mapping's file range lies outside every PT_LOAD of the
+                # ELF header we read. That is not an arithmetic failure: it
+                # means the loaded image is not the file we think it is (an
+                # upgraded library still mapped at its old offsets, or a module
+                # whose on-disk copy was replaced after load).
+                seg_out["vaddr_start"] = None
+                seg_out["vaddr_end"] = None
+                seg_out["vaddr_unmapped_reason"] = (
+                    f"file range [0x{seg_off:x}, 0x{file_end:x}) matches no PT_LOAD "
+                    f"of the ELF header at 0x{first.start:x}; the mapped image "
+                    f"differs from the file on disk")
+                continue
+            seg_out["vaddr_start"] = f"0x{lo_v:x}"
+            seg_out["vaddr_end"] = f"0x{hi_v:x}"
+            if len(spanned) > 1:
+                # Say so explicitly: a caller assuming one LOAD per mapping would
+                # otherwise mis-attribute the boundary bytes.
+                seg_out["spans_loads"] = len(spanned)
 
         # A single call that answers "where does this vaddr live" for callers who
         # would otherwise reach for load_bias + vaddr. This is the identity the
@@ -1939,6 +1982,19 @@ class AnalysisFacade:
                 previous[j] = data
             if i + 1 < count:
                 time.sleep(interval_ms / 1000.0)
+        per_span = [
+            {"address": f"0x{addr:x}", "size": size, "samples": samples[j]}
+            for j, (addr, size) in enumerate(parsed)
+        ]
+        # A span that could not be read must say so at the span level too, not
+        # only inside each sample. A caller looping over spans checks the span
+        # first; making them dig into samples to discover every tick failed is
+        # how "it returned data, so it worked" mistakes happen.
+        for entry in per_span:
+            failures = sum(1 for s in entry["samples"] if s.get("error"))
+            if failures:
+                entry["error"] = "read_failed"
+                entry["failed_samples"] = failures
         return {
             "pid": pid,
             "count": count,
@@ -1947,10 +2003,12 @@ class AnalysisFacade:
             "clock": "timestamp_monotonic is time.monotonic(); add started_wall "
                      "to convert to wall-clock, so a system clock jump cannot "
                      "fake a gap between samples",
-            "spans": [
-                {"address": f"0x{addr:x}", "size": size, "samples": samples[j]}
-                for j, (addr, size) in enumerate(parsed)
-            ],
+            # `spans` is the structured form; `samples` mirrors watch(), which
+            # returns a flat `samples` list. Callers written against watch
+            # reasonably expect the same key here and silently get nothing when
+            # it is absent — so provide both rather than making the shape a trap.
+            "spans": per_span,
+            "samples": [entry["samples"] for entry in per_span],
         }
 
     def pointers_to(self, pid: int, addresses, *, module: str | None = None,
