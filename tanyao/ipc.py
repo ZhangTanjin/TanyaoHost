@@ -38,6 +38,7 @@ def _opt_u64(value):
 
 
 def build_method_table(facade: AnalysisFacade) -> dict:
+    IpcRequestHandler.facade = facade
     """method name -> callable(payload dict) -> JSON-serializable dict.
     This table is the ONLY place IPC and MCP surfaces diverge (MCP wraps these)."""
 
@@ -76,10 +77,15 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         # caller acting on that sample wrongly concludes the chain is down.
         # probe_alive does one tiny round trip with a brief retry and tells us
         # whether the answer was transient.
-        alive, transient = facade.service.probe_alive()
+        alive, transient, fail_kind = facade.service.probe_alive()
         caps = facade.service.agent_capabilities()
         out = {
             "connected": alive,
+            # Three-way diagnosis: a false `connected` is not one condition.
+            # serve_down  = this host process cannot reach the agent at all
+            # agent_down  = agent process is not running on the device
+            # stale       = connection exists but the session is stale
+            "state": "connected" if alive else (fail_kind or "unknown"),
             "generation": facade.service.generation(),
             "backend": _backend_dict(facade.service),
             "write_enabled": facade._write_enabled,
@@ -111,6 +117,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
         "get_status": get_status,
         "ping_agent": lambda p: facade.service.ping(),
         "connect": lambda p: {"backend": facade.service.connect().name},
+        "reconnect": lambda p: facade.service.reconnect(),
         "find_process": lambda p: facade.find_process(
             str(p["name"]), mode=str(p.get("mode", "exact"))),
         "list_processes": lambda p: {"pids": facade.service.process_list(int(p.get("bytes", 8192)))},
@@ -135,7 +142,9 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             as_type=p.get("as_type"),
             count=int(p.get("count", 1)),
             pid_cookie=_opt_u64(p.get("pid_cookie")),
-            strip_pac=bool(p.get("strip_pac", False)),
+            # None = let the facade decide (ptr strips by default, others don't).
+            # Passing False unconditionally would defeat that default.
+            strip_pac=p.get("strip_pac"),
         ),
         "write_bytes": lambda p: facade.write_bytes(
             need_pid(p),
@@ -207,11 +216,13 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             alignment=int(p["alignment"]) if p.get("alignment") else None,
             async_run=bool(p.get("async", False)),
             allow_large=bool(p.get("allow_large", False)),
+            ranges=p.get("ranges"),
         ),
         "scan_hex": lambda p: facade.scan_hex(
             need_pid(p), str(p["pattern"]),
             async_run=bool(p.get("async", False)),
             allow_large=bool(p.get("allow_large", False)),
+            ranges=p.get("ranges"),
         ),
         "scan_start": lambda p: facade.scan_start(
             need_pid(p),
@@ -221,6 +232,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             pattern=p.get("pattern"),
             epsilon=float(p.get("epsilon", 0.0)),
             alignment=int(p["alignment"]) if p.get("alignment") else None,
+            ranges=p.get("ranges"),
         ),
         "scan_cancel": lambda p: facade.scan_cancel(
             need_pid(p), str(p["job_id"])
@@ -305,6 +317,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
 
 class IpcRequestHandler(BaseHTTPRequestHandler):
     methods: dict = {}
+    facade = None  # set by build_method_table; scene label is read from it
     server_version = "tanyao-ipc/0.1"
 
     def log_message(self, fmt, *args):  # quiet
@@ -358,6 +371,10 @@ class IpcRequestHandler(BaseHTTPRequestHandler):
                 if isinstance(result, dict):
                     result.setdefault("ts_mono_ns", time.monotonic_ns())
                     result.setdefault("ts_wall_ns", time.time_ns())
+                    # Session scene label, if one was set. Stamped here rather
+                    # than in 38 tools so the convention cannot be forgotten.
+                    if self.facade is not None and getattr(self.facade, "_scene", None) is not None:
+                        result.setdefault("scene", self.facade._scene)
                 self._reply(200, {"ok": True, "result": result})
             except AgentError as exc:
                 body = {"ok": False, "error": exc.error, "errno": exc.errno, "detail": exc.detail}

@@ -164,6 +164,19 @@ class TanyaoService:
 
     # -- connection management -------------------------------------------------
 
+    def reconnect(self) -> dict:
+        """Drop the current connection and establish a fresh one.
+
+        Needed because a stale connection can look alive at the socket level
+        while every request on it fails with a stale session. Callers previously
+        had to restart the whole host process to escape that state.
+        """
+        with self._lock:
+            self._drop_connection()
+        info = self.connect()
+        return {"backend": info.name, "abi": f"{info.abi_major}.{info.abi_minor}",
+                "capabilities": f"0x{info.capabilities:x}"}
+
     def connect(self) -> BackendInfo:
         with self._lock:
             if self._conn is not None and self._conn.is_connected:
@@ -307,6 +320,7 @@ class TanyaoService:
         every status read, which is why it is a separate method.
         """
         first_failed = False
+        last_error: str | None = None
         for i in range(max(1, attempts)):
             with self._lock:
                 conn = self._conn
@@ -316,14 +330,16 @@ class TanyaoService:
                     # Transient = the FIRST probe failed but this one succeeded.
                     # A caller reading recovering=true knows the link was
                     # mid-establishment, not that it is still broken.
-                    return True, first_failed
-                except (ConnectionError, TimeoutError, OSError, ProtocolError):
-                    pass
+                    return True, first_failed, None
+                except (ConnectionError, TimeoutError, OSError, ProtocolError) as exc:
+                    last_error = type(exc).__name__
+            else:
+                last_error = "no_connection"
             if i + 1 < attempts:
                 first_failed = True
                 time.sleep(delay)
         # Every probe failed: the link is genuinely down.
-        return False, False
+        return False, False, last_error
 
     def generation(self) -> int | None:
         with self._lock:

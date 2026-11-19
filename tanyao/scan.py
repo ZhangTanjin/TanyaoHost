@@ -26,6 +26,11 @@ TYPES: dict[str, tuple[str, int, str]] = {
     "i64": ("<q", 8, "int"),
     "f32": ("<f", 4, "float"),
     "f64": ("<d", 8, "float"),
+    # `ptr` is an 8-byte pointer read. It is identical to u64 in bytes, but the
+    # semantic difference matters: a pointer may carry a PAC tag in its top bits,
+    # and dereferencing it without stripping fails with EFAULT. `ptr` therefore
+    # strips by default; u64 stays raw because the tag itself is often the data.
+    "ptr": ("<Q", 8, "int"),
 }
 
 MAX_HITS = 200_000

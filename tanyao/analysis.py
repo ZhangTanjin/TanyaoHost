@@ -129,6 +129,11 @@ class AnalysisFacade:
         # with TANYAO_ALLOW_CALL=1 for the call_export tool to exist
         self._call_enabled = os.environ.get("TANYAO_ALLOW_CALL") == "1"
         self._call_allowlist: set[tuple[str, str]] | None = None
+        # Session-level scene label, stamped onto every read/scan response.
+        # The project convention requires every runtime point-read to carry the
+        # scene (lobby/loading/training/ranked/settlement) so exported evidence
+        # is auditable without manual bookkeeping.
+        self._scene: str | None = None
         allowlist_path = os.environ.get("TANYAO_CALL_ALLOWLIST")
         if allowlist_path:
             self._call_allowlist = self._load_call_allowlist(allowlist_path)
@@ -561,6 +566,9 @@ class AnalysisFacade:
             # the authoritative runtime↔file-offset reference (R7)
             file_offset = address - seg.start + seg.file_offset
             out["file_offset"] = f"0x{file_offset:x}"
+            # `rva` is a deprecated alias for file_offset, kept for callers that
+            # predate the rename. ELF calls this vaddr; the tool always meant
+            # file offset, and the name caused real confusion in the field.
             out["rva"] = out["file_offset"]
         return out
 
@@ -614,7 +622,7 @@ class AnalysisFacade:
 
     def read_memory(self, pid: int, address: int, size: int, *, as_type: str | None = None,
                     count: int = 1, pid_cookie: int | None = None,
-                    strip_pac: bool = False) -> dict:
+                    strip_pac: bool | None = None) -> dict:
         """Raw/typed read. pid_cookie (from find_process.start_cookie) pins the
         pid: if the process restarted and the pid was recycled, the kernel
         answers -ESTALE instead of silently reading the wrong process.
@@ -630,6 +638,11 @@ class AnalysisFacade:
         untouched bytes, so both views are available in one response.
         """
         if as_type:
+            # ptr defaults to stripping: a tagged pointer dereferences to EFAULT,
+            # and the caller almost always wants the address, not the tag. u64
+            # stays raw because the tag itself is often the information.
+            if strip_pac is None:
+                strip_pac = (as_type == "ptr")
             fmt, width, kind = TYPES[as_type]
             total = width * max(1, count)
             data = self.service.mem_read(pid, address, total, expected_cookie=pid_cookie)
@@ -665,7 +678,11 @@ class AnalysisFacade:
                 stripped, noted = [], []
                 for v in values:
                     low = v & PAC_MASK_DEFAULT
-                    if _looks_like_pointer(v):
+                    # as_type="ptr" is an explicit declaration: strip ALWAYS.
+                    # The heuristic guard exists for raw u64 reads where a magic
+                    # constant could be mistaken for a pointer; a caller who
+                    # asked for ptr has already made that judgement.
+                    if as_type == "ptr" or _looks_like_pointer(v):
                         stripped.append(low)
                         noted.append(True)
                     else:
@@ -857,6 +874,27 @@ class AnalysisFacade:
         return summary | {"found": summary["count"],
                           "results": self._agent_results_page(dev_job, 0, limit),
                           "async": False}
+
+    def _set_explicit_ranges(self, pid: int, ranges: list[dict]) -> None:
+        """Install caller-supplied ranges for the next scan.
+
+        Each range is {"start": "0x...", "end": "0x..."}. Setting explicit ranges
+        supersedes any preset; the scan response will say range_source=explicit.
+        """
+        parsed = []
+        for r in ranges:
+            start = int(r["start"], 16) if isinstance(r["start"], str) else int(r["start"])
+            end = int(r["end"], 16) if isinstance(r["end"], str) else int(r["end"])
+            if end <= start:
+                raise AgentError("bad_request", detail=f"range end <= start: {r!r}")
+            parsed.append((start, end))
+        if not parsed:
+            raise AgentError("bad_request", detail="ranges must not be empty")
+        self._explicit_ranges[pid] = parsed
+        self._scan_presets.pop(pid, None)
+        self._preset_fresh.pop(pid, None)
+        engine = self._scan_for(pid)
+        engine.set_ranges(pid, parsed)
 
     def _explicit_ranges_payload(self, pid: int) -> list[dict] | None:
         ranges = self._explicit_ranges.get(pid)
@@ -1067,6 +1105,7 @@ class AnalysisFacade:
         alignment: int | None = None,
         async_run: bool = False,
         allow_large: bool = False,
+        ranges: list[dict] | None = None,
     ) -> dict:
         """First scan. With async_run=True (or estimated bytes > threshold) this runs
         as a background job: returns {'job_id','state':'running'} — poll scan_status.
@@ -1075,6 +1114,8 @@ class AnalysisFacade:
         see `_scan_scope`. A scope above SCAN_CONFIRM_LIMIT is refused unless
         `allow_large` is set.
         """
+        if ranges is not None:
+            self._set_explicit_ranges(pid, ranges)
         scope = self._scan_scope(pid, allow_large=allow_large)
         if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(
@@ -1096,7 +1137,9 @@ class AnalysisFacade:
                                            "async": False, "engine": "host-scan"}
 
     def scan_hex(self, pid: int, pattern: str, *, async_run: bool = False,
-                 allow_large: bool = False) -> dict:
+                 allow_large: bool = False, ranges: list[dict] | None = None) -> dict:
+        if ranges is not None:
+            self._set_explicit_ranges(pid, ranges)
         scope = self._scan_scope(pid, allow_large=allow_large)
         if self._scan_route(pid) == "agent":
             dev_job, meta = self._agent_scan_start(pid, kind="hex", pattern=pattern,
@@ -1117,7 +1160,9 @@ class AnalysisFacade:
 
     def scan_start(self, pid: int, kind: str, *, type: str | None = None, value=None,
                    pattern: str | None = None, epsilon: float = 0.0,
-                   alignment: int | None = None) -> dict:
+                   alignment: int | None = None, ranges: list[dict] | None = None) -> dict:
+        if ranges is not None:
+            self._set_explicit_ranges(pid, ranges)
         """Public async-scan entry (MCP scan_start). Validates kind/params then
         hands off to the background job runner."""
         if kind == "value":
@@ -1227,17 +1272,44 @@ class AnalysisFacade:
             st = self.service.agent_scan_status(meta["dev_job"])
             summary = self._agent_summary(pid, st, meta)
             results = self._agent_results_page(meta["dev_job"], offset, limit)
-            out = summary | {"results": results}
-            if offset + len(results) < int(summary.get("count", 0)):
+            total = int(summary.get("count", 0))
+            out = summary | {
+                "results": results,
+                "total_hits": total,
+                "returned": len(results),
+                "offset": offset,
+            }
+            if offset + len(results) < total:
                 out["next_offset"] = offset + len(results)
             return out
         engine = self._scans.get(pid)
         if engine is None:
             raise AgentError("bad_request", detail="no scan for this pid")
         results = engine.results(offset, limit)
-        out = engine.summary() | {"results": results, "engine": "host-scan"}
+        out = engine.summary() | {
+            "results": results,
+            "engine": "host-scan",
+            "total_hits": engine.state.count,
+            "returned": len(results),
+            "offset": offset,
+        }
         if offset + len(results) < engine.state.count:
             out["next_offset"] = offset + len(results)
+        return out
+
+    def set_scene(self, scene: str) -> dict:
+        """Tag this session with the current scene (e.g. "lobby", "ranked").
+
+        Every subsequent read/scan response carries `scene` so evidence can be
+        attributed without the caller maintaining a parallel log. Pass an empty
+        string to clear.
+        """
+        self._scene = scene or None
+        return {"scene": self._scene}
+
+    def _stamp_scene(self, out: dict) -> dict:
+        if self._scene is not None:
+            out["scene"] = self._scene
         return out
 
     def scan_clear(self, pid: int) -> dict:
@@ -2185,14 +2257,28 @@ class AnalysisFacade:
             if not isinstance(addr, int) or addr < 0 or size <= 0:
                 raise AgentError("bad_request", detail=f"bad span {span!r}")
             parsed.append((addr, size))
+        # mem_readv is ONE device round trip, but the kernel reads each span
+        # independently: there is no snapshot isolation across spans. Two spans
+        # can observe different generations of a value being written, and the
+        # response must not pretend otherwise. The `atomic` field says so; the
+        # per-span timestamp is the host's receive time, not the device read time
+        # (the device does not report per-span timing).
         results = self.service.mem_readv(pid, parsed)
+        ts = time.monotonic_ns()
         entries = []
         for (addr, size), data in zip(parsed, results):
+            entry = {"address": f"0x{addr:x}", "size": size, "ts_mono_ns": ts}
             if data is None:
-                entries.append({"address": f"0x{addr:x}", "size": size, "error": "read_failed"})
+                entry["error"] = "read_failed"
             else:
-                entries.append({"address": f"0x{addr:x}", "size": len(data), "data_hex": data.hex()})
-        return {"pid": pid, "count": len(entries), "spans": entries}
+                entry["data_hex"] = data.hex()
+            entries.append(entry)
+        return {"pid": pid, "count": len(entries), "spans": entries,
+                "atomic": False,
+                "atomicity_note": ("spans are read independently by the kernel; "
+                                   "no cross-span snapshot is guaranteed. The "
+                                   "timestamp is host receive time, not per-span "
+                                   "device read time.")}
 
     # -- symbols ---------------------------------------------------------------------------
 
@@ -2354,7 +2440,8 @@ class AnalysisFacade:
                 instructions = [
                     {
                         "addr": ins["address"],
-                        "rva": int(str(ins["address"]), 16) - region.start + region.file_offset,
+                        "file_offset": f"0x{int(str(ins['address']), 16) - region.start + region.file_offset:x}",
+                        "rva": f"0x{int(str(ins['address']), 16) - region.start + region.file_offset:x}",
                         "bytes": ins["bytes_hex"],
                         "text": f"{ins['mnemonic']} {ins['op_str']}".strip(),
                     }
@@ -2364,6 +2451,7 @@ class AnalysisFacade:
                     "pid": pid,
                     "module": name,
                     "address": f"0x{address:x}",
+                    "file_offset": f"0x{rva:x}",
                     "rva": f"0x{rva:x}",
                     "engine": "agent-capstone",
                     "count": len(instructions),
@@ -2378,6 +2466,7 @@ class AnalysisFacade:
             "pid": pid,
             "module": name,
             "address": f"0x{address:x}",
+            "file_offset": f"0x{rva:x}",
             "rva": f"0x{rva:x}",
             "engine": decoded["engine"],
             "count": len(decoded["instructions"]),
