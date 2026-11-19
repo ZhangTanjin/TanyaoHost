@@ -486,7 +486,7 @@ TOOLS = [
     },
     {
         "name": "decompile_start",
-        "description": "Dump a module and decompile it with IDA Pro (idalib + Hex-Rays): dumps the live image, loads it in-process and emits one .c per function plus index.json. Long-running: returns job_id; poll decompile_status. Modules >64MB get an entropy pre-flight — mostly-encrypted images are rejected unless force=true. Requires IDA Pro with idalib (TANYAO_IDA_DIR, default /home/ufo/ida-pro-9.4); if absent the call returns a structured 'unavailable', so still usable targets are never blocked by a missing decompiler.",
+        "description": "Dump a module and decompile it with IDA Pro (idalib + Hex-Rays): dumps the live image, loads it in-process and emits one .c per function plus index.json. Long-running: returns job_id; poll decompile_status. Modules >64MB get an entropy pre-flight — mostly-encrypted images are rejected unless force=true. Requires IDA Pro with idalib — auto-discovered as the highest ida-pro-* under $HOME, /opt or /usr/local (override with TANYAO_IDA_DIR); if absent the call returns a structured 'unavailable', so still usable targets are never blocked by a missing decompiler.",
         "inputSchema": _obj(
             {
                 "pid": {"type": "integer"},

@@ -29,3 +29,6 @@ node_modules/
 # Local state
 *.log
 .cache/
+
+# Generated from ida_backend._WORKER at first use; tracking it invites drift.
+tanyao/_ida_worker.py

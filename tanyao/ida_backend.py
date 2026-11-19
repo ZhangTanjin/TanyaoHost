@@ -19,7 +19,9 @@ consumers keep working):
     index.json              {module, functions:[{name,address,file}], ...}
 
 Environment:
-    TANYAO_IDA_DIR   IDA Pro installation root (default /home/ufo/ida-pro-9.4)
+    TANYAO_IDA_DIR   IDA Pro installation root (default: highest ida-pro-* found
+                     under $HOME, /opt, /usr/local — so an in-place upgrade is
+                     picked up without editing config)
     TANYAO_IDA_PY    idalib python dir   (default <IDA_DIR>/idalib/python)
 
 If IDA is absent the caller gets a structured `unavailable` error, exactly like
@@ -39,11 +41,49 @@ from typing import Callable
 
 # --- environment discovery ---------------------------------------------------
 
-DEFAULT_IDA_DIR = "/home/ufo/ida-pro-9.4"
+# IDA ships as `ida-pro-<version>` directories. Hardcoding one version breaks
+# silently on upgrade: the host keeps loading the old tree while the operator
+# believes they are running the new one. Discover the highest version instead,
+# and let TANYAO_IDA_DIR override when a specific tree must be pinned.
+_IDA_DIR_PARENTS = (
+    os.path.expanduser("~"),
+    "/opt",
+    "/usr/local",
+)
+_IDA_DIR_RE = re.compile(r"^ida-pro-(\d+(?:\.\d+)*)$")
+
+
+def _version_key(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split(".") if part.isdigit())
+
+
+def discover_ida_root() -> str | None:
+    """Highest-versioned ida-pro-* install, or None when none is found."""
+    best: tuple[tuple[int, ...], str] | None = None
+    for parent in _IDA_DIR_PARENTS:
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            continue
+        for name in entries:
+            m = _IDA_DIR_RE.match(name)
+            if not m:
+                continue
+            path = os.path.join(parent, name)
+            if not os.path.isdir(path):
+                continue
+            key = _version_key(m.group(1))
+            if best is None or key > best[0]:
+                best = (key, path)
+    return best[1] if best else None
 
 
 def ida_root() -> str:
-    return os.environ.get("TANYAO_IDA_DIR", DEFAULT_IDA_DIR)
+    explicit = os.environ.get("TANYAO_IDA_DIR")
+    if explicit:
+        return explicit
+    found = discover_ida_root()
+    return found if found else "/home/ufo/ida-pro-9.5"
 
 
 def idalib_python_dir() -> str:
@@ -125,6 +165,8 @@ def main():
         return 1
 
     import ida_auto, ida_funcs, ida_hexrays, ida_name, ida_nalt, ida_bytes
+    import idaapi
+    from idaapi import BADADDR
 
     # Write a helper so a function body can be read as raw bytes when the dump
     # has no segments covering it (common for hybrid dumps).
@@ -142,7 +184,15 @@ def main():
     func_entries = []
     total = ida_funcs.get_func_qty()
     for i in range(total):
-        f = ida_funcs.getn_func(i)
+        # getn_func() is deprecated in IDA 9.5 (warns on every call, and the
+        # deprecation notice names get_func_ea_by_num as the replacement). The
+        # pair below is byte-for-byte equivalent on both 9.4 and 9.5, including
+        # the out-of-range case where getn_func returns None: get_func_ea_by_num
+        # gives BADADDR and get_func(BADADDR) gives None.
+        ea = ida_funcs.get_func_ea_by_num(i)
+        if ea == BADADDR:
+            continue
+        f = ida_funcs.get_func(ea)
         if f is None:
             continue
         func_entries.append((f.start_ea, f.end_ea))
@@ -207,8 +257,13 @@ def main():
         os.replace(tmp, progress_path)
 
     mod = os.path.basename(dump_path)
+    try:
+        ida_version = idaapi.get_kernel_version()
+    except Exception:
+        ida_version = ""
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as fh:
-        json.dump({"module": mod, "engine": "ida", "hexrays": have_hexrays,
+        json.dump({"module": mod, "engine": "ida", "ida_version": ida_version,
+                   "hexrays": have_hexrays,
                    "functions": index, "cancelled": aborted}, fh, indent=2)
     with open(os.path.join(out_dir, mod + ".c"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(combined))
@@ -217,8 +272,12 @@ def main():
         idapro.close_database(False)
     except Exception:
         pass
+    # Record WHICH IDA produced this output. After an in-place upgrade a stale
+    # worker or a pinned TANYAO_IDA_DIR can silently keep using the old engine,
+    # and without this the result looks identical either way.
     print(json.dumps({"ok": True, "functions": len(index),
-                      "hexrays": have_hexrays, "cancelled": aborted}))
+                      "hexrays": have_hexrays, "cancelled": aborted,
+                      "ida_version": ida_version}))
     return 0
 
 if __name__ == "__main__":
@@ -328,8 +387,20 @@ def start_decompile(
             job.error = (err or out or "").strip()[-800:] or f"exit {proc.returncode}"
         else:
             job.state = "done"
+            # The worker's last stdout line is its JSON verdict; carry the IDA
+            # version through so a caller can tell which engine produced this.
+            ida_version = ""
+            for line in reversed((out or "").strip().splitlines()):
+                try:
+                    verdict = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(verdict, dict) and "ida_version" in verdict:
+                    ida_version = str(verdict.get("ida_version") or "")
+                break
             job.result = {
                 "out_dir": out_dir,
+                "ida_version": ida_version,
                 "index": os.path.join(out_dir, "index.json"),
                 "c_file": os.path.join(out_dir, f"{os.path.basename(dump_path)}.c"),
                 "functions": job.functions_done or job.functions_total,
