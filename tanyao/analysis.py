@@ -597,6 +597,15 @@ class AnalysisFacade:
                 "type": as_type,
                 "count": count,
                 "values": values,
+                # The same numbers as hex STRINGS.
+                #
+                # JSON has no integer type: a parser that yields IEEE doubles
+                # silently rounds anything above 2^53. A pointer like
+                # 0xB4007BE0774880 (12970367458873919616) comes back wrong in the
+                # last digits while data_hex stays correct — so the response
+                # contradicts itself and the more convenient field is the lying
+                # one. Hex strings have no such cliff, for any width.
+                "values_hex": [f"0x{v:x}" for v in values],
                 "data_hex": data.hex(),
             }
             if strip_pac and kind == "int" and width == 8:

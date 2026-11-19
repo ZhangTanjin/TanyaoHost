@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .analysis import WriteDisabled, AnalysisFacade
@@ -339,6 +340,22 @@ class IpcRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 result = handler(params)
+                # Timestamp every response at ONE place rather than threading it
+                # through 38 tools.
+                #
+                # Why it matters: a caller comparing a memory read against an
+                # external observation (screenshot, log line, another process)
+                # needs to know WHEN the read happened. Without it, values that
+                # change every frame cannot be lined up with anything, and the
+                # error is invisible — the numbers look fine, they just belong to
+                # a different instant.
+                #
+                # ts_mono is the one to compute deltas with: it is immune to
+                # wall-clock steps (NTP, manual change). ts_wall is for matching
+                # against externally recorded times.
+                if isinstance(result, dict):
+                    result.setdefault("ts_mono_ns", time.monotonic_ns())
+                    result.setdefault("ts_wall_ns", time.time_ns())
                 self._reply(200, {"ok": True, "result": result})
             except AgentError as exc:
                 body = {"ok": False, "error": exc.error, "errno": exc.errno, "detail": exc.detail}
