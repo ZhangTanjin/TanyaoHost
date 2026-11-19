@@ -174,6 +174,7 @@ def build_method_table(facade: AnalysisFacade) -> dict:
             interval_ms=int(p.get("interval_ms", 200)),
             count=int(p.get("count", 10)),
             changes_only=bool(p.get("changes_only", False)),
+            mirror_samples=bool(p.get("mirror_samples", True)),
         ),
         "pointers_to": lambda p: facade.pointers_to(
             need_pid(p),

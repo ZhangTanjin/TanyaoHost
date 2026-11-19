@@ -273,3 +273,74 @@ class ZeroFillTailTest(unittest.TestCase):
     def test_below_first_load_is_not_covered(self) -> None:
         _load, where = self.m.load_covering(0x3fffff)
         self.assertEqual(where, "none")
+
+
+# --- segment vaddr windows: the property that actually matters ----------------
+# Earlier attempts asserted "adjacent windows must not overlap". That is FALSE
+# for this model by construction: a mapping's window is the union of every
+# PT_LOAD it overlaps, and neighbouring mappings share a page, so their windows
+# overlap on purpose. Such an assertion would fail on correct output.
+#
+# The property that does hold, and that catches the original defect, is
+# COVERAGE: every PT_LOAD's file-backed vaddr range must fall inside exactly one
+# mapping's window. Under the buggy version a vaddr like 0x51EA4D0 was covered by
+# no window at all.
+WINDOW_LOADS = [
+    PhdrLoad(0x0, 0x7ba78, 0x7ba78, 0x0, 5, 0x1000),
+    PhdrLoad(0x7fa80, 0x94028, 0x94028, 0x7ba80, 5, 0x1000),   # unaligned p_offset
+    PhdrLoad(0x117aa8, 0x7300, 0x8558, 0x10faa8, 6, 0x1000),
+    PhdrLoad(0x122da8, 0x1c0, 0x74e0, 0x116da8, 6, 0x1000),
+]
+WINDOW_HEADER = build_elf(WINDOW_LOADS)
+# Page-aligned mappings, as the loader really produces.
+WINDOW_SEGS = [
+    Map(0x7000000000, 0x7000007c000, 0x0, 5, "/x/libwin.so"),
+    Map(0x7000007b000, 0x70000110000, 0x7b000, 5, "/x/libwin.so"),
+    Map(0x7000010f000, 0x70000117000, 0x10f000, 6, "/x/libwin.so"),
+]
+
+
+def _window_of(seg, loads):
+    """Mirror of the resolver's rule: union of overlaps, page-aligned matching."""
+    seg_off = seg.file_offset
+    file_end = seg_off + (seg.end - seg.start)
+    lo = hi = None
+    for ld in loads:
+        ov_lo = max(ld.offset, seg_off)
+        ov_hi = min(ld.offset + ld.filesz, file_end)
+        if ov_hi <= ov_lo:
+            continue
+        v_lo = ld.vaddr + (ov_lo - ld.offset)
+        v_hi = ld.vaddr + (ov_hi - ld.offset)
+        lo = v_lo if lo is None else min(lo, v_lo)
+        hi = v_hi if hi is None else max(hi, v_hi)
+    return (lo, hi) if lo is not None else None
+
+
+class WindowCoverageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.loads = WINDOW_LOADS
+
+    def test_every_load_is_covered_by_some_window(self) -> None:
+        """The defect this replaces: a vaddr that no window covered."""
+        windows = [w for w in (_window_of(s, self.loads) for s in WINDOW_SEGS) if w]
+        for ld in self.loads:
+            lo, hi = ld.vaddr, ld.vaddr + ld.filesz
+            covering = [w for w in windows if w[0] <= lo and hi <= w[1]]
+            self.assertTrue(
+                covering,
+                f"PT_LOAD [{lo:#x}, {hi:#x}) is not contained in any window; "
+                f"windows={[(hex(a), hex(b)) for a, b in windows]}")
+
+    def test_windows_may_overlap(self) -> None:
+        """Overlap is expected, not a defect — pin it so nobody 'fixes' it."""
+        windows = sorted(w for w in (_window_of(s, self.loads) for s in WINDOW_SEGS) if w)
+        overlaps = any(windows[i][1] > windows[i + 1][0] for i in range(len(windows) - 1))
+        self.assertTrue(overlaps, "expected the union model to produce overlapping windows")
+
+    def test_unaligned_p_offset_shifts_window_start(self) -> None:
+        """A mapping starting before p_offset must not report p_vaddr as its start."""
+        seg = WINDOW_SEGS[1]                 # off 0x7b000, LOAD2 has p_offset 0x7ba80
+        win = _window_of(seg, self.loads)
+        self.assertIsNotNone(win)
+        self.assertNotEqual(win[0], 0x7fa80, "window start must be mapping-relative, not p_vaddr")

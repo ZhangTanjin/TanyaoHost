@@ -1941,7 +1941,8 @@ class AnalysisFacade:
     # -- multi-span sampling & pointer search (R5 F1/F2) ---------------------------
 
     def watch_many(self, pid: int, spans: list[dict], *, interval_ms: int = 200,
-                   count: int = 10, changes_only: bool = False) -> dict:
+                   count: int = 10, changes_only: bool = False,
+                   mirror_samples: bool = True) -> dict:
         """F1: multi-address sampling orchestrated over MEM_READV — one batch
         read per tick (fault isolation per span), per-span sample arrays in
         the same shape as watch's. Zero protocol additions."""
@@ -1982,8 +1983,18 @@ class AnalysisFacade:
                 previous[j] = data
             if i + 1 < count:
                 time.sleep(interval_ms / 1000.0)
+        # A `changes_only` run returns fewer samples than `count` BY DESIGN —
+        # unchanged ticks are dropped. Without saying so, a caller cannot tell
+        # "sampled 30 times, nothing moved" from "only managed one sample",
+        # which are very different conclusions.
+        stopped_reason = None
+        if changes_only:
+            kept = [len(samples[j]) for j in range(len(parsed))]
+            if all(k < count for k in kept):
+                stopped_reason = "no_changes"
         per_span = [
-            {"address": f"0x{addr:x}", "size": size, "samples": samples[j]}
+            {"address": f"0x{addr:x}", "size": size, "samples": samples[j],
+             "count_requested": count, "samples_returned": len(samples[j])}
             for j, (addr, size) in enumerate(parsed)
         ]
         # A span that could not be read must say so at the span level too, not
@@ -2003,12 +2014,20 @@ class AnalysisFacade:
             "clock": "timestamp_monotonic is time.monotonic(); add started_wall "
                      "to convert to wall-clock, so a system clock jump cannot "
                      "fake a gap between samples",
+            "count_requested": count,
+            "changes_only": changes_only,
+            **({"stopped_reason": stopped_reason} if stopped_reason else {}),
             # `spans` is the structured form; `samples` mirrors watch(), which
             # returns a flat `samples` list. Callers written against watch
             # reasonably expect the same key here and silently get nothing when
             # it is absent — so provide both rather than making the shape a trap.
             "spans": per_span,
-            "samples": [entry["samples"] for entry in per_span],
+            # `samples` mirrors watch()'s flat shape, but it is the SAME data as
+            # spans[].samples — so it doubles the payload. On by default because
+            # a strict client rejects a response whose shape it cannot match;
+            # turn it off for large captures where the duplication is real cost.
+            **({"samples": [entry["samples"] for entry in per_span]}
+               if mirror_samples else {}),
         }
 
     def pointers_to(self, pid: int, addresses, *, module: str | None = None,
