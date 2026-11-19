@@ -214,6 +214,32 @@ class AddressModel:
                 "arithmetic (uncorroborated: no [anon:.bss] mapping adjacent to "
                 "the module's last segment)")
 
+    def load_covering(self, elf_vaddr: int) -> tuple[object | None, str]:
+        """Which PT_LOAD covers this vaddr, and in which part of it.
+
+        Returns (load, where) where `where` is one of:
+
+          "file"           vaddr < p_vaddr + p_filesz — bytes are on disk
+          "zero"           p_vaddr + p_filesz <= vaddr < p_vaddr + p_memsz —
+                           the loader zero-fills this tail; no file bytes exist
+          "none"           not covered by any PT_LOAD
+
+        The distinction matters because address resolution must not treat these
+        the same: a "zero" vaddr has no file offset at all, so any file-offset
+        arithmetic silently produces a bogus address. Checking only `p_filesz`
+        (as one path did) makes a perfectly solvable vaddr look like it is in no
+        segment, and the caller then reports "not covered by any PT_LOAD" for an
+        address that is very much inside one.
+        """
+        for load in self.elf.loads:
+            end_file = load.vaddr + load.filesz
+            end_mem = load.vaddr + load.memsz
+            if load.vaddr <= elf_vaddr < end_file:
+                return load, "file"
+            if end_file <= elf_vaddr < end_mem:
+                return load, "zero"
+        return None, "none"
+
     # -- conversions --------------------------------------------------------
 
     def to_runtime(self, elf_vaddr: int) -> int:

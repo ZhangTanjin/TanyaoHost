@@ -1558,11 +1558,16 @@ class AnalysisFacade:
                 method = "arithmetic"
                 note = "no [anon:.bss] mapping; arithmetic only"
 
-        # -- 2) file-backed PT_LOAD: map vaddr -> file offset -> runtime addr ---
+        # -- 2) PT_LOAD: file-backed bytes, then the zero-filled tail ----------
+        # The two halves need different arithmetic and a vaddr in the second
+        # half has NO file offset at all. Testing only p_filesz (as this did)
+        # made a vaddr in [p_vaddr+p_filesz, p_vaddr+p_memsz) look like it was
+        # covered by nothing, and the caller got "not covered by any PT_LOAD"
+        # for an address sitting inside a segment — the field report's
+        # 0x1D38800 case.
         if runtime is None:
-            for load in info.loads:
-                if not (load.vaddr <= vaddr < load.vaddr + load.filesz):
-                    continue
+            load, where = model.load_covering(vaddr)
+            if where == "file" and load is not None:
                 file_off = load.offset + (vaddr - load.vaddr)
                 seg = next((x for x in segs
                             if x.file_offset <= file_off
@@ -1570,7 +1575,19 @@ class AnalysisFacade:
                 if seg is not None:
                     runtime = seg.start + (file_off - seg.file_offset)
                     method = "segment_mapping"
-                    break
+            elif where == "zero" and load is not None:
+                # The loader zero-fills this tail in an anonymous mapping that
+                # follows the segment's file-backed bytes. Anchor on the segment
+                # start, which is what the mapping table actually proves.
+                file_end_off = load.offset + load.filesz
+                seg = next((x for x in segs
+                            if x.file_offset <= file_end_off
+                            < x.file_offset + (x.end - x.start)), None)
+                if seg is not None:
+                    runtime = seg.start + (vaddr - load.vaddr)
+                    method = "zero_fill_tail"
+                    note = (f"vaddr is past p_filesz; zero-filled BSS tail of the "
+                            f"segment at 0x{seg.start:x}")
 
         # -- 3) arithmetic last resort ----------------------------------------
         if runtime is None:

@@ -218,3 +218,58 @@ class FailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- memsz > filesz tail: the "covered by no PT_LOAD" trap -----------------
+# A LOAD whose p_memsz exceeds p_filesz has a zero-filled tail. Those bytes are
+# INSIDE the segment but have no file offset at all. A resolver that tests only
+# `p_filesz` concludes the vaddr belongs to no segment and refuses it — the
+# field report's 0x1D38800, which sat inside .data and was rejected with
+# "not covered by any PT_LOAD ... no unambiguous load anchor".
+TAIL_LOADS = [
+    PhdrLoad(0x400000, 0x1000, 0x1000, 0x0, 5, 0x1000),
+    # filesz 0x1e18, memsz 0x2000 -> zero tail [0x401e18, 0x402000)
+    PhdrLoad(0x401000, 0x2000, 0x1e18, 0x1000, 6, 0x1000),
+]
+TAIL_HEADER = build_elf(TAIL_LOADS)
+TAIL_SEGS = [
+    Map(0x200000, 0x201000, 0x0, 5, "/x/libtail.so"),
+    Map(0x201000, 0x203000, 0x1000, 6, "/x/libtail.so"),
+]
+
+
+class ZeroFillTailTest(unittest.TestCase):
+    """load_covering must distinguish file bytes from the zero-filled tail."""
+
+    def setUp(self) -> None:
+        self.m = AddressModel.build(0, "libtail.so", TAIL_SEGS,
+                                    mem_from(TAIL_HEADER, 0x200000))
+
+    def test_file_backed_bytes_are_file(self) -> None:
+        load, where = self.m.load_covering(0x401000)
+        self.assertEqual(where, "file")
+        self.assertEqual(load.vaddr, 0x401000)
+
+    def test_byte_just_past_filesz_is_zero_fill(self) -> None:
+        # p_vaddr + p_filesz = 0x401000 + 0x1e18 = 0x402e18,
+        # the first byte with no file counterpart.
+        load, where = self.m.load_covering(0x402e18)
+        self.assertEqual(where, "zero")
+        self.assertEqual(load.vaddr, 0x401000)
+
+    def test_last_file_byte_is_file(self) -> None:
+        _load, where = self.m.load_covering(0x402e17)
+        self.assertEqual(where, "file")
+
+    def test_last_zero_fill_byte_is_inside(self) -> None:
+        # p_vaddr + p_memsz - 1 = 0x403000 - 1
+        _load, where = self.m.load_covering(0x402fff)
+        self.assertEqual(where, "zero")
+
+    def test_first_byte_past_memsz_is_not_covered(self) -> None:
+        _load, where = self.m.load_covering(0x403000)
+        self.assertEqual(where, "none")
+
+    def test_below_first_load_is_not_covered(self) -> None:
+        _load, where = self.m.load_covering(0x3fffff)
+        self.assertEqual(where, "none")
