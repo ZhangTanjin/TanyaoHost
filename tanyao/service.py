@@ -306,22 +306,24 @@ class TanyaoService:
         Cheap enough to run on demand (one tiny request), too slow to run on
         every status read, which is why it is a separate method.
         """
+        first_failed = False
         for i in range(max(1, attempts)):
             with self._lock:
                 conn = self._conn
             if conn is not None and conn.is_connected:
                 try:
                     conn.ping()
-                    return True, False
+                    # Transient = the FIRST probe failed but this one succeeded.
+                    # A caller reading recovering=true knows the link was
+                    # mid-establishment, not that it is still broken.
+                    return True, first_failed
                 except (ConnectionError, TimeoutError, OSError, ProtocolError):
                     pass
             if i + 1 < attempts:
+                first_failed = True
                 time.sleep(delay)
-        # One last state read: a link that came up during the retries counts as
-        # alive, and the fact that it needed the retries is the transient signal.
-        with self._lock:
-            now_connected = self._conn is not None and self._conn.is_connected
-        return now_connected, now_connected
+        # Every probe failed: the link is genuinely down.
+        return False, False
 
     def generation(self) -> int | None:
         with self._lock:

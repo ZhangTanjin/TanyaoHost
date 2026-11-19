@@ -648,9 +648,13 @@ class AnalysisFacade:
                 # last digits while data_hex stays correct — so the response
                 # contradicts itself and the more convenient field is the lying
                 # one. Hex strings have no such cliff, for any width.
-                "values_hex": [f"0x{v:x}" for v in values],
                 "data_hex": data.hex(),
             }
+            # Only integer reads of width >= 4 get a hex mirror: a float's hex
+            # digits are not the value, and a u8 never exceeds 2^53, so emitting
+            # them there is noise the caller did not ask for.
+            if kind == "int" and width >= 4:
+                out["values_hex"] = [f"0x{v:x}" for v in values]
             if strip_pac and kind == "int" and width == 8:
                 # PAC lives in the top byte(s); mask to the 48-bit VA space.
                 # Guard: stripping is only meaningful for values that LOOK like
@@ -1744,12 +1748,25 @@ class AnalysisFacade:
                 # The loader zero-fills this tail in an anonymous mapping that
                 # follows the segment's file-backed bytes. Anchor on the segment
                 # start, which is what the mapping table actually proves.
+                # Where in the FILE does this vaddr's segment start? The
+                # mapping's file_offset is page-aligned DOWN, so the mapping's
+                # first byte corresponds to a vaddr BEFORE load.vaddr when
+                # p_offset is unaligned. Using load.vaddr directly shifts the
+                # answer by that delta — the same class of bug the window
+                # computation had.
+                #
+                # Correct chain: vaddr -> offset within the LOAD's zero tail ->
+                # add the LOAD's file_end to get the byte position in the file,
+                # then locate that byte inside the mapping.
                 file_end_off = load.offset + load.filesz
                 seg = next((x for x in segs
                             if x.file_offset <= file_end_off
                             < x.file_offset + (x.end - x.start)), None)
                 if seg is not None:
-                    runtime = seg.start + (vaddr - load.vaddr)
+                    # Byte position of the segment's last file byte within the
+                    # mapping, then how far past it this vaddr sits.
+                    file_end_in_seg = seg.start + (file_end_off - seg.file_offset)
+                    runtime = file_end_in_seg + (vaddr - (load.vaddr + load.filesz))
                     method = "zero_fill_tail"
                     note = (f"vaddr is past p_filesz; zero-filled BSS tail of the "
                             f"segment at 0x{seg.start:x}")
