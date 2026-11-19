@@ -350,7 +350,12 @@ class AnalysisFacade:
             "bss_note": bss_note,
             "mirror_detected": mirror,
             # D19: full segment table — translation_base is each segment's own
-            # (start − file_offset) anchor; mirror flags the whole-file copies
+            # (start − file_offset) anchor; mirror flags the whole-file copies.
+            #
+            # vaddr_start/vaddr_end let a caller do segment attribution itself
+            # instead of re-deriving it from load_bias, which cannot work on a
+            # multi-anchor module and silently drifts on layouts whose first
+            # mapping is not at load_bias.
             "segments": [
                 {
                     "start": f"0x{s.start:x}",
@@ -365,6 +370,29 @@ class AnalysisFacade:
                 for s in v.segments
             ],
         }
+        # Attach each mapping's ELF vaddr window.
+        #
+        # Match by file_offset, not by index: a mirror or multi-anchor module has
+        # more mappings than PT_LOADs, and positional pairing would then assign
+        # every window one slot off. The file offset is what actually identifies
+        # which LOAD a mapping was made from.
+        _loads = sorted(model.elf.loads, key=lambda l: l.offset)
+        for i, seg_out in enumerate(out["segments"]):
+            seg_off = int(seg_out["file_offset"], 16)
+            match = next((l for l in _loads
+                          if l.offset <= seg_off < l.offset + max(l.filesz, 1)), None)
+            if match is None and i < len(_loads):
+                match = _loads[i]          # last resort: positional
+            if match is not None:
+                seg_out["vaddr_start"] = f"0x{match.vaddr:x}"
+                seg_out["vaddr_end"] = f"0x{match.vaddr + match.memsz:x}"
+
+        # A single call that answers "where does this vaddr live" for callers who
+        # would otherwise reach for load_bias + vaddr. This is the identity the
+        # tool docs state but never exposed.
+        out["vaddr_to_runtime_hint"] = (
+            "resolve_vaddr(pid, module, vaddr) — handles .bss, zero-filled tails "
+            "and multi-anchor layouts; do not do load_bias + vaddr arithmetic")
         if ambiguous:
             out["load_bias_ambiguous"] = True
             out["hint"] = ("load_bias is ambiguous on this multi-anchor layout — use "
