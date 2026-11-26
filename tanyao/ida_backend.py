@@ -83,7 +83,7 @@ def ida_root() -> str:
     if explicit:
         return explicit
     found = discover_ida_root()
-    return found if found else "/home/ufo/ida-pro-9.5"
+    return found if found else "/home/ufo/data/tools/ida-pro-9.5"
 
 
 def idalib_python_dir() -> str:
