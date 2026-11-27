@@ -32,3 +32,6 @@ node_modules/
 
 # Generated from ida_backend._WORKER at first use; tracking it invites drift.
 tanyao/_ida_worker.py
+
+# 本地发布产物（2026-11-27）
+dist/
