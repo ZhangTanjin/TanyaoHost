@@ -1,4 +1,4 @@
-"""ctx 槽泄漏回归：批量开/关目标会话后，用户态 ctx 占用数必须回到基线。
+"""ctx 槽泄漏回归：会话开/关之后，用户态 ctx 占用数不得随轮数增长。
 
 为什么需要它（2026-11-27）
 --------------------------
@@ -15,20 +15,27 @@ Kitty 用户态库里有两张表：内核 session 表 + 用户态 `g_ctxs`。
 这个缺陷真实发生过一次（agent 的 5 处 `::close` + 2 处回滚，已修）。它靠人读
 代码才发现，运气成分很大 —— 所以固化成会失败的测试。
 
-原理
-----
-agent 支持一个探针：环境变量 `TANYAO_CTX_PROBE` 指向某个路径时，它在**启动**
-和**每个请求处理完之后**把当前占用槽数写进该文件。
+**断言用差分，不用绝对值**
+--------------------------
+第一版断言 `final == baseline`，复查发现它和 host 的会话缓存耦合：
 
-本测试分两个阶段，覆盖两条会话路径：
+`resolve_module` 走 `service.target_maps()` → `_require_handle()`，**按 pid
+缓存**会话；host 只在槽位满时才 `close_target()`。所以同一个 pid 跑 N 轮
+实际只 open 一次，之后一直复用缓存句柄。于是：
 
-- **阶段 1（控制 fd 路径）**：经 serve 调 `resolve_module` N 轮 —— 每次
-  `backend.open_target()` / `close_target()`，走 `kitty_close()`。
-- **阶段 2（池 fd 路径）**：直连 agent 发 `TARGET_OPEN` / `TARGET_CLOSE`
-  N 轮 —— 每次 `Backend::connect_fd()` 拿一个池 fd，回收走
-  `release_target_fd()` / `TargetCtx::close()`。
+| 起始状态 | `final == baseline` 的结果 |
+| --- | --- |
+| 该 pid 还没缓存 | baseline=1，第一轮后 2 并保持 → **健康 agent 也 FAIL** |
+| 该 pid 已有缓存 | baseline=2，跑完仍 2 → **PASS 但根本没经过 open/close** |
 
-两阶段各自「读基线 → 跑 → 再读 → 断言回到基线」；泄漏会让数字单调增长。
+改成差分后对缓存天然免疫：
+
+    跑第 1 轮 → 读 e1（此时 = 基线 + 常驻缓存会话）
+    再跑 N-1 轮 → 读 eN
+    断言 eN == e1（不随轮数增长）
+
+两阶段都用这个口径。阶段 2（池 fd）每轮真的 connect_fd → open_target_on →
+release_target_fd，泄漏会表现为 eN 单调增大。
 
 用法
 ----
@@ -41,7 +48,7 @@ agent 支持一个探针：环境变量 `TANYAO_CTX_PROBE` 指向某个路径时
 退出码 0 = 通过；1 = 泄漏或轮次失败；2 = 环境不满足（探针未启用）。
 
 tanyao 后端（`-DTANYAO_BACKEND=lkm`）没有第二张表，`ctx_live()` 返回 -ENOSYS，
-探针会写 -1 —— 此时测试报 SKIP（退出码 0），因为该后端不存在这类泄漏。
+探针写 -1 —— 此时报 SKIP（退出码 0），因为该后端不存在这类泄漏。
 """
 
 from __future__ import annotations
@@ -51,9 +58,9 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
-# 直连 agent（阶段 2）复用 host 自己的连接实现，不重复造帧格式
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
@@ -61,6 +68,7 @@ if ROOT not in sys.path:
 
 DEFAULT_BASE_URL = "http://127.0.0.1:28101/"
 DEFAULT_PROBE = "/data/local/tmp/.ctx-live"
+SENTINEL = -999
 
 
 def rpc(base_url: str, method: str, params: dict, timeout: float = 60.0):
@@ -72,97 +80,97 @@ def rpc(base_url: str, method: str, params: dict, timeout: float = 60.0):
         return json.loads(resp.read().decode())
 
 
-def read_probe(adb: str, serial: str | None, path: str) -> int | None:
-    cmd = [adb] + (["-s", serial] if serial else [])
-    cmd += ["shell", f"su -c 'cat {path}'"]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    text = out.stdout.strip()
-    if not text:
-        return None
-    try:
-        return int(text.splitlines()[0])
-    except ValueError:
-        return None
+def _adb_cmd(adb: str, serial: str | None, shell: str) -> list[str]:
+    return [adb] + (["-s", serial] if serial else []) + ["shell", shell]
 
 
-def phase_pool(host: str, port: int, token: str, pid: int, rounds: int,
-               probe: int, read: "callable") -> int:
-    """阶段 2：直连 agent，反复 target_open/target_close（池 fd 路径）。"""
-    from tanyao.connection import AgentConnection
-    from tanyao.constants import CMD_TARGET_CLOSE, CMD_TARGET_OPEN
+def read_probe(adb: str, serial: str | None, path: str,
+               attempts: int = 3, delay: float = 0.1) -> int | None:
+    """读探针，失败重试。
 
-    from tanyao.connection import AgentError
-
-    conn = AgentConnection(host, port, token)
-    conn.connect()
-    try:
-        failures = []
-        for index in range(rounds):
-            try:
-                opened = conn.request(CMD_TARGET_OPEN, {"pid": pid})
-                handle = opened.get("handle") if isinstance(opened, dict) else None
-                if not handle:
-                    failures.append((index, f"open 无 handle: {opened}"))
-                else:
-                    conn.request(CMD_TARGET_CLOSE, {"handle": handle})
-            except AgentError as exc:
-                # -ENOMEM 就是槽位耗尽的典型症状（KITTY_MAX_CTX=64）
-                failures.append((index, f"{exc}"))
-            if len(failures) >= 5:
-                break
-    finally:
-        conn.close()
-
-    final = read()
-    print(f"[池 fd] 轮次失败={len(failures)} 完成后占用槽={final}（基线 {probe}）")
-    for idx, err in failures:
-        print(f"  round {idx}: {err}")
-    if failures:
-        print("FAIL: 池 fd 路径的开/关有失败")
-        return 1
-    if final != probe:
-        print(
-            f"FAIL: 池 fd 路径 ctx 槽从 {probe} 涨到 {final} —— "
-            "有路径没走 kitty_close()/release_target_fd"
-        )
-        return 1
-    print("PASS: 池 fd 路径 %d 轮后 ctx 槽回到基线" % rounds)
-    return 0
-
-
-SENTINEL = -999
-
-
-def read_probe_raw(adb: str, serial: str | None, path: str) -> int | None:
-    return read_probe(adb, serial, path)
+    写入端已改成 tmp+rename 原子替换，理论上不会读到截断内容；这里仍重试，
+    是为了容忍转发侧/文件系统偶发的空读 —— 一次空读不该让测试假失败。
+    """
+    for attempt in range(attempts):
+        try:
+            out = subprocess.run(
+                _adb_cmd(adb, serial, f"su -c 'cat {path}'"),
+                capture_output=True, text=True, timeout=30,
+            )
+            text = out.stdout.strip()
+            if text:
+                return int(text.splitlines()[0])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return None
 
 
 def write_probe_sentinel(adb: str, serial: str | None, path: str) -> None:
     """把探针文件写成哨兵。
 
-    为什么需要：如果 agent 没有以 TANYAO_CTX_PROBE 启动，文件里会残留上一次
-    测试的值 —— 那个值通常正好等于基线，于是「回到基线」的断言会**假通过**。
-    先写 -999，发一个请求后再读：仍是 -999 就说明探针没在更新，测试必须
-    SKIP 而不是 PASS。
+    如果 agent 没有以 TANYAO_CTX_PROBE 启动，文件里会残留上一次测试的值 ——
+    那个值通常正好等于基线，断言会**假通过**。先写 -999，发一个请求后再读：
+    仍是 -999 就说明探针没在更新，测试必须 SKIP 而不是 PASS。
     """
-    cmd = [adb] + (["-s", serial] if serial else [])
-    cmd += ["shell", f"su -c 'echo {SENTINEL} > {path}'"]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    subprocess.run(
+        _adb_cmd(adb, serial, f"su -c 'echo {SENTINEL} > {path}'"),
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def run_phase(label: str, rounds: int, round_once, read_now) -> int:
+    """差分跑一个阶段：第 1 轮后取 e1，再跑 N-1 轮取 eN，断言 eN == e1。"""
+    failures: list[tuple[int, str]] = []
+    try:
+        round_once()
+        e1 = read_now()
+        if e1 is None:
+            print(f"FAIL [{label}]: 第 1 轮后读不到探针", file=sys.stderr)
+            return 1
+        for index in range(1, rounds):
+            try:
+                round_once()
+            except Exception as exc:  # noqa: BLE001 — 每轮都要单独记账
+                failures.append((index, str(exc)))
+                if len(failures) >= 5:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL [{label}]: 第 1 轮就抛错: {exc}", file=sys.stderr)
+        return 1
+
+    en = read_now()
+    print(f"[{label}] e1={e1} eN={en} 轮次失败={len(failures)}")
+    for idx, err in failures:
+        print(f"  round {idx}: {err}")
+    if en is None:
+        print(f"FAIL [{label}]: 跑完之后读不到探针", file=sys.stderr)
+        return 1
+    if failures:
+        print(f"FAIL [{label}]: 开/关循环有失败（槽位耗尽时就是 -ENOMEM）")
+        return 1
+    if en != e1:
+        print(
+            f"FAIL [{label}]: ctx 槽从第 1 轮的 {e1} 涨到 {en}（{rounds} 轮）—— "
+            "每有路径没走 kitty_close()/release_target_fd。\n"
+            "  查 agent 里是否有裸 ::close(fd) 回收 kitty 会话。"
+        )
+        return 1
+    print(f"PASS [{label}]: {rounds} 轮差分为 0（{e1} → {en}）")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pid", type=int, required=True, help="目标进程 pid（用来开/关会话）")
-    ap.add_argument("--rounds", type=int, default=100, help="开/关循环次数（默认 100，需 > 64）")
-    ap.add_argument("--module", default="libc.so", help="每轮解析的模块名")
+    ap.add_argument("--pid", type=int, required=True, help="目标进程 pid")
+    ap.add_argument("--rounds", type=int, default=100, help="每阶段轮次（默认 100，建议 > 64）")
+    ap.add_argument("--module", default="libc.so")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    ap.add_argument("--probe", default=DEFAULT_PROBE, help="agent 探针文件路径（设备上）")
+    ap.add_argument("--probe", default=DEFAULT_PROBE, help="agent 探针文件（设备上）")
     ap.add_argument("--adb", default="adb")
     ap.add_argument("--serial", default=os.environ.get("KITTY_DEV") or None)
-    ap.add_argument("--agent-host", default="127.0.0.1", help="阶段 2 直连的 agent 地址")
+    ap.add_argument("--agent-host", default="127.0.0.1")
     ap.add_argument("--agent-port", type=int, default=52730)
     ap.add_argument("--token-file", default="/tmp/tanyao_token")
     ap.add_argument("--skip-pool", action="store_true", help="只跑阶段 1")
@@ -174,8 +182,7 @@ def main() -> int:
         return 2
     backend = (status.get("result") or {}).get("backend", {}).get("name", "?")
 
-    # 探针活性检测：先写哨兵，再发一个请求看它有没有被更新。
-    # （否则残留的旧值会让断言假通过 —— 见 write_probe_sentinel 的注释。）
+    # 探针活性检测：先写哨兵，再发一个请求看它有没有被更新
     write_probe_sentinel(args.adb, args.serial, args.probe)
     rpc(args.base_url, "find_process", {"name": "surfaceflinger"})
     baseline = read_probe(args.adb, args.serial, args.probe)
@@ -187,64 +194,52 @@ def main() -> int:
         )
         return 2
     if baseline is None:
-        print(
-            "环境不满足：读不到探针文件 %s\n"
-            "  agent 需要以 TANYAO_CTX_PROBE=%s 启动。" % (args.probe, args.probe),
-            file=sys.stderr,
-        )
+        print(f"环境不满足：读不到探针文件 {args.probe}", file=sys.stderr)
         return 2
     if baseline < 0:
-        print(f"SKIP: backend={backend} 没有用户态 ctx 表（ctx_live=-1），无此类泄漏")
+        print(f"SKIP: backend={backend} 没有用户态 ctx 表（ctx_live={baseline}）")
         return 0
 
-    print(f"backend={backend} 探针基线={baseline} 轮次={args.rounds} pid={args.pid}")
+    print(f"backend={backend} 基线={baseline} 轮次={args.rounds} pid={args.pid}")
 
-    failures: list[tuple[int, str]] = []
-    for index in range(args.rounds):
-        out = rpc(
-            args.base_url,
-            "resolve_module",
-            {"pid": args.pid, "name": args.module},
-        )
+    read_now = lambda: read_probe(args.adb, args.serial, args.probe)  # noqa: E731
+
+    # 阶段 1：控制 fd 路径（host 有会话缓存，所以必须用差分口径）
+    def control_round():
+        out = rpc(args.base_url, "resolve_module", {"pid": args.pid, "name": args.module})
         if not out.get("ok"):
-            failures.append((index, str(out.get("error"))))
-            if len(failures) >= 5:
-                break
+            raise RuntimeError(str(out.get("error")))
 
-    final = read_probe(args.adb, args.serial, args.probe)
-    if final is None:
-        print("FAIL: 跑完之后读不到探针文件", file=sys.stderr)
-        return 1
+    rc = run_phase("控制 fd", args.rounds, control_round, read_now)
+    if rc != 0 or args.skip_pool:
+        return rc
 
-    print(f"轮次失败={len(failures)} 完成后占用槽={final}（基线 {baseline}）")
-    for idx, err in failures:
-        print(f"  round {idx}: {err}")
-
-    if failures:
-        print("FAIL: 开/关循环有失败 —— 很可能是槽位已耗尽（-ENOMEM）")
-        return 1
-    if final != baseline:
-        print(
-            f"FAIL: ctx 槽从 {baseline} 涨到 {final} —— 有路径没走 kitty_close()。\n"
-            "  查 agent 里是否有裸 ::close(fd) 回收 kitty 会话（应改 "
-            "Backend::release_target_fd）。"
-        )
-        return 1
-
-    print("PASS: 阶段 1（控制 fd）开/关 %d 轮后 ctx 槽回到基线" % args.rounds)
-
-    if args.skip_pool:
-        return 0
+    # 阶段 2：池 fd 路径（每轮真开/真关）
     try:
         token = open(args.token_file, encoding="utf-8").read().strip()
     except OSError as exc:
         print(f"SKIP 阶段 2: 读不到 token 文件 {args.token_file}（{exc}）")
         return 0
-    return phase_pool(
-        args.agent_host, args.agent_port, token, args.pid, args.rounds,
-        read_probe(args.adb, args.serial, args.probe),
-        lambda: read_probe(args.adb, args.serial, args.probe),
-    )
+
+    from tanyao.connection import AgentConnection
+    from tanyao.constants import CMD_TARGET_CLOSE, CMD_TARGET_OPEN
+
+    conn = AgentConnection(args.agent_host, args.agent_port, token)
+    conn.connect()
+    try:
+        handle_box: dict[str, str] = {}
+
+        def pool_round():
+            opened = conn.request(CMD_TARGET_OPEN, {"pid": args.pid})
+            handle = opened.get("handle") if isinstance(opened, dict) else None
+            if not handle:
+                raise RuntimeError(f"open 无 handle: {opened}")
+            handle_box["h"] = handle
+            conn.request(CMD_TARGET_CLOSE, {"handle": handle})
+
+        return run_phase("池 fd", args.rounds, pool_round, read_now)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
