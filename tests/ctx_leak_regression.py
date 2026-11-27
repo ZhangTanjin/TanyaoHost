@@ -133,6 +133,26 @@ def phase_pool(host: str, port: int, token: str, pid: int, rounds: int,
     return 0
 
 
+SENTINEL = -999
+
+
+def read_probe_raw(adb: str, serial: str | None, path: str) -> int | None:
+    return read_probe(adb, serial, path)
+
+
+def write_probe_sentinel(adb: str, serial: str | None, path: str) -> None:
+    """把探针文件写成哨兵。
+
+    为什么需要：如果 agent 没有以 TANYAO_CTX_PROBE 启动，文件里会残留上一次
+    测试的值 —— 那个值通常正好等于基线，于是「回到基线」的断言会**假通过**。
+    先写 -999，发一个请求后再读：仍是 -999 就说明探针没在更新，测试必须
+    SKIP 而不是 PASS。
+    """
+    cmd = [adb] + (["-s", serial] if serial else [])
+    cmd += ["shell", f"su -c 'echo {SENTINEL} > {path}'"]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", type=int, required=True, help="目标进程 pid（用来开/关会话）")
@@ -154,9 +174,18 @@ def main() -> int:
         return 2
     backend = (status.get("result") or {}).get("backend", {}).get("name", "?")
 
-    # 先触发一次请求，确保探针已落盘（启动基线也会写一次）
-    warm = rpc(args.base_url, "find_process", {"name": "surfaceflinger"})
+    # 探针活性检测：先写哨兵，再发一个请求看它有没有被更新。
+    # （否则残留的旧值会让断言假通过 —— 见 write_probe_sentinel 的注释。）
+    write_probe_sentinel(args.adb, args.serial, args.probe)
+    rpc(args.base_url, "find_process", {"name": "surfaceflinger"})
     baseline = read_probe(args.adb, args.serial, args.probe)
+    if baseline == SENTINEL:
+        print(
+            "环境不满足：探针没有被更新（仍是哨兵 %d）。\n"
+            "  agent 需要以 TANYAO_CTX_PROBE=%s 启动。" % (SENTINEL, args.probe),
+            file=sys.stderr,
+        )
+        return 2
     if baseline is None:
         print(
             "环境不满足：读不到探针文件 %s\n"
